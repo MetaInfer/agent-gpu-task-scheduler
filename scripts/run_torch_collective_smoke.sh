@@ -2,7 +2,7 @@
 set -euo pipefail
 
 readonly PYTHON_SCRIPT=/data/fh/agent-gpu-task-scheduler/scripts/torch_collective_smoke.py
-readonly PYTHON_SHA256=bff84ddef7d49c5347211ef619a2f6b5e7dcb21c06eef99a9736f7849015affc
+readonly PYTHON_SHA256=22930384f516280a87ef1a912da2721fcdf664eeded285e536afe1ce9c12d635
 
 if [[ $# -ne 2 ]]; then
   printf 'usage: %s OUTPUT BUSINESS_LOG\n' "$0" >&2

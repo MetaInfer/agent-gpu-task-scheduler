@@ -1,3 +1,4 @@
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -76,6 +77,19 @@ def test_vram_gate_keeps_task_queued(runtime_identity):
     assert scheduler.get_status(task.task_id).state is TaskState.QUEUED
 
 
+def test_qualification_gpu_wait_expires_at_30_minutes(runtime_identity):
+    root, identity = runtime_identity
+    task = signed_task(identity)
+    scheduler = scheduler_for(root, identity, threshold=90)
+    scheduler.register_worker(worker(91, GpuState.DRIFTED))
+    scheduler.enqueue(task)
+    scheduler._queue[task.task_id].enqueued_at = utc_now() - timedelta(minutes=31)
+    assert scheduler.tick() == []
+    status = scheduler.get_status(task.task_id)
+    assert status.state is TaskState.BLOCKED
+    assert status.failure_reason == "QUALIFICATION_GPU_WAIT_EXPIRED"
+
+
 def test_cleanup_failure_retains_entire_lease(runtime_identity):
     root, identity = runtime_identity
     task = signed_task(identity)
@@ -121,6 +135,16 @@ def test_queued_task_can_be_cancelled(runtime_identity):
     status = scheduler.cancel_task(task.task_id, actor="zz_chentian", request_id="cancel-request")
     assert status.state is TaskState.CANCELLED
     assert scheduler.tick() == []
+
+
+def test_active_task_restarts_in_reconciliation(runtime_identity):
+    root, identity = runtime_identity
+    task = signed_task(identity)
+    first = scheduler_for(root, identity)
+    first.enqueue(task)
+    first._transition(task, TaskState.PREPARING, "test")
+    rebuilt = scheduler_for(root, identity)
+    assert rebuilt.get_status(task.task_id).state is TaskState.RECONCILIATION_REQUIRED
 
 
 def test_queued_task_rebuilds_after_snapshot_deletion(runtime_identity):

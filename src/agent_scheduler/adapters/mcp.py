@@ -78,7 +78,7 @@ class SubmitterMCPAdapter:
 
     def wait_for_task(self, task_id: str, timeout_seconds: int = 30) -> dict[str, object]:
         deadline = time.monotonic() + min(max(timeout_seconds, 1), 30)
-        terminal = {"COMPLETED", "FAILED", "CANCELLED", "CLEANUP_FAILED"}
+        terminal = {"BLOCKED", "COMPLETED", "FAILED", "CANCELLED", "CLEANUP_FAILED"}
         while True:
             value = self.get_task(task_id)
             status = value.get("status")

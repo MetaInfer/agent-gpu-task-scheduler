@@ -51,7 +51,7 @@ _REQUIRED_HEADINGS = (
     "## Risks and Notes",
 )
 _QUALIFICATION_LAUNCHER = "/data/fh/agent-gpu-task-scheduler/scripts/run_torch_collective_smoke.sh"
-_QUALIFICATION_LAUNCHER_SHA256 = "66de599723417262b3d6c2c2e665777c6c2183a770ed1dbce2d69fcb074881f0"
+_QUALIFICATION_LAUNCHER_SHA256 = "c1cf6dee074e03c026dd7272e358d7b15c65b6ff3b6ae1c1f71e7efae341de0c"
 _TERMINAL = {
     ProposalState.REJECTED,
     ProposalState.EXPIRED,
@@ -578,6 +578,18 @@ class ProposalService:
         return sorted(
             (record.proposal for record in self._records.values()),
             key=lambda proposal: (proposal.created_at, proposal.proposal_id),
+        )
+
+    def list_reviews(self) -> list[Review]:
+        return sorted(
+            (review for record in self._records.values() for review in record.reviews.values()),
+            key=lambda review: (review.created_at, review.review_id),
+        )
+
+    def list_tasks(self) -> list[Task]:
+        return sorted(
+            (record.task for record in self._records.values() if record.task is not None),
+            key=lambda task: task.task_id,
         )
 
     def _make_revision(self, proposal: Proposal, markdown: str, number: int) -> Revision:

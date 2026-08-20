@@ -27,7 +27,7 @@ from agent_scheduler.storage.events import EventStore
 
 T = TypeVar("T", bound=BaseModel)
 _LAUNCHER_PATH = "/data/fh/agent-gpu-task-scheduler/scripts/run_torch_collective_smoke.sh"
-_LAUNCHER_SHA256 = "66de599723417262b3d6c2c2e665777c6c2183a770ed1dbce2d69fcb074881f0"
+_LAUNCHER_SHA256 = "c1cf6dee074e03c026dd7272e358d7b15c65b6ff3b6ae1c1f71e7efae341de0c"
 _IMAGE_DIGEST = (
     "harbor.sourcefind.cn:5443/dcu/admin/base/custom@"
     "sha256:158bdfd1567477cc4d7b276ba9328b2d29b9c8bcd996d11921a9ea855dbfb238"
@@ -136,7 +136,7 @@ class ClaudeCodeAdapter:
             "Do not approve the proposal. The deterministic qualification command MUST be "
             "container_path_bash `/data/fh/agent-gpu-task-scheduler/scripts/"
             "run_torch_collective_smoke.sh` with SHA-256 "
-            "`66de599723417262b3d6c2c2e665777c6c2183a770ed1dbce2d69fcb074881f0`; "
+            "`c1cf6dee074e03c026dd7272e358d7b15c65b6ff3b6ae1c1f71e7efae341de0c`; "
             "argv MUST be the Proposal-unique container output and business-log paths derived "
             "from proposal_id, and required host paths MUST map `/data` to `/public/share`.\n\n"
             f"facts_id={facts_id}\nproposal_id={revision.proposal_id}\n"

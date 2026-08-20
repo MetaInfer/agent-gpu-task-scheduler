@@ -73,6 +73,13 @@ def main() -> None:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             result = {
                 "schema_version": "v1",
+                "task_id": os.environ["TASK_ID"],
+                "unit_id": os.environ["UNIT_ID"],
+                "execution_id": os.environ["EXECUTION_ID"],
+                "plan_id": os.environ["PLAN_ID"],
+                "assignment_id": os.environ["ASSIGNMENT_ID"],
+                "lease_epoch": int(os.environ["LEASE_EPOCH"]),
+                "gpu_ids": [int(value) for value in os.environ["HIP_VISIBLE_DEVICES"].split(",")],
                 "backend": dist.get_backend(),
                 "rocm_version": torch.version.hip,
                 "world_size": world_size,

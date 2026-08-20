@@ -49,10 +49,13 @@ def build_parser() -> argparse.ArgumentParser:
     qualify.add_argument("--base-url", default="https://127.0.0.1:8443")
     qualify.add_argument("--timeout", type=int, default=45 * 60)
 
-    inspect = subparsers.add_parser("inspect", help="inspect persisted events")
+    inspect = subparsers.add_parser("inspect", help="inspect Ground Truth objects/resources")
     inspect.add_argument("--state-root", type=Path, required=True)
-    inspect.add_argument("--object-type", required=True)
-    inspect.add_argument("--object-id", required=True)
+    inspect.add_argument(
+        "--kind", choices=("events", "immutable", "snapshot", "leases"), default="events"
+    )
+    inspect.add_argument("--object-type")
+    inspect.add_argument("--object-id")
 
     for name in ("tick", "drain"):
         admin = subparsers.add_parser(name, help=f"invoke Admin {name}")
@@ -159,8 +162,23 @@ def main(argv: list[str] | None = None) -> int:
         print(verified.model_dump_json(indent=2))
         return 0 if verified.status == "COMPLETED" else 3
     if args.command == "inspect":
-        events = EventStore(args.state_root).list_events(args.object_type, args.object_id)
-        print(json.dumps([event.model_dump(mode="json") for event in events], indent=2))
+        store = EventStore(args.state_root)
+        if args.kind == "leases":
+            values = list(store.iter_snapshots("leases"))
+        else:
+            if not args.object_type or not args.object_id:
+                raise SystemExit("inspect requires --object-type and --object-id")
+            if args.kind == "events":
+                values = [
+                    event.model_dump(mode="json")
+                    for event in store.list_events(args.object_type, args.object_id)
+                ]
+            elif args.kind == "immutable":
+                values = [store.read_immutable(args.object_type, args.object_id)]
+            else:
+                snapshot = store.read_snapshot(args.object_type, args.object_id)
+                values = [snapshot] if snapshot is not None else []
+        print(json.dumps(values, indent=2))
         return 0
     if args.command in {"tick", "drain", "compile-retry", "reconcile", "reload-users"}:
         return _run_admin(args)

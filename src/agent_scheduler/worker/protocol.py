@@ -12,12 +12,14 @@ from fastapi import WebSocket, WebSocketDisconnect
 
 from agent_scheduler.domain.models import (
     ExecutionPlan,
+    GpuState,
     PrepareManifest,
     ProtocolEnvelope,
     Task,
     WorkerSnapshot,
     new_id,
     strict_from_json_value,
+    utc_now,
 )
 from agent_scheduler.scheduler.core import ExecutionResult, WorkerDriver
 from agent_scheduler.storage.events import EventStore
@@ -34,6 +36,18 @@ class WorkerHub:
         self._connections: dict[str, WebSocket] = {}
         self._pending: dict[str, asyncio.Future[ProtocolEnvelope]] = {}
         self._sequence: dict[str, int] = {}
+        self._receive_sequence: dict[str, int] = {}
+        self._last_snapshot: dict[str, WorkerSnapshot] = {}
+        for value in events.iter_snapshots("protocol-sequence"):
+            worker = value.get("worker_id")
+            sequence = value.get("sequence")
+            if isinstance(worker, str) and isinstance(sequence, int):
+                self._sequence[worker] = sequence
+        for value in events.iter_snapshots("worker-receive-sequence"):
+            worker = value.get("worker_id")
+            sequence = value.get("sequence")
+            if isinstance(worker, str) and isinstance(sequence, int):
+                self._receive_sequence[worker] = sequence
         self._loop: asyncio.AbstractEventLoop | None = None
         self._lock = asyncio.Lock()
 
@@ -48,6 +62,22 @@ class WorkerHub:
         try:
             while True:
                 envelope = ProtocolEnvelope.model_validate_json(await websocket.receive_text())
+                prior_sequence = self._receive_sequence.get(worker_id, 0)
+                if envelope.sequence <= prior_sequence:
+                    if self.events.immutable_exists("worker-replies", envelope.message_id):
+                        await self._send_ack(worker_id, envelope)
+                    continue
+                if envelope.sequence != prior_sequence + 1:
+                    raise WorkerProtocolError(
+                        f"Worker sequence gap: expected {prior_sequence + 1}, "
+                        f"got {envelope.sequence}"
+                    )
+                self._receive_sequence[worker_id] = envelope.sequence
+                self.events.write_snapshot(
+                    "worker-receive-sequence",
+                    _worker_object_id(worker_id),
+                    {"worker_id": worker_id, "sequence": envelope.sequence},
+                )
                 self.events.append(
                     "workers",
                     _worker_object_id(worker_id),
@@ -65,6 +95,7 @@ class WorkerHub:
                     snapshot = strict_from_json_value(WorkerSnapshot, envelope.payload["worker"])
                     if snapshot.worker_id != worker_id:
                         raise WorkerProtocolError("heartbeat worker_id mismatch")
+                    self._last_snapshot[worker_id] = snapshot
                     asyncio.create_task(asyncio.to_thread(self.on_heartbeat, snapshot))
                     await self._send_ack(worker_id, envelope)
                     continue
@@ -72,13 +103,29 @@ class WorkerHub:
                 if isinstance(reply_to, str):
                     future = self._pending.get(reply_to)
                     if future is not None and not future.done():
+                        if not self.events.immutable_exists("worker-replies", envelope.message_id):
+                            self.events.write_immutable(
+                                "worker-replies", envelope.message_id, envelope
+                            )
                         future.set_result(envelope)
-                    await self._send_ack(worker_id, envelope)
+                        await self._send_ack(worker_id, envelope)
         except WebSocketDisconnect:
             pass
         finally:
             async with self._lock:
                 self._connections.pop(worker_id, None)
+            prior = self._last_snapshot.get(worker_id)
+            if prior is not None:
+                offline = prior.model_copy(
+                    update={
+                        "online": False,
+                        "last_heartbeat_at": utc_now(),
+                        "gpus": tuple(
+                            gpu.model_copy(update={"state": GpuState.UNKNOWN}) for gpu in prior.gpus
+                        ),
+                    }
+                )
+                await asyncio.to_thread(self.on_heartbeat, offline)
 
     def request(
         self,
@@ -123,6 +170,11 @@ class WorkerHub:
             raise WorkerProtocolError("Worker is not connected")
         sequence = self._sequence.get(worker_id, 0) + 1
         self._sequence[worker_id] = sequence
+        self.events.write_snapshot(
+            "protocol-sequence",
+            _worker_object_id(worker_id),
+            {"worker_id": worker_id, "sequence": sequence},
+        )
         envelope = ProtocolEnvelope(
             message_id=new_id("msg"),
             sequence=sequence,
@@ -153,6 +205,11 @@ class WorkerHub:
         websocket = self._connections[worker_id]
         sequence = self._sequence.get(worker_id, 0) + 1
         self._sequence[worker_id] = sequence
+        self.events.write_snapshot(
+            "protocol-sequence",
+            _worker_object_id(worker_id),
+            {"worker_id": worker_id, "sequence": sequence},
+        )
         ack = ProtocolEnvelope(
             message_id=new_id("msg"),
             sequence=sequence,
@@ -188,7 +245,7 @@ class RemoteWorkerDriver(WorkerDriver):
         response = self.hub.request(
             self.worker_id,
             "PLAN",
-            {"plan": plan.model_dump(mode="json"), **self._task_reference(task)},
+            {**self._plan_reference(plan), **self._task_reference(task)},
             assignment_id=plan.assignment_id,
             dispatch_generation=plan.dispatch_generation,
             lease_epoch=plan.lease_epoch,
@@ -201,7 +258,7 @@ class RemoteWorkerDriver(WorkerDriver):
         response = self.hub.request(
             self.worker_id,
             "EXECUTE",
-            {"plan": plan.model_dump(mode="json"), **self._task_reference(task)},
+            {**self._plan_reference(plan), **self._task_reference(task)},
             assignment_id=plan.assignment_id,
             dispatch_generation=plan.dispatch_generation,
             lease_epoch=plan.lease_epoch,
@@ -240,7 +297,7 @@ class RemoteWorkerDriver(WorkerDriver):
         response = self.hub.request(
             self.worker_id,
             "CANCEL",
-            {"plan": plan.model_dump(mode="json"), **self._task_reference(task)},
+            {**self._plan_reference(plan), **self._task_reference(task)},
             assignment_id=plan.assignment_id,
             dispatch_generation=plan.dispatch_generation,
             lease_epoch=plan.lease_epoch,
@@ -253,7 +310,7 @@ class RemoteWorkerDriver(WorkerDriver):
         response = self.hub.request(
             self.worker_id,
             "RECONCILE",
-            {"plan": plan.model_dump(mode="json"), **self._task_reference(task)},
+            {**self._plan_reference(plan), **self._task_reference(task)},
             assignment_id=plan.assignment_id,
             dispatch_generation=plan.dispatch_generation,
             lease_epoch=plan.lease_epoch,
@@ -281,6 +338,18 @@ class RemoteWorkerDriver(WorkerDriver):
                 raise WorkerProtocolError("Worker evidence lacks event_id")
             if not self.hub.events.immutable_exists("worker-evidence", event_id):
                 self.hub.events.write_immutable("worker-evidence", event_id, value)
+
+    def _plan_reference(self, plan: ExecutionPlan) -> dict[str, object]:
+        if plan.content_hash is None:
+            raise WorkerProtocolError("ExecutionPlan has no content hash")
+        return {
+            "plan_id": plan.plan_id,
+            "plan_content_hash": plan.content_hash,
+            "plan_path": f"{self.state_root}/immutable/plans/{plan.plan_id}.json",
+            "plan_canonical_path": (
+                f"{self.state_root}/immutable/plans/{plan.plan_id}.canonical.json"
+            ),
+        }
 
     def _task_reference(self, task: Task) -> dict[str, object]:
         if task.content_hash is None:

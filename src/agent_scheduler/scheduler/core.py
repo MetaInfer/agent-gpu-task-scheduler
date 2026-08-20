@@ -24,7 +24,7 @@ from agent_scheduler.domain.models import (
     utc_now,
 )
 from agent_scheduler.domain.state import transition_task
-from agent_scheduler.integrity.signing import sign_model, verify_model
+from agent_scheduler.integrity.signing import canonical_bytes, sign_model, verify_model
 from agent_scheduler.storage.events import EventStore
 
 
@@ -104,6 +104,7 @@ class Scheduler:
         self._epochs: dict[tuple[str, str], int] = {}
         self._tasks: dict[str, Task] = {}
         self._statuses: dict[str, TaskStatus] = {}
+        self._initial_statuses: dict[str, TaskStatus] = {}
         self._plans: dict[str, ExecutionPlan] = {}
         self._cancel_requested: set[str] = set()
         self._lock = RLock()
@@ -126,7 +127,7 @@ class Scheduler:
     def enqueue(self, task: Task, request_id: str = "scheduler") -> TaskStatus:
         with self._lock:
             if task.task_id in self._statuses:
-                return self._statuses[task.task_id]
+                return self._initial_statuses[task.task_id]
             self._verify_task(task)
             self._persist_task_if_needed(task)
             now = utc_now()
@@ -138,6 +139,7 @@ class Scheduler:
             )
             self._tasks[task.task_id] = task
             self._statuses[task.task_id] = status
+            self._initial_statuses[task.task_id] = status
             self._queue[task.task_id] = _Queued(task, status, now, now)
             self._persist_status(status)
             self.events.append("tasks", task.task_id, "QUEUED", "scheduler", request_id, {})
@@ -163,6 +165,17 @@ class Scheduler:
             for queued in ordered:
                 selections = self._select_for_task(queued.task)
                 if selections is None:
+                    if (
+                        self.qualification_profile
+                        and (utc_now() - queued.enqueued_at).total_seconds() >= 30 * 60
+                    ):
+                        self._queue.pop(queued.task.task_id)
+                        self._transition(
+                            queued.task,
+                            TaskState.BLOCKED,
+                            request_id,
+                            failure_reason="QUALIFICATION_GPU_WAIT_EXPIRED",
+                        )
                     continue
                 self._queue.pop(queued.task.task_id)
                 claimed = (queued.task, selections)
@@ -195,6 +208,12 @@ class Scheduler:
 
     def plans(self) -> list[ExecutionPlan]:
         return list(self._plans.values())
+
+    def queued_task_ids(self) -> list[str]:
+        with self._lock:
+            return [
+                queued.task.task_id for queued in sorted(self._queue.values(), key=self._queue_key)
+            ]
 
     def cancel_task(self, task_id: str, *, actor: str, request_id: str) -> TaskStatus:
         with self._lock:
@@ -363,6 +382,11 @@ class Scheduler:
                     self.signing_key,
                 )
                 self.events.write_immutable("manifests", manifest.manifest_id, manifest)
+                self.events.write_immutable_bytes(
+                    "manifests",
+                    f"{manifest.manifest_id}.canonical.json",
+                    canonical_bytes(manifest),
+                )
                 provisional = ResourceLease(
                     lease_id=new_id("lease"),
                     execution_id=task.execution_id,
@@ -389,10 +413,11 @@ class Scheduler:
             for unit, manifest in zip(task.units, manifests, strict=True):
                 if task.content_hash is None:
                     raise SchedulingError("signed Task has no content hash")
+                plan_id = new_id("plan")
                 plan = sign_model(
                     ExecutionPlan(
                         key_id=self.key_id,
-                        plan_id=new_id("plan"),
+                        plan_id=plan_id,
                         assignment_id=manifest.assignment_id,
                         execution_id=task.execution_id,
                         task_id=task.task_id,
@@ -412,12 +437,18 @@ class Scheduler:
                             ("TASK_ID", task.task_id),
                             ("UNIT_ID", unit.unit_id),
                             ("EXECUTION_ID", task.execution_id),
+                            ("PLAN_ID", plan_id),
+                            ("ASSIGNMENT_ID", manifest.assignment_id),
+                            ("LEASE_EPOCH", str(manifest.lease_epoch)),
                         ),
                         created_at=utc_now(),
                     ),
                     self.signing_key,
                 )
                 self.events.write_immutable("plans", plan.plan_id, plan)
+                self.events.write_immutable_bytes(
+                    "plans", f"{plan.plan_id}.canonical.json", canonical_bytes(plan)
+                )
                 self._plans[plan.plan_id] = plan
                 worker_reply_uncertain = True
                 acknowledged = self.driver.acknowledge_plan(plan, task)
@@ -630,11 +661,19 @@ class Scheduler:
     def _load(self) -> None:
         for data in self.events.iter_snapshots("workers"):
             worker = strict_from_json_value(WorkerSnapshot, data)
-            self._workers[worker.worker_id] = worker
+            self._workers[worker.worker_id] = worker.model_copy(
+                update={
+                    "online": False,
+                    "gpus": tuple(
+                        gpu.model_copy(update={"state": GpuState.UNKNOWN}) for gpu in worker.gpus
+                    ),
+                }
+            )
         for data in self.events.iter_immutable("tasks"):
             loaded_task = strict_from_json_value(Task, data)
             self._tasks[loaded_task.task_id] = loaded_task
         latest_status: dict[str, TaskStatus] = {}
+        initial_status: dict[str, TaskStatus] = {}
         for data in self.events.iter_snapshots("task-status"):
             status = strict_from_json_value(TaskStatus, data)
             latest_status[status.task_id] = status
@@ -643,6 +682,37 @@ class Scheduler:
             prior = latest_status.get(status.task_id)
             if prior is None or status.updated_at >= prior.updated_at:
                 latest_status[status.task_id] = status
+            first = initial_status.get(status.task_id)
+            if first is None or status.updated_at < first.updated_at:
+                initial_status[status.task_id] = status
+        self._initial_statuses = initial_status
+        active_states = {
+            TaskState.PREPARING,
+            TaskState.RESERVED,
+            TaskState.DISPATCHED,
+            TaskState.STARTING,
+            TaskState.RUNNING,
+            TaskState.FINALIZING,
+        }
+        for task_id, status in list(latest_status.items()):
+            if status.state in active_states:
+                reconciled = status.model_copy(
+                    update={
+                        "state": TaskState.RECONCILIATION_REQUIRED,
+                        "updated_at": utc_now(),
+                        "failure_reason": "MASTER_RESTART_DURING_ACTIVE_EXECUTION",
+                    }
+                )
+                latest_status[task_id] = reconciled
+                self._persist_status(reconciled)
+                self.events.append(
+                    "tasks",
+                    task_id,
+                    "RECONCILIATION_REQUIRED",
+                    "master-recovery",
+                    new_id("request"),
+                    {"previous_state": status.state.value},
+                )
         self._statuses = latest_status
         for status in latest_status.values():
             queued_task = self._tasks.get(status.task_id)
@@ -665,6 +735,13 @@ class Scheduler:
             self._leases[lease.lease_id] = lease
         for data in self.events.iter_immutable("lease-history"):
             lease = strict_from_json_value(ResourceLease, data["lease"])
+            for gpu_id in lease.gpu_ids:
+                resource = (lease.worker_id, f"gpu:{gpu_id}")
+                self._epochs[resource] = max(self._epochs.get(resource, 0), lease.lease_epoch)
+            container_resource = (lease.worker_id, f"container:{lease.container_name}")
+            self._epochs[container_resource] = max(
+                self._epochs.get(container_resource, 0), lease.lease_epoch
+            )
             if data.get("action") in {"HELD", "COMMITTED"}:
                 self._leases[lease.lease_id] = lease
             elif data.get("action") == "RELEASED":

@@ -11,7 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, WebSocket
-from fastapi.responses import HTMLResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_scheduler.adapters.harness import ClaudeCodeAdapter, FakeHarnessAdapter
@@ -21,7 +22,7 @@ from agent_scheduler.proposal.service import ProposalError, ProposalService
 from agent_scheduler.runtime import RuntimeIdentity, load_runtime
 from agent_scheduler.scheduler.core import Scheduler, SchedulingError, WorkerDriver
 from agent_scheduler.storage import EventStore, StoreCorruptionError, prune_framework_logs
-from agent_scheduler.worker.docker import DockerCLI
+from agent_scheduler.worker.docker import DockerCLI, DockerError
 from agent_scheduler.worker.driver import DockerWorkerDriver, FakeWorkerDriver
 from agent_scheduler.worker.gpu import HySmiSampler
 from agent_scheduler.worker.protocol import RemoteWorkerDriver, WorkerHub
@@ -149,6 +150,33 @@ def create_app(settings: Settings, identity: RuntimeIdentity | None = None) -> F
 
     app = FastAPI(title="Agent GPU Task Scheduler", version="0.2.0", lifespan=lifespan)
     app.state.context = context
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+        request_id = _request_id(request)
+        return JSONResponse(
+            status_code=422,
+            content=_error_body(
+                "VALIDATION_ERROR",
+                "request failed strict schema validation",
+                request_id,
+                details=exc.errors(),
+            ),
+        )
+
+    @app.exception_handler(HTTPException)
+    async def http_error(request: Request, exc: HTTPException) -> JSONResponse:
+        request_id = _request_id(request)
+        if isinstance(exc.detail, dict) and "error_code" in exc.detail:
+            body = dict(exc.detail)
+            body.setdefault("request_id", request_id)
+        else:
+            body = _error_body(
+                "METHOD_NOT_ALLOWED" if exc.status_code == 405 else "HTTP_ERROR",
+                str(exc.detail),
+                request_id,
+            )
+        return JSONResponse(status_code=exc.status_code, content=body, headers=exc.headers)
 
     @app.get("/health")
     def health() -> dict[str, object]:
@@ -342,7 +370,7 @@ def create_app(settings: Settings, identity: RuntimeIdentity | None = None) -> F
         root = (settings.state_root / "framework-logs").resolve()
         path = (root / task_id / unit_id / execution_id / name).resolve()
         if root not in path.parents or not path.is_file():
-            raise HTTPException(status_code=404, detail="log not found")
+            raise _error(404, "LOG_NOT_FOUND", "log not found", str(uuid.uuid4()))
         with path.open("rb") as handle:
             handle.seek(offset)
             data = handle.read(limit)
@@ -351,6 +379,38 @@ def create_app(settings: Settings, identity: RuntimeIdentity | None = None) -> F
             media_type="application/octet-stream",
             headers={"X-Next-Offset": str(offset + len(data))},
         )
+
+    @app.get("/api/v1/observe/logs/{task_id}/{unit_id}/{execution_id}/{name}")
+    def observe_log(
+        task_id: str,
+        unit_id: str,
+        execution_id: str,
+        name: str,
+        request: Request,
+        offset: int | None = Query(default=None, ge=0),
+        tail_lines: int = Query(default=1000, ge=1, le=10000),
+    ) -> dict[str, object]:
+        request_id = _request_id(request)
+        root = (settings.state_root / "framework-logs").resolve()
+        path = (root / task_id / unit_id / execution_id / name).resolve()
+        if root not in path.parents or not path.is_file():
+            raise _error(404, "LOG_NOT_FOUND", "log not found", request_id)
+        data = path.read_bytes()
+        start = (
+            offset
+            if offset is not None
+            else max(
+                0,
+                len(data) - len(b"\n".join(data.splitlines()[-tail_lines:])),
+            )
+        )
+        chunk = data[start:]
+        return {
+            "request_id": request_id,
+            "data": chunk.decode("utf-8", errors="replace"),
+            "offset": start,
+            "next_offset": len(data),
+        }
 
     @app.post("/api/v1/admin/tick")
     def tick(body: AdminReasonRequest, request: Request) -> dict[str, object]:
@@ -372,9 +432,15 @@ def create_app(settings: Settings, identity: RuntimeIdentity | None = None) -> F
     @app.post("/api/v1/admin/drain")
     def drain(body: AdminReasonRequest, request: Request) -> dict[str, object]:
         request_id = _request_id(request)
+        before = context.draining
         context.draining = True
         events.append(
-            "admin", _admin_object_id(), "DRAINED", body.actor, request_id, {"reason": body.reason}
+            "admin",
+            _admin_object_id(),
+            "DRAINED",
+            body.actor,
+            request_id,
+            {"reason": body.reason, "before": before, "after": True},
         )
         return {"request_id": request_id, "draining": True}
 
@@ -384,10 +450,26 @@ def create_app(settings: Settings, identity: RuntimeIdentity | None = None) -> F
     ) -> dict[str, object]:
         request_id = _request_id(request)
         try:
+            before = proposals.get(proposal_id).state.value
             task = proposals.retry_compilation(proposal_id, body.actor, request_id)
             task_status = scheduler.enqueue(task, request_id)
+            after = proposals.get(proposal_id).state.value
         except ProposalError as exc:
             raise _proposal_http_error(exc, request_id) from exc
+        events.append(
+            "admin",
+            _admin_object_id(),
+            "COMPILATION_RETRY",
+            body.actor,
+            request_id,
+            {
+                "reason": body.reason,
+                "proposal_id": proposal_id,
+                "before": before,
+                "after": after,
+                "task_id": task.task_id,
+            },
+        )
         return {
             "request_id": request_id,
             "task": task.model_dump(mode="json"),
@@ -399,17 +481,42 @@ def create_app(settings: Settings, identity: RuntimeIdentity | None = None) -> F
         execution_id: str, body: AdminReasonRequest, request: Request
     ) -> dict[str, object]:
         request_id = _request_id(request)
+        before = [
+            lease.model_dump(mode="json")
+            for lease in scheduler.leases()
+            if lease.execution_id == execution_id
+        ]
         try:
             released = scheduler.reconcile_execution(
                 execution_id, actor=body.actor, reason=body.reason, request_id=request_id
             )
         except SchedulingError as exc:
             raise _error(409, "RECONCILE_REJECTED", str(exc), request_id) from exc
+        after = [
+            lease.model_dump(mode="json")
+            for lease in scheduler.leases()
+            if lease.execution_id == execution_id
+        ]
+        events.append(
+            "admin",
+            _admin_object_id(),
+            "RECONCILE_COMMAND",
+            body.actor,
+            request_id,
+            {
+                "reason": body.reason,
+                "execution_id": execution_id,
+                "before": before,
+                "after": after,
+                "released": released,
+            },
+        )
         return {"request_id": request_id, "released": released}
 
     @app.post("/api/v1/admin/reload-users")
     def reload_users(body: ReloadUsersRequest, request: Request) -> dict[str, object]:
         request_id = _request_id(request)
+        before = sorted(proposals.allowed_users)
         proposals.allowed_users = set(body.users)
         events.append(
             "admin",
@@ -417,21 +524,58 @@ def create_app(settings: Settings, identity: RuntimeIdentity | None = None) -> F
             "USERS_RELOADED",
             body.actor,
             request_id,
-            {"reason": body.reason, "users": sorted(body.users)},
+            {
+                "reason": body.reason,
+                "before": before,
+                "after": sorted(body.users),
+            },
         )
         return {"request_id": request_id, "users": sorted(body.users)}
 
     @app.get("/api/v1/observe/summary")
     def observe_summary(request: Request) -> dict[str, object]:
         request_id = _request_id(request)
+        tasks = proposals.list_tasks()
+        container: dict[str, object]
+        try:
+            inspection = DockerCLI().inspect("fh-sglang-deepseek-v4-flash")
+            container = {
+                "name": "fh-sglang-deepseek-v4-flash",
+                "exists": inspection.exists,
+                "running": inspection.running,
+                "image_id": inspection.image_id,
+            }
+        except DockerError as exc:
+            container = {
+                "name": "fh-sglang-deepseek-v4-flash",
+                "exists": False,
+                "running": False,
+                "error": type(exc).__name__,
+            }
+        framework_logs = [
+            str(path.relative_to(settings.state_root))
+            for path in sorted((settings.state_root / "framework-logs").rglob("*.json"))
+        ]
         return {
             "request_id": request_id,
             "master": {"draining": context.draining, "profile": _profile(settings)},
             "workers": [item.model_dump(mode="json") for item in scheduler.workers()],
+            "gpus": [
+                gpu.model_dump(mode="json") for worker in scheduler.workers() for gpu in worker.gpus
+            ],
             "proposals": [item.model_dump(mode="json") for item in proposals.list_proposals()],
+            "reviews": [item.model_dump(mode="json") for item in proposals.list_reviews()],
             "tasks": [item.model_dump(mode="json") for item in scheduler.statuses()],
+            "units": [unit.model_dump(mode="json") for task in tasks for unit in task.units],
+            "queue": scheduler.queued_task_ids(),
             "plans": [item.model_dump(mode="json") for item in scheduler.plans()],
             "leases": [item.model_dump(mode="json") for item in scheduler.leases()],
+            "containers": [container],
+            "framework_logs": framework_logs,
+            "audit_streams": [
+                str(path.relative_to(events.events_root))
+                for path in sorted(events.events_root.rglob("*.jsonl"))
+            ],
         }
 
     @app.get("/api/v1/observe/events/{object_type}/{object_id}")
@@ -470,7 +614,7 @@ def create_app(settings: Settings, identity: RuntimeIdentity | None = None) -> F
         methods=["POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     )
     def observe_write_rejected(path: str) -> Response:
-        return Response(status_code=405)
+        raise HTTPException(status_code=405, detail="observe namespace is GET-only")
 
     return app
 
@@ -504,23 +648,36 @@ def _proposal_http_error(exc: ProposalError, request_id: str) -> HTTPException:
     return _error(status_code, exc.code, str(exc), request_id)
 
 
+def _error_body(
+    code: str,
+    message: str,
+    request_id: str,
+    *,
+    details: object | None = None,
+) -> dict[str, object]:
+    body: dict[str, object] = {
+        "error_code": code,
+        "message": message,
+        "object_id": None,
+        "current_state": None,
+        "request_id": request_id,
+        "retryable": False,
+    }
+    if details is not None:
+        body["details"] = details
+    return body
+
+
 def _error(status_code: int, code: str, message: str, request_id: str) -> HTTPException:
     return HTTPException(
         status_code=status_code,
-        detail={
-            "error_code": code,
-            "message": message,
-            "object_id": None,
-            "current_state": None,
-            "request_id": request_id,
-            "retryable": False,
-        },
+        detail=_error_body(code, message, request_id),
     )
 
 
 def _reject_if_draining(context: AppContext) -> None:
     if context.draining:
-        raise HTTPException(status_code=503, detail="Master is draining")
+        raise _error(503, "MASTER_DRAINING", "Master is draining", str(uuid.uuid4()))
 
 
 def _profile(settings: Settings) -> dict[str, object]:

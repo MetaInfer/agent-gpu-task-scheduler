@@ -2,7 +2,7 @@
 
 - Checked at: 2026-08-21
 - Status: `BLOCKED_QUALIFICATION`
-- Code gate: 45 local tests passed, 3 real-environment tests opt-in/skipped; Ruff and Mypy passed before real preflight
+- Code gate: 50 local tests passed, 3 real-environment tests opt-in/skipped; Ruff and Mypy passed before real preflight
 
 ## Blocking preconditions
 

@@ -99,6 +99,47 @@ class DockerWorkerDriver:
     _prepared: dict[str, PrepareManifest] = field(default_factory=dict, init=False)
     _plans: dict[str, ExecutionPlan] = field(default_factory=dict, init=False)
     _epoch_high_water: dict[str, int] = field(default_factory=dict, init=False)
+    _resource_owner: dict[str, str] = field(default_factory=dict, init=False)
+    _state_path: Path = field(init=False)
+
+    def __post_init__(self) -> None:
+        directory = self.events.root / "worker-inbox" / self.worker_id
+        directory.mkdir(parents=True, exist_ok=True)
+        self._state_path = directory / "driver-state.json"
+        if not self._state_path.is_file():
+            return
+        value = json.loads(self._state_path.read_text(encoding="utf-8"))
+        self._epoch_high_water = {
+            str(key): int(epoch) for key, epoch in value.get("epoch_high_water", {}).items()
+        }
+        self._resource_owner = {
+            str(key): str(owner) for key, owner in value.get("resource_owner", {}).items()
+        }
+        self._prepared = {
+            assignment_id: PrepareManifest.model_validate_json(json.dumps(manifest))
+            for assignment_id, manifest in value.get("prepared", {}).items()
+        }
+        self._plans = {
+            assignment_id: ExecutionPlan.model_validate_json(json.dumps(plan))
+            for assignment_id, plan in value.get("plans", {}).items()
+        }
+
+    def _persist_state(self) -> None:
+        temporary = self._state_path.with_suffix(".tmp")
+        payload = {
+            "epoch_high_water": self._epoch_high_water,
+            "resource_owner": self._resource_owner,
+            "prepared": {
+                key: value.model_dump(mode="json") for key, value in self._prepared.items()
+            },
+            "plans": {key: value.model_dump(mode="json") for key, value in self._plans.items()},
+        }
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, self._state_path)
 
     def prepare(self, manifest: PrepareManifest, task: Task) -> bool:
         try:
@@ -118,7 +159,9 @@ class DockerWorkerDriver:
                 raise DriverError("STALE_LEASE_EPOCH")
             for resource in resources:
                 self._epoch_high_water[resource] = manifest.lease_epoch
+                self._resource_owner[resource] = manifest.assignment_id
             self._prepared[manifest.assignment_id] = manifest
+            self._persist_state()
             self._audit(
                 task,
                 "PREPARED",
@@ -145,6 +188,7 @@ class DockerWorkerDriver:
             ):
                 raise DriverError("ExecutionPlan does not match PrepareManifest/Task")
             self._plans[plan.assignment_id] = plan
+            self._persist_state()
             self._audit(task, "PLAN_ACK", {"plan_id": plan.plan_id})
             return True
         except (DriverError, KeyError):
@@ -152,8 +196,8 @@ class DockerWorkerDriver:
 
     def execute(self, plan: ExecutionPlan, task: Task) -> ExecutionResult:
         unit = next(unit for unit in task.units if unit.unit_id == plan.unit_id)
-        if self._plans.get(plan.assignment_id) != plan:
-            return ExecutionResult(1, False, False, True, failure_reason="PLAN_NOT_ACKED")
+        if self._plans.get(plan.assignment_id) != plan or not self._is_current_plan(plan):
+            return ExecutionResult(1, False, False, True, failure_reason="PLAN_NOT_CURRENT")
         start_attempted = False
         forced = False
         failure_reason: str | None = None
@@ -172,6 +216,15 @@ class DockerWorkerDriver:
             self._validate_container(unit, require_stopped=True)
             self._audit(
                 task,
+                "DOCKER_INSPECT_PRE",
+                {
+                    "plan_id": plan.plan_id,
+                    "argv": ["docker", "inspect", plan.container_name],
+                    "postcondition": "exists=true,running=false,baseline=matched",
+                },
+            )
+            self._audit(
+                task,
                 "TASK_VERIFIED_PRE_DOCKER",
                 {
                     "plan_id": plan.plan_id,
@@ -182,6 +235,15 @@ class DockerWorkerDriver:
             )
             start_attempted = True
             self.docker.start(plan.container_name)
+            self._audit(
+                task,
+                "DOCKER_START_CONFIRMED",
+                {
+                    "plan_id": plan.plan_id,
+                    "argv": ["docker", "start", plan.container_name],
+                    "postcondition": "running=true",
+                },
+            )
             setup_exit = self._run_commands(plan, task, "setup", unit.setup, timeout=remaining(120))
             if setup_exit != 0:
                 failure_reason = "SETUP_NONZERO"
@@ -202,6 +264,21 @@ class DockerWorkerDriver:
         cleanup_ok, warning = (
             self._cleanup(plan.container_name) if start_attempted else (True, None)
         )
+        if start_attempted:
+            self._audit(
+                task,
+                "DOCKER_CLEANUP_INSPECTED",
+                {
+                    "plan_id": plan.plan_id,
+                    "argv": [
+                        ["docker", "stop", "--time", "30", plan.container_name],
+                        ["docker", "kill", plan.container_name],
+                        ["docker", "inspect", plan.container_name],
+                    ],
+                    "cleanup_ok": cleanup_ok,
+                    "warning": warning,
+                },
+            )
         logs_present = all(Path(path).is_file() for path in unit.required_logs)
         outputs_present = all(Path(path).is_file() for path in unit.required_outputs)
         self._audit(
@@ -227,6 +304,16 @@ class DockerWorkerDriver:
             failure_reason=failure_reason,
         )
 
+    def _is_current_plan(self, plan: ExecutionPlan) -> bool:
+        resources = [f"gpu:{gpu_id}" for gpu_id in plan.gpu_ids] + [
+            f"container:{plan.container_name}"
+        ]
+        return all(
+            self._epoch_high_water.get(resource) == plan.lease_epoch
+            and self._resource_owner.get(resource) == plan.assignment_id
+            for resource in resources
+        )
+
     def query_status(
         self,
         assignment_id: str,
@@ -235,7 +322,14 @@ class DockerWorkerDriver:
         task: Task,
     ) -> str:
         plan = self._plans.get(assignment_id)
+        manifest = self._prepared.get(assignment_id)
         if plan is not None:
+            if (
+                plan.dispatch_generation != dispatch_generation
+                or plan.lease_epoch != lease_epoch
+                or not self._is_current_plan(plan)
+            ):
+                return "STALE"
             completed = (
                 self.events.root
                 / "worker-inbox"
@@ -253,7 +347,12 @@ class DockerWorkerDriver:
             except DockerError:
                 return "UNKNOWN"
             return "PLAN_ACK"
-        if assignment_id in self._prepared:
+        if manifest is not None:
+            if (
+                manifest.dispatch_generation != dispatch_generation
+                or manifest.lease_epoch != lease_epoch
+            ):
+                return "STALE"
             return "PREPARED"
         return "NOT_REGISTERED"
 
@@ -261,6 +360,8 @@ class DockerWorkerDriver:
         try:
             self._verify_signed(task)
             self._verify_signed(plan)
+            if self._plans.get(plan.assignment_id) != plan or not self._is_current_plan(plan):
+                raise DriverError("cancel references a stale assignment")
             cleanup_ok, _warning = self._cleanup(plan.container_name)
             self._audit(task, "CANCELLED_BY_MASTER", {"plan_id": plan.plan_id})
             return cleanup_ok
@@ -271,6 +372,8 @@ class DockerWorkerDriver:
         try:
             self._verify_signed(task)
             self._verify_signed(plan)
+            if self._plans.get(plan.assignment_id) != plan or not self._is_current_plan(plan):
+                raise DriverError("reconcile references a stale assignment")
             inspection = self.docker.inspect(plan.container_name)
             return inspection.exists and not inspection.running
         except (DriverError, DockerError):

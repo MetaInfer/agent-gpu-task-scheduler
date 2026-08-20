@@ -31,10 +31,24 @@ def test_proposal_confirm_schedule_and_observe(app_client):
     assert tick.json()["statuses"][0]["state"] == "COMPLETED"
     fetched = client.get(f"/api/v1/tasks/{task['task_id']}")
     assert fetched.json()["status"]["state"] == "COMPLETED"
+    repeated = client.post(
+        f"/api/v1/proposals/{proposal['proposal_id']}/confirm",
+        headers={
+            "X-Username": "zz_chentian",
+            "Idempotency-Key": "confirm-api-1",
+        },
+        json={"revision_id": proposal["current_revision_id"]},
+    )
+    assert repeated.json()["status"]["state"] == "QUEUED"
     summary = client.get("/api/v1/observe/summary")
     assert summary.status_code == 200
     assert summary.json()["proposals"]
+    assert summary.json()["reviews"]
     assert summary.json()["tasks"]
+    assert summary.json()["units"]
+    assert "queue" in summary.json()
+    assert summary.json()["containers"]
+    assert "audit_streams" in summary.json()
     assert client.post("/api/v1/observe/summary").status_code == 405
     assert "worker_api_key" not in summary.text
 
@@ -54,13 +68,26 @@ def test_idempotency_conflict_and_strict_request(app_client):
         "/api/v1/proposals", headers=headers, json={"markdown": proposal_markdown(2)}
     )
     assert response.status_code == 409
-    assert response.json()["detail"]["error_code"] == "IDEMPOTENCY_CONFLICT"
+    assert response.json()["error_code"] == "IDEMPOTENCY_CONFLICT"
     unknown = client.post(
         "/api/v1/proposals",
         headers={"X-Username": "zz_chentian", "Idempotency-Key": "unknown"},
         json={"markdown": proposal_markdown(), "extra": True},
     )
     assert unknown.status_code == 422
+    assert set(unknown.json()).issuperset(
+        {
+            "error_code",
+            "message",
+            "object_id",
+            "current_state",
+            "request_id",
+            "retryable",
+        }
+    )
+    method = client.post("/api/v1/observe/summary")
+    assert method.status_code == 405
+    assert method.json()["error_code"] == "METHOD_NOT_ALLOWED"
 
 
 def test_cancel_and_drain_are_real_state_changes(app_client):

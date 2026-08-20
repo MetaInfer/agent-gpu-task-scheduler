@@ -13,6 +13,7 @@ class StartThenFailDocker:
     def __init__(self, cleanup_fails: bool):
         self.running = False
         self.cleanup_fails = cleanup_fails
+        self.start_calls = 0
         self.stop_calls = 0
 
     def inspect(self, name):
@@ -46,6 +47,7 @@ class StartThenFailDocker:
         )
 
     def start(self, name):
+        self.start_calls += 1
         self.running = True
         raise DockerTimeout("client timed out after daemon started container")
 
@@ -57,7 +59,7 @@ class StartThenFailDocker:
         return self.inspect(name), None
 
 
-def manifest_and_plan(task, identity):
+def manifest_and_plan(task, identity, *, epoch=1, generation=1):
     unit = task.units[0]
     manifest = sign_model(
         PrepareManifest(
@@ -66,10 +68,10 @@ def manifest_and_plan(task, identity):
             task_id=task.task_id,
             execution_id=task.execution_id,
             assignment_id=new_id("assign"),
-            dispatch_generation=1,
+            dispatch_generation=generation,
             worker_id=unit.worker_id,
             gpu_ids=(0,),
-            lease_epoch=1,
+            lease_epoch=epoch,
             container_name=unit.container_name,
             created_at=utc_now(),
         ),
@@ -83,11 +85,11 @@ def manifest_and_plan(task, identity):
             execution_id=task.execution_id,
             task_id=task.task_id,
             task_content_hash=task.content_hash or "0" * 64,
-            dispatch_generation=1,
+            dispatch_generation=generation,
             worker_id=unit.worker_id,
             unit_id=unit.unit_id,
             gpu_ids=(0,),
-            lease_epoch=1,
+            lease_epoch=epoch,
             container_name=unit.container_name,
             submitter_username=unit.submitter_username,
             container_user=unit.container_user,
@@ -97,6 +99,37 @@ def manifest_and_plan(task, identity):
         identity.signing_private_key,
     )
     return manifest, plan
+
+
+def test_new_epoch_invalidates_old_execute_and_cancel(runtime_identity):
+    root, identity = runtime_identity
+    task = signed_task(identity)
+    docker = StartThenFailDocker(cleanup_fails=False)
+    driver = DockerWorkerDriver(
+        docker, EventStore(root), identity.signing_public_key, identity.key_id
+    )
+    first_manifest, first_plan = manifest_and_plan(task, identity, epoch=1)
+    second_manifest, second_plan = manifest_and_plan(task, identity, epoch=2)
+    assert driver.prepare(first_manifest, task)
+    assert driver.acknowledge_plan(first_plan, task)
+    assert driver.prepare(second_manifest, task)
+    assert driver.acknowledge_plan(second_plan, task)
+    result = driver.execute(first_plan, task)
+    assert result.failure_reason == "PLAN_NOT_CURRENT"
+    assert docker.start_calls == 0
+    assert not driver.cancel(first_plan, task)
+    rebuilt = DockerWorkerDriver(
+        docker, EventStore(root), identity.signing_public_key, identity.key_id
+    )
+    assert (
+        rebuilt.query_status(
+            first_plan.assignment_id,
+            first_plan.dispatch_generation,
+            first_plan.lease_epoch,
+            task,
+        )
+        == "STALE"
+    )
 
 
 def test_start_side_effect_always_triggers_cleanup(runtime_identity):

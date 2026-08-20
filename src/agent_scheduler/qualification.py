@@ -10,6 +10,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Literal
 
+import httpx
+
 from agent_scheduler.domain.models import (
     ExecutionPlan,
     PrepareManifest,
@@ -31,7 +33,7 @@ from agent_scheduler.storage import EventStore, StoreCorruptionError
 from agent_scheduler.worker.docker import DockerCLI, DockerError
 
 _LAUNCHER_PATH = "/data/fh/agent-gpu-task-scheduler/scripts/run_torch_collective_smoke.sh"
-_LAUNCHER_SHA256 = "66de599723417262b3d6c2c2e665777c6c2183a770ed1dbce2d69fcb074881f0"
+_LAUNCHER_SHA256 = "c1cf6dee074e03c026dd7272e358d7b15c65b6ff3b6ae1c1f71e7efae341de0c"
 _TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "CLEANUP_FAILED"}
 
 
@@ -187,44 +189,73 @@ def run_submitter_agent(
         if os.environ.get("ANTHROPIC_BASE_URL"):
             env["ANTHROPIC_BASE_URL"] = os.environ["ANTHROPIC_BASE_URL"]
         cli_version = _claude_version(executable, env)
-        completed = subprocess.run(
-            command,
-            input=prompt,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=timeout_seconds,
-            cwd=project_root,
-            env=env,
-        )
-        audit.update(
-            {
-                "ended_at": utc_now().isoformat(),
+        last_reason = "Submitter exhausted retry attempts"
+        for attempt in range(1, 5):
+            attempt_id = invocation_id if attempt == 1 else new_id("harness")
+            attempt_audit = {
+                **audit,
+                "invocation_id": attempt_id,
+                "attempt": attempt,
                 "argv": command,
                 "cli_version": cli_version,
                 "cwd": str(project_root),
-                "exit_code": completed.returncode,
-                "stdout": completed.stdout,
-                "stderr": completed.stderr,
             }
-        )
-        store.write_immutable("harness", invocation_id, audit)
-        if completed.returncode != 0:
-            return _blocked((), f"Submitter Claude exited with code {completed.returncode}", run_id)
-        result = strict_from_json_value(
-            QualificationResult, _stream_structured_output(completed.stdout)
-        )
-        if result.run_id != run_id:
-            return _blocked(result.items, "Submitter returned a different run_id", run_id)
-        return result
-    except subprocess.TimeoutExpired:
-        audit.update(
-            {"ended_at": utc_now().isoformat(), "argv": command, "error": "submitter_timeout"}
-        )
-        if store is not None:
-            store.write_immutable("harness", invocation_id, audit)
-        return _blocked((), "Submitter qualification deadline expired", run_id)
-    except (OSError, DockerError, StoreCorruptionError, json.JSONDecodeError, ValueError) as exc:
+            try:
+                completed = subprocess.run(
+                    command,
+                    input=prompt,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=timeout_seconds,
+                    cwd=project_root,
+                    env=env,
+                )
+            except subprocess.TimeoutExpired:
+                attempt_audit.update(
+                    {"ended_at": utc_now().isoformat(), "error": "submitter_timeout"}
+                )
+                store.write_immutable("harness", attempt_id, attempt_audit)
+                last_reason = "Submitter qualification attempt timed out"
+                if attempt < 4:
+                    continue
+                return _blocked((), last_reason, run_id)
+            attempt_audit.update(
+                {
+                    "ended_at": utc_now().isoformat(),
+                    "exit_code": completed.returncode,
+                    "stdout": completed.stdout,
+                    "stderr": completed.stderr,
+                }
+            )
+            store.write_immutable("harness", attempt_id, attempt_audit)
+            if completed.returncode != 0:
+                last_reason = f"Submitter Claude exited with code {completed.returncode}"
+                retryable = _retryable_submitter_failure(completed.stderr)
+                if retryable and attempt < 4:
+                    continue
+                return _blocked((), last_reason, run_id)
+            try:
+                result = strict_from_json_value(
+                    QualificationResult, _stream_structured_output(completed.stdout)
+                )
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                last_reason = f"Submitter structured output invalid: {type(exc).__name__}"
+                if attempt < 4:
+                    continue
+                return _blocked((), last_reason, run_id)
+            if result.run_id != run_id:
+                return _blocked(result.items, "Submitter returned a different run_id", run_id)
+            return result
+        return _blocked((), last_reason, run_id)
+    except (
+        OSError,
+        DockerError,
+        StoreCorruptionError,
+        httpx.HTTPError,
+        json.JSONDecodeError,
+        ValueError,
+    ) as exc:
         audit.update(
             {
                 "ended_at": utc_now().isoformat(),
@@ -266,6 +297,30 @@ def verify_qualification(
             return _blocked(
                 result.items, "local quality gates are not bound and passing", result.run_id
             )
+        gate_results = gate_records[0].get("results")
+        expected_gate_markers = {"pytest", "ruff", "mypy"}
+        if (
+            not isinstance(gate_results, list)
+            or len(gate_results) != 3
+            or any(
+                not isinstance(gate, dict)
+                or gate.get("exit_code") != 0
+                or not isinstance(gate.get("argv"), list)
+                for gate in gate_results
+            )
+            or {
+                marker
+                for marker in expected_gate_markers
+                if any(
+                    isinstance(gate, dict)
+                    and isinstance(gate.get("argv"), list)
+                    and marker in " ".join(map(str, gate["argv"]))
+                    for gate in gate_results
+                )
+            }
+            != expected_gate_markers
+        ):
+            return _blocked(result.items, "local gate command evidence is invalid", result.run_id)
         expected_cards = {1, 2, 4, 8}
         if {item.card_count for item in result.items} != expected_cards or len(result.items) != 4:
             return _blocked(
@@ -296,7 +351,14 @@ def verify_qualification(
         if not inspection.exists or inspection.running:
             return _blocked(result.items, "reuse container is not confirmed stopped", result.run_id)
         return result
-    except (OSError, DockerError, StoreCorruptionError, json.JSONDecodeError, ValueError) as exc:
+    except (
+        OSError,
+        DockerError,
+        StoreCorruptionError,
+        httpx.HTTPError,
+        json.JSONDecodeError,
+        ValueError,
+    ) as exc:
         return _blocked(
             result.items,
             f"qualification evidence failed closed: {type(exc).__name__}: {exc}",
@@ -311,6 +373,17 @@ def _verify_item(
     identity: RuntimeIdentity,
     harness_records: list[dict[str, Any]],
 ) -> str | None:
+    submitter_records = [
+        value
+        for value in harness_records
+        if value.get("role") == "submitter" and value.get("run_id") == run_id
+    ]
+    if (
+        len(submitter_records) != 1
+        or not _record_mentions(submitter_records[0], item.proposal_id)
+        or not _record_mentions(submitter_records[0], item.task_id)
+    ):
+        return f"Submitter evidence is not bound to current item: {item.task_id}"
     task = strict_from_json_value(Task, store.read_immutable("tasks", item.task_id))
     if task.proposal_id != item.proposal_id or not verify_model(task, identity.signing_public_key):
         return f"Task/Proposal/signature binding invalid: {item.task_id}"
@@ -393,9 +466,15 @@ def _verify_item(
         (
             sample
             for sample in reversed(samples)
-            if sample.last_heartbeat_at >= task.created_at
+            if sample.last_heartbeat_at <= plan.created_at
+            and (plan.created_at - sample.last_heartbeat_at).total_seconds() <= 30
             and all(
-                gpu.gpu_id in plan.gpu_ids and gpu.vram_percent < 90 and bool(gpu.raw_line)
+                gpu.gpu_id in plan.gpu_ids
+                and gpu.state.value == "AVAILABLE"
+                and gpu.vram_percent < 90
+                and bool(gpu.raw_line)
+                and gpu.sampled_at <= plan.created_at
+                and (plan.created_at - gpu.sampled_at).total_seconds() <= 30
                 for gpu in sample.gpus
                 if gpu.gpu_id in plan.gpu_ids
             )
@@ -430,7 +509,15 @@ def _verify_item(
     evidence = [value for value in worker_events if value.get("task_id") == task.task_id]
     if not any(value.get("event_type") == "TASK_VERIFIED_PRE_DOCKER" for value in evidence):
         return f"pre-Docker verification evidence missing: {task.task_id}"
-    if not any(value.get("event_type") == "EXECUTION_FINISHED" for value in evidence):
+    required_worker_evidence = {
+        "TASK_VERIFIED_PRE_DOCKER",
+        "DOCKER_INSPECT_PRE",
+        "DOCKER_START_CONFIRMED",
+        "DOCKER_CLEANUP_INSPECTED",
+        "EXECUTION_FINISHED",
+    }
+    evidence_types = {value.get("event_type") for value in evidence}
+    if not required_worker_evidence.issubset(evidence_types):
         return f"Docker lifecycle evidence missing: {task.task_id}"
     roles = {
         value.get("role")
@@ -469,7 +556,14 @@ def _verify_item(
     ranks = output.get("ranks")
     expected_value = item.card_count * (item.card_count + 1) / 2
     if (
-        output.get("world_size") != item.card_count
+        output.get("task_id") != task.task_id
+        or output.get("unit_id") != unit.unit_id
+        or output.get("execution_id") != task.execution_id
+        or output.get("plan_id") != plan.plan_id
+        or output.get("assignment_id") != plan.assignment_id
+        or output.get("lease_epoch") != plan.lease_epoch
+        or output.get("gpu_ids") != list(plan.gpu_ids)
+        or output.get("world_size") != item.card_count
         or output.get("all_reduce") != "ok"
         or output.get("gemm") != "ok"
         or output.get("rocm_version") is None
@@ -517,8 +611,6 @@ def _record_mentions(record: dict[str, Any], identifier: str) -> bool:
 
 
 def _master_profile(base_url: str, certificate: Path) -> dict[str, object]:
-    import httpx
-
     response = httpx.get(f"{base_url}/health", verify=str(certificate), timeout=10)
     response.raise_for_status()
     value = response.json()
@@ -580,6 +672,14 @@ def _run_local_gates(project_root: Path, store: EventStore, run_id: str) -> str 
         },
     )
     return None if passed else "one or more local quality gates failed"
+
+
+def _retryable_submitter_failure(stderr: str) -> bool:
+    lowered = stderr.lower()
+    return any(
+        marker in lowered
+        for marker in ("rate limit", "429", "timed out", "timeout", "temporarily unavailable")
+    )
 
 
 def _stream_structured_output(stdout: str) -> dict[str, object]:

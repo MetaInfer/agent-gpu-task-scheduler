@@ -3,13 +3,14 @@ import json
 import pytest
 from conftest import signed_task
 
-from agent_scheduler.domain.models import ProtocolEnvelope, new_id
-from agent_scheduler.integrity import canonical_bytes
+from agent_scheduler.domain.models import ExecutionPlan, ProtocolEnvelope, new_id, utc_now
+from agent_scheduler.integrity import canonical_bytes, sign_model
 from agent_scheduler.storage import EventStore
 from agent_scheduler.worker.client import WorkerClient, WorkerClientError
 from agent_scheduler.worker.docker import DockerCLI
 from agent_scheduler.worker.driver import DockerWorkerDriver
 from agent_scheduler.worker.gpu import HySmiSampler
+from agent_scheduler.worker.protocol import WorkerHub
 
 
 def test_worker_rereads_ground_truth_before_docker(runtime_identity):
@@ -46,6 +47,82 @@ def test_worker_rereads_ground_truth_before_docker(runtime_identity):
     path.write_text(json.dumps(tampered.model_dump(mode="json")) + "\n", encoding="utf-8")
     with pytest.raises(WorkerClientError):
         client._load_task(envelope)
+
+
+def test_worker_rereads_plan_ground_truth_and_fencing(runtime_identity):
+    root, identity = runtime_identity
+    store = EventStore(root)
+    task = signed_task(identity)
+    unit = task.units[0]
+    plan = sign_model(
+        ExecutionPlan(
+            key_id=identity.key_id,
+            plan_id=new_id("plan"),
+            assignment_id=new_id("assign"),
+            execution_id=task.execution_id,
+            task_id=task.task_id,
+            task_content_hash=task.content_hash or "0" * 64,
+            dispatch_generation=1,
+            worker_id=unit.worker_id,
+            unit_id=unit.unit_id,
+            gpu_ids=(0,),
+            lease_epoch=1,
+            container_name=unit.container_name,
+            submitter_username=unit.submitter_username,
+            container_user=unit.container_user,
+            image_digest=unit.image_digest,
+            created_at=utc_now(),
+        ),
+        identity.signing_private_key,
+    )
+    store.write_immutable("plans", plan.plan_id, plan)
+    store.write_immutable_bytes("plans", f"{plan.plan_id}.canonical.json", canonical_bytes(plan))
+    driver = DockerWorkerDriver(DockerCLI(), store, identity.signing_public_key, identity.key_id)
+    client = WorkerClient(
+        uri="wss://unused",
+        worker_id="worker-local-01",
+        api_key="unused",
+        driver=driver,
+        sampler=HySmiSampler(2),
+        ca_file="unused",
+    )
+    envelope = ProtocolEnvelope(
+        message_id=new_id("msg"),
+        sequence=1,
+        message_type="PLAN",
+        assignment_id=plan.assignment_id,
+        dispatch_generation=plan.dispatch_generation,
+        lease_epoch=plan.lease_epoch,
+        payload={
+            "plan_id": plan.plan_id,
+            "plan_content_hash": plan.content_hash,
+            "plan_path": str(store.immutable_root / "plans" / f"{plan.plan_id}.json"),
+            "plan_canonical_path": str(
+                store.immutable_root / "plans" / f"{plan.plan_id}.canonical.json"
+            ),
+        },
+    )
+    assert client._load_plan(envelope) == plan
+    wrong_fence = envelope.model_copy(update={"lease_epoch": 2})
+    with pytest.raises(WorkerClientError, match="fencing"):
+        client._load_plan(wrong_fence)
+    path = store.immutable_root / "plans" / f"{plan.plan_id}.json"
+    path.write_text(
+        json.dumps(plan.model_copy(update={"lease_epoch": 2}).model_dump(mode="json")) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(WorkerClientError):
+        client._load_plan(envelope)
+
+
+def test_master_protocol_sequence_survives_restart(tmp_path):
+    store = EventStore(tmp_path / "state")
+    object_id = "worker_" + "0" * 32
+    store.write_snapshot(
+        "protocol-sequence", object_id, {"worker_id": "worker-local-01", "sequence": 42}
+    )
+    hub = WorkerHub(store, lambda _worker: None)
+    assert hub._sequence["worker-local-01"] == 42
 
 
 def test_unacked_worker_response_survives_restart(runtime_identity):

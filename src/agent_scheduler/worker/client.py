@@ -101,6 +101,11 @@ class WorkerClient:
                         if cached is not None:
                             await self._send(websocket, cached)
                         continue
+                    if envelope.sequence != self._seen_sequence + 1:
+                        raise WorkerClientError(
+                            f"Master sequence gap: expected {self._seen_sequence + 1}, "
+                            f"got {envelope.sequence}"
+                        )
                     self._seen_sequence = envelope.sequence
                     self._persist_protocol_state()
                     if envelope.message_type == "ACK":
@@ -199,14 +204,20 @@ class WorkerClient:
         payload: dict[str, Any]
         if envelope.message_type == "PREPARE":
             manifest = strict_from_json_value(PrepareManifest, envelope.payload["manifest"])
+            self._assert_fencing(
+                envelope,
+                manifest.assignment_id,
+                manifest.dispatch_generation,
+                manifest.lease_epoch,
+            )
             task = self._load_task(envelope)
             payload = {"accepted": self.driver.prepare(manifest, task)}
         elif envelope.message_type == "PLAN":
-            plan = strict_from_json_value(ExecutionPlan, envelope.payload["plan"])
+            plan = self._load_plan(envelope)
             task = self._load_task(envelope)
             payload = {"accepted": self.driver.acknowledge_plan(plan, task)}
         elif envelope.message_type == "EXECUTE":
-            plan = strict_from_json_value(ExecutionPlan, envelope.payload["plan"])
+            plan = self._load_plan(envelope)
             task = self._load_task(envelope)
             cached_result = self._completed_execution(plan, task)
             if cached_result is not None:
@@ -240,11 +251,11 @@ class WorkerClient:
                 )
             }
         elif envelope.message_type == "CANCEL":
-            plan = strict_from_json_value(ExecutionPlan, envelope.payload["plan"])
+            plan = self._load_plan(envelope)
             task = self._load_task(envelope)
             payload = {"cancelled": self.driver.cancel(plan, task)}
         elif envelope.message_type == "RECONCILE":
-            plan = strict_from_json_value(ExecutionPlan, envelope.payload["plan"])
+            plan = self._load_plan(envelope)
             task = self._load_task(envelope)
             payload = {"safe": self.driver.reconcile(plan, task)}
         else:
@@ -257,6 +268,53 @@ class WorkerClient:
             dispatch_generation=envelope.dispatch_generation,
             lease_epoch=envelope.lease_epoch,
         )
+
+    @staticmethod
+    def _assert_fencing(
+        envelope: ProtocolEnvelope,
+        assignment_id: str,
+        dispatch_generation: int,
+        lease_epoch: int,
+    ) -> None:
+        if (
+            envelope.assignment_id != assignment_id
+            or envelope.dispatch_generation != dispatch_generation
+            or envelope.lease_epoch != lease_epoch
+        ):
+            raise WorkerClientError("protocol envelope fencing does not match payload")
+
+    def _load_plan(self, envelope: ProtocolEnvelope) -> ExecutionPlan:
+        plan_id = envelope.payload.get("plan_id")
+        expected_hash = envelope.payload.get("plan_content_hash")
+        plan_path_value = envelope.payload.get("plan_path")
+        canonical_path_value = envelope.payload.get("plan_canonical_path")
+        if not isinstance(plan_id, str) or not isinstance(expected_hash, str):
+            raise WorkerClientError("Worker message lacks Plan identity/hash")
+        if not isinstance(plan_path_value, str) or not isinstance(canonical_path_value, str):
+            raise WorkerClientError("Worker message lacks Plan Ground Truth paths")
+        plan_path = Path(plan_path_value).resolve()
+        canonical_path = Path(canonical_path_value).resolve()
+        expected_plan_path = (
+            self.driver.events.root / "immutable" / "plans" / f"{plan_id}.json"
+        ).resolve()
+        expected_canonical_path = (
+            self.driver.events.root / "immutable" / "plans" / f"{plan_id}.canonical.json"
+        ).resolve()
+        if plan_path != expected_plan_path or canonical_path != expected_canonical_path:
+            raise WorkerClientError("Plan reference escapes the configured Ground Truth")
+        try:
+            plan = ExecutionPlan.model_validate_json(plan_path.read_text(encoding="utf-8"))
+            canonical = canonical_path.read_bytes()
+        except (OSError, ValueError) as exc:
+            raise WorkerClientError("Plan Ground Truth is missing or invalid") from exc
+        if plan.plan_id != plan_id or plan.content_hash != expected_hash:
+            raise WorkerClientError("Plan Ground Truth differs from signed reference")
+        if canonical != canonical_bytes(plan):
+            raise WorkerClientError("canonical Plan sidecar differs from Plan JSON")
+        self._assert_fencing(
+            envelope, plan.assignment_id, plan.dispatch_generation, plan.lease_epoch
+        )
+        return plan
 
     def _completed_execution(self, plan: ExecutionPlan, task: Task) -> dict[str, Any] | None:
         path = (
