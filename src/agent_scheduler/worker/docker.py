@@ -131,19 +131,36 @@ class DockerCLI:
             raise DockerError("container is not running after docker start")
 
     def stop(self, name: str, grace_seconds: int = 30) -> tuple[ContainerInspection, str | None]:
-        result = self.run(["stop", "--time", str(grace_seconds), name], timeout=grace_seconds + 15)
+        stop_error: DockerError | None = None
+        result: subprocess.CompletedProcess[str] | None = None
+        try:
+            result = self.run(
+                ["stop", "--time", str(grace_seconds), name],
+                timeout=grace_seconds + 15,
+            )
+        except DockerError as exc:
+            stop_error = exc
         status = self.inspect(name)
         warning = None
         if status.running:
-            kill = self.run(["kill", name])
+            kill_error: DockerError | None = None
+            kill: subprocess.CompletedProcess[str] | None = None
+            try:
+                kill = self.run(["kill", name])
+            except DockerError as exc:
+                kill_error = exc
             status = self.inspect(name)
-            if kill.returncode != 0 and status.running:
-                raise DockerError(kill.stderr.strip() or "docker kill failed")
+            if status.running:
+                if kill_error is not None:
+                    raise DockerError("container remains running after kill error") from kill_error
+                raise DockerError(
+                    kill.stderr.strip()
+                    if kill and kill.stderr.strip()
+                    else "container remains running"
+                )
             warning = "DOCKER_STOP_REQUIRED_KILL"
-        if status.running:
-            raise DockerError("container remains running after stop/kill")
-        if result.returncode != 0:
-            warning = "DOCKER_STOP_NONZERO_POSTCONDITION_MET"
+        if stop_error is not None or (result is not None and result.returncode != 0):
+            warning = warning or "DOCKER_STOP_NONZERO_POSTCONDITION_MET"
         return status, warning
 
     def exec_attached(

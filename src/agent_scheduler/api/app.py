@@ -20,7 +20,7 @@ from agent_scheduler.domain.models import GpuSnapshot, GpuState, WorkerSnapshot,
 from agent_scheduler.proposal.service import ProposalError, ProposalService
 from agent_scheduler.runtime import RuntimeIdentity, load_runtime
 from agent_scheduler.scheduler.core import Scheduler, SchedulingError, WorkerDriver
-from agent_scheduler.storage.events import EventStore
+from agent_scheduler.storage import EventStore, StoreCorruptionError, prune_framework_logs
 from agent_scheduler.worker.docker import DockerCLI
 from agent_scheduler.worker.driver import DockerWorkerDriver, FakeWorkerDriver
 from agent_scheduler.worker.gpu import HySmiSampler
@@ -84,7 +84,7 @@ def create_app(settings: Settings, identity: RuntimeIdentity | None = None) -> F
         sampler = HySmiSampler(settings.vram_threshold)
     else:
         hub = WorkerHub(events, lambda _worker: None)
-        driver = RemoteWorkerDriver(hub, settings.worker_id)
+        driver = RemoteWorkerDriver(hub, str(settings.state_root), settings.worker_id)
     scheduler = Scheduler(
         events,
         identity.signing_private_key,
@@ -109,6 +109,8 @@ def create_app(settings: Settings, identity: RuntimeIdentity | None = None) -> F
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         sampler_task: asyncio.Task[None] | None = None
+        scheduler_task: asyncio.Task[None] | None = None
+        prune_framework_logs(settings.state_root)
         if settings.worker_mode == "fake":
             now = utc_now()
             scheduler.register_worker(
@@ -132,15 +134,37 @@ def create_app(settings: Settings, identity: RuntimeIdentity | None = None) -> F
             sampler_task = asyncio.create_task(
                 _sample_local_worker(scheduler, sampler, settings.worker_id)
             )
+        if settings.auto_schedule:
+            scheduler_task = asyncio.create_task(_scheduler_loop(scheduler))
         try:
             yield
         finally:
-            if sampler_task is not None:
-                sampler_task.cancel()
-                await asyncio.gather(sampler_task, return_exceptions=True)
+            for task in (sampler_task, scheduler_task):
+                if task is not None:
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (sampler_task, scheduler_task) if task is not None),
+                return_exceptions=True,
+            )
 
     app = FastAPI(title="Agent GPU Task Scheduler", version="0.2.0", lifespan=lifespan)
     app.state.context = context
+
+    @app.get("/health")
+    def health() -> dict[str, object]:
+        try:
+            events.validate_all_events()
+            integrity = "valid"
+        except StoreCorruptionError as exc:
+            raise _error(503, "GROUND_TRUTH_CORRUPT", str(exc), str(uuid.uuid4())) from exc
+        return {
+            "status": "ready" if not context.draining else "draining",
+            "workers": len(scheduler.workers()),
+            "integrity": integrity,
+            "qualification": settings.qualification_profile,
+            "harness_mode": settings.harness_mode,
+            "worker_mode": settings.worker_mode,
+        }
 
     @app.post("/api/v1/proposals", status_code=201)
     def create_proposal(
@@ -167,6 +191,20 @@ def create_app(settings: Settings, identity: RuntimeIdentity | None = None) -> F
         except ProposalError as exc:
             raise _proposal_http_error(exc, request_id) from exc
         return {"request_id": request_id, "proposal": proposal.model_dump(mode="json")}
+
+    @app.get("/api/v1/proposals/{proposal_id}/reviews")
+    def get_reviews(proposal_id: str, request: Request) -> dict[str, object]:
+        request_id = _request_id(request)
+        try:
+            reviews = proposals.get_reviews(proposal_id)
+            facts = proposals.get_current_facts(proposal_id)
+        except ProposalError as exc:
+            raise _proposal_http_error(exc, request_id) from exc
+        return {
+            "request_id": request_id,
+            "reviews": [review.model_dump(mode="json") for review in reviews],
+            "current_facts": facts.model_dump(mode="json") if facts else None,
+        }
 
     @app.get("/api/v1/proposals/{proposal_id}/events")
     def proposal_events(
@@ -207,11 +245,18 @@ def create_app(settings: Settings, identity: RuntimeIdentity | None = None) -> F
         body: ConfirmRequest,
         request: Request,
         x_username: str | None = Header(default=None),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> dict[str, object]:
         _reject_if_draining(context)
         request_id = _request_id(request)
         try:
-            task = proposals.confirm(proposal_id, x_username or "", body.revision_id, request_id)
+            task = proposals.confirm(
+                proposal_id,
+                x_username or "",
+                body.revision_id,
+                idempotency_key or "",
+                request_id,
+            )
             task_status = scheduler.enqueue(task, request_id)
         except ProposalError as exc:
             raise _proposal_http_error(exc, request_id) from exc
@@ -252,6 +297,24 @@ def create_app(settings: Settings, identity: RuntimeIdentity | None = None) -> F
         except ProposalError as exc:
             raise _proposal_http_error(exc, request_id) from exc
         return {"request_id": request_id, "proposal": proposal.model_dump(mode="json")}
+
+    @app.post("/api/v1/tasks/{task_id}/cancel")
+    def cancel_task(
+        task_id: str,
+        request: Request,
+        x_username: str | None = Header(default=None),
+    ) -> dict[str, object]:
+        request_id = _request_id(request)
+        try:
+            task = scheduler.get_task(task_id)
+            if not task.units or task.units[0].submitter_username != (x_username or ""):
+                raise SchedulingError("username does not own Task declaration")
+            task_status = scheduler.cancel_task(
+                task_id, actor=x_username or "", request_id=request_id
+            )
+        except SchedulingError as exc:
+            raise _error(409, "CANCEL_REJECTED", str(exc), request_id) from exc
+        return {"request_id": request_id, "status": task_status.model_dump(mode="json")}
 
     @app.get("/api/v1/tasks/{task_id}")
     def get_task(task_id: str, request: Request) -> dict[str, object]:
@@ -410,6 +473,12 @@ def create_app(settings: Settings, identity: RuntimeIdentity | None = None) -> F
         return Response(status_code=405)
 
     return app
+
+
+async def _scheduler_loop(scheduler: Scheduler) -> None:
+    while True:
+        await asyncio.to_thread(scheduler.tick, "scheduler-loop")
+        await asyncio.sleep(1)
 
 
 async def _sample_local_worker(scheduler: Scheduler, sampler: HySmiSampler, worker_id: str) -> None:

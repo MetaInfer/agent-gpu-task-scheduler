@@ -41,6 +41,8 @@ def test_claude_adapter_uses_restricted_cli_and_validates_output(tmp_path, monke
     captured = {}
 
     def fake_run(command, **kwargs):
+        if "--version" in command:
+            return subprocess.CompletedProcess(command, 0, "2.1.237 (Claude Code)\n", "")
         captured["command"] = command
         captured["env"] = kwargs["env"]
         prompt = kwargs["input"]

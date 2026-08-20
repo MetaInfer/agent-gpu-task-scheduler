@@ -107,6 +107,7 @@ def app_client(runtime_identity: tuple[Path, RuntimeIdentity]):
         qualification_profile=False,
         vram_threshold=2.0,
         allowed_users=frozenset({"zz_chentian"}),
+        auto_schedule=False,
     )
     app = create_app(settings, identity)
     with TestClient(app) as client:

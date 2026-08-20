@@ -49,6 +49,16 @@ class WorkerDriver(Protocol):
 
     def execute(self, plan: ExecutionPlan, task: Task) -> ExecutionResult: ...
 
+    def cancel(self, plan: ExecutionPlan, task: Task) -> bool: ...
+
+    def query_status(
+        self,
+        assignment_id: str,
+        dispatch_generation: int,
+        lease_epoch: int,
+        task: Task,
+    ) -> str: ...
+
     def reconcile(self, plan: ExecutionPlan, task: Task) -> bool: ...
 
 
@@ -95,12 +105,14 @@ class Scheduler:
         self._tasks: dict[str, Task] = {}
         self._statuses: dict[str, TaskStatus] = {}
         self._plans: dict[str, ExecutionPlan] = {}
+        self._cancel_requested: set[str] = set()
         self._lock = RLock()
         self._load()
 
     def register_worker(self, worker: WorkerSnapshot, request_id: str = "worker-register") -> None:
         with self._lock:
             self._workers[worker.worker_id] = worker
+            self.events.write_immutable("worker-samples", new_id("sample"), worker)
             self.events.write_snapshot("workers", worker.worker_id, worker)
             self.events.append(
                 "workers",
@@ -144,15 +156,21 @@ class Scheduler:
             return status
 
     def tick(self, request_id: str = "scheduler") -> list[TaskStatus]:
-        """Advance at most one queued Task through all single-worker barriers."""
+        """Claim one queued Task, then perform Worker I/O without the Scheduler lock."""
+        claimed: tuple[Task, list[tuple[str, tuple[int, ...]]]] | None = None
         with self._lock:
             ordered = sorted(self._queue.values(), key=self._queue_key)
             for queued in ordered:
                 selections = self._select_for_task(queued.task)
                 if selections is None:
                     continue
-                return [self._dispatch(queued.task, selections, request_id)]
-        return []
+                self._queue.pop(queued.task.task_id)
+                claimed = (queued.task, selections)
+                break
+        if claimed is None:
+            return []
+        task, selections = claimed
+        return [self._dispatch(task, selections, request_id)]
 
     def get_task(self, task_id: str) -> Task:
         try:
@@ -177,6 +195,30 @@ class Scheduler:
 
     def plans(self) -> list[ExecutionPlan]:
         return list(self._plans.values())
+
+    def cancel_task(self, task_id: str, *, actor: str, request_id: str) -> TaskStatus:
+        with self._lock:
+            task = self.get_task(task_id)
+            status = self.get_status(task_id)
+            if status.state in {
+                TaskState.COMPLETED,
+                TaskState.FAILED,
+                TaskState.CANCELLED,
+                TaskState.CLEANUP_FAILED,
+            }:
+                return status
+            if status.state in {TaskState.QUEUED, TaskState.BLOCKED}:
+                self._queue.pop(task_id, None)
+                return self._transition(task, TaskState.CANCELLED, request_id)
+            self._cancel_requested.add(task_id)
+            plans = [plan for plan in self._plans.values() if plan.task_id == task_id]
+        if plans and not all(self.driver.cancel(plan, task) for plan in plans):
+            with self._lock:
+                self._cancel_requested.discard(task_id)
+            self.events.append("tasks", task_id, "CANCEL_UNCONFIRMED", actor, request_id, {})
+            raise SchedulingError("cancel could not confirm container stopped")
+        self.events.append("tasks", task_id, "CANCEL_REQUESTED", actor, request_id, {})
+        return self.get_status(task_id)
 
     def reconcile_execution(
         self, execution_id: str, *, actor: str, reason: str, request_id: str
@@ -243,6 +285,11 @@ class Scheduler:
         for unit in task.units:
             if unit.worker_id in used_workers:
                 return None
+            if any(
+                lease.worker_id == unit.worker_id and lease.container_name == unit.container_name
+                for lease in self._leases.values()
+            ):
+                return None
             selection = self._select_gpus(unit.required_gpu_count, unit.worker_id)
             if selection is None:
                 return None
@@ -277,11 +324,13 @@ class Scheduler:
         selections: list[tuple[str, tuple[int, ...]]],
         request_id: str,
     ) -> TaskStatus:
-        self._queue.pop(task.task_id)
         status = self._transition(task, TaskState.PREPARING, request_id)
         leases: list[ResourceLease] = []
+        committed: list[ResourceLease] = []
         plans: list[ExecutionPlan] = []
         side_effect_possible = False
+        worker_reply_uncertain = False
+        prepare_rejected = False
         try:
             manifests: list[PrepareManifest] = []
             for unit, (worker_id, gpu_ids) in zip(task.units, selections, strict=True):
@@ -314,20 +363,24 @@ class Scheduler:
                     self.signing_key,
                 )
                 self.events.write_immutable("manifests", manifest.manifest_id, manifest)
-                if not self.driver.prepare(manifest, task):
-                    raise SchedulingError("Worker rejected PrepareManifest")
-                manifests.append(manifest)
-                leases.append(
-                    ResourceLease(
-                        lease_id=new_id("lease"),
-                        execution_id=task.execution_id,
-                        worker_id=worker_id,
-                        gpu_ids=gpu_ids,
-                        container_name=unit.container_name,
-                        lease_epoch=epoch,
-                        committed=False,
-                    )
+                provisional = ResourceLease(
+                    lease_id=new_id("lease"),
+                    execution_id=task.execution_id,
+                    worker_id=worker_id,
+                    gpu_ids=gpu_ids,
+                    container_name=unit.container_name,
+                    lease_epoch=epoch,
+                    committed=False,
                 )
+                leases.append(provisional)
+                self._persist_lease(provisional)
+                manifests.append(manifest)
+                worker_reply_uncertain = True
+                accepted = self.driver.prepare(manifest, task)
+                worker_reply_uncertain = False
+                if not accepted:
+                    prepare_rejected = True
+                    raise SchedulingError("Worker rejected PrepareManifest")
             self.events.append("tasks", task.task_id, "PREPARED", "scheduler", request_id, {})
             committed = [lease.model_copy(update={"committed": True}) for lease in leases]
             for lease in committed:
@@ -366,16 +419,42 @@ class Scheduler:
                 )
                 self.events.write_immutable("plans", plan.plan_id, plan)
                 self._plans[plan.plan_id] = plan
-                if not self.driver.acknowledge_plan(plan, task):
+                worker_reply_uncertain = True
+                acknowledged = self.driver.acknowledge_plan(plan, task)
+                worker_reply_uncertain = False
+                if not acknowledged:
                     raise SchedulingError("Worker rejected ExecutionPlan")
                 plans.append(plan)
             self.events.append("tasks", task.task_id, "PLAN_ACK", "scheduler", request_id, {})
+            with self._lock:
+                cancelled_before_start = task.task_id in self._cancel_requested
+                self._cancel_requested.discard(task.task_id)
+            if cancelled_before_start:
+                status = self._transition(task, TaskState.FINALIZING, request_id)
+                for lease in committed:
+                    self._delete_lease(lease)
+                return self._transition(
+                    task,
+                    TaskState.CANCELLED,
+                    request_id,
+                    failure_reason="CANCELLED_BEFORE_START",
+                )
             status = self._transition(task, TaskState.DISPATCHED, request_id)
             status = self._transition(task, TaskState.STARTING, request_id)
             side_effect_possible = True
             status = self._transition(task, TaskState.RUNNING, request_id)
+            worker_reply_uncertain = True
             results = [self.driver.execute(plan, task) for plan in plans]
-            outcome, failure_reason = self._outcome(results)
+            worker_reply_uncertain = False
+            with self._lock:
+                cancelled_during_run = task.task_id in self._cancel_requested
+                self._cancel_requested.discard(task.task_id)
+            outcome: TaskState
+            failure_reason: str | None
+            if cancelled_during_run:
+                outcome, failure_reason = TaskState.CANCELLED, "CANCELLED_DURING_RUN"
+            else:
+                outcome, failure_reason = self._outcome(results)
             underlying = outcome
             status = self._transition(task, TaskState.FINALIZING, request_id)
             if any(not result.cleanup_ok for result in results):
@@ -390,9 +469,41 @@ class Scheduler:
             for lease in committed:
                 self._delete_lease(lease)
             return self._transition(task, outcome, request_id, failure_reason=failure_reason)
-        except (RuntimeError, ValueError) as exc:
-            target = TaskState.CLEANUP_FAILED if side_effect_possible else TaskState.FAILED
-            if not side_effect_possible:
+        except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
+            query_results: list[str] = []
+            if worker_reply_uncertain:
+                for manifest in manifests:
+                    try:
+                        query_results.append(
+                            self.driver.query_status(
+                                manifest.assignment_id,
+                                manifest.dispatch_generation,
+                                manifest.lease_epoch,
+                                task,
+                            )
+                        )
+                    except (OSError, RuntimeError, TimeoutError, ValueError):
+                        query_results.append("UNKNOWN")
+                self.events.append(
+                    "tasks",
+                    task.task_id,
+                    "STATUS_QUERIED_AFTER_TIMEOUT",
+                    "scheduler",
+                    request_id,
+                    {"results": query_results},
+                )
+            uncertain = worker_reply_uncertain or side_effect_possible or bool(committed)
+            if (
+                query_results
+                and set(query_results) == {"NOT_REGISTERED"}
+                and not committed
+                and not side_effect_possible
+            ):
+                uncertain = False
+            if prepare_rejected and not committed:
+                uncertain = False
+            target = TaskState.RECONCILIATION_REQUIRED if uncertain else TaskState.FAILED
+            if not uncertain:
                 for lease in leases:
                     self._delete_lease(lease)
             return self._force_failure(task, target, request_id, str(exc))
@@ -491,10 +602,28 @@ class Scheduler:
         self.events.write_snapshot("task-status", status.task_id, status)
 
     def _persist_lease(self, lease: ResourceLease) -> None:
+        self.events.write_immutable(
+            "lease-history",
+            new_id("lease_evt"),
+            {
+                "action": "COMMITTED" if lease.committed else "HELD",
+                "timestamp": utc_now().isoformat(),
+                "lease": lease.model_dump(mode="json"),
+            },
+        )
         self._leases[lease.lease_id] = lease
         self.events.write_snapshot("leases", lease.lease_id, lease)
 
     def _delete_lease(self, lease: ResourceLease) -> None:
+        self.events.write_immutable(
+            "lease-history",
+            new_id("lease_evt"),
+            {
+                "action": "RELEASED",
+                "timestamp": utc_now().isoformat(),
+                "lease": lease.model_dump(mode="json"),
+            },
+        )
         self._leases.pop(lease.lease_id, None)
         self.events.delete_snapshot("leases", lease.lease_id)
 
@@ -534,6 +663,14 @@ class Scheduler:
         for data in self.events.iter_snapshots("leases"):
             lease = strict_from_json_value(ResourceLease, data)
             self._leases[lease.lease_id] = lease
+        for data in self.events.iter_immutable("lease-history"):
+            lease = strict_from_json_value(ResourceLease, data["lease"])
+            if data.get("action") in {"HELD", "COMMITTED"}:
+                self._leases[lease.lease_id] = lease
+            elif data.get("action") == "RELEASED":
+                self._leases.pop(lease.lease_id, None)
+            else:
+                raise SchedulingError("unknown Lease history action")
 
     @staticmethod
     def _sample_fresh(gpu: GpuSnapshot) -> bool:

@@ -24,7 +24,11 @@ class SubmitterMCPAdapter:
     _client: httpx.Client = field(init=False)
 
     def __post_init__(self) -> None:
-        self._client = httpx.Client(base_url=self.base_url, verify=self.verify, timeout=30)
+        self._client = httpx.Client(
+            base_url=self.base_url,
+            verify=self.verify,
+            timeout=httpx.Timeout(connect=10, read=15 * 60, write=30, pool=30),
+        )
 
     def close(self) -> None:
         self._client.close()
@@ -43,8 +47,17 @@ class SubmitterMCPAdapter:
             idempotency_key=idempotency_key,
         )
 
-    def confirm(self, proposal_id: str, revision_id: str) -> dict[str, object]:
-        return self._post(f"/api/v1/proposals/{proposal_id}/confirm", {"revision_id": revision_id})
+    def confirm(
+        self, proposal_id: str, revision_id: str, idempotency_key: str
+    ) -> dict[str, object]:
+        return self._post(
+            f"/api/v1/proposals/{proposal_id}/confirm",
+            {"revision_id": revision_id},
+            idempotency_key=idempotency_key,
+        )
+
+    def get_reviews(self, proposal_id: str) -> dict[str, object]:
+        return self._get(f"/api/v1/proposals/{proposal_id}/reviews")
 
     def resume(self, proposal_id: str, idempotency_key: str) -> dict[str, object]:
         return self._post(
@@ -56,6 +69,24 @@ class SubmitterMCPAdapter:
 
     def get_proposal(self, proposal_id: str) -> dict[str, object]:
         return self._get(f"/api/v1/proposals/{proposal_id}")
+
+    def get_task(self, task_id: str) -> dict[str, object]:
+        return self._get(f"/api/v1/tasks/{task_id}")
+
+    def cancel_task(self, task_id: str) -> dict[str, object]:
+        return self._post(f"/api/v1/tasks/{task_id}/cancel", {})
+
+    def wait_for_task(self, task_id: str, timeout_seconds: int = 30) -> dict[str, object]:
+        deadline = time.monotonic() + min(max(timeout_seconds, 1), 30)
+        terminal = {"COMPLETED", "FAILED", "CANCELLED", "CLEANUP_FAILED"}
+        while True:
+            value = self.get_task(task_id)
+            status = value.get("status")
+            if isinstance(status, dict) and status.get("state") in terminal:
+                return value
+            if time.monotonic() >= deadline:
+                return value
+            time.sleep(1)
 
     def wait_for_events(
         self, proposal_id: str, after_sequence: int, timeout_seconds: int = 30
@@ -103,13 +134,22 @@ class SubmitterMCPAdapter:
                 _string(arguments, "idempotency_key"),
             ),
             "confirm_revision": lambda: self.confirm(
-                _string(arguments, "proposal_id"), _string(arguments, "revision_id")
+                _string(arguments, "proposal_id"),
+                _string(arguments, "revision_id"),
+                _string(arguments, "idempotency_key"),
             ),
+            "get_reviews": lambda: self.get_reviews(_string(arguments, "proposal_id")),
             "resume": lambda: self.resume(
                 _string(arguments, "proposal_id"), _string(arguments, "idempotency_key")
             ),
             "cancel": lambda: self.cancel(_string(arguments, "proposal_id")),
             "get_proposal": lambda: self.get_proposal(_string(arguments, "proposal_id")),
+            "get_task": lambda: self.get_task(_string(arguments, "task_id")),
+            "cancel_task": lambda: self.cancel_task(_string(arguments, "task_id")),
+            "wait_for_task": lambda: self.wait_for_task(
+                _string(arguments, "task_id"),
+                _integer(arguments, "timeout_seconds", 30),
+            ),
             "wait_for_events": lambda: self.wait_for_events(
                 _string(arguments, "proposal_id"),
                 _integer(arguments, "after_sequence", 0),
@@ -272,8 +312,14 @@ _TOOLS = [
     _tool(
         "confirm_revision",
         "Explicitly confirm the current immutable revision for review.",
-        {"proposal_id": _ID, "revision_id": _ID},
-        ["proposal_id", "revision_id"],
+        {"proposal_id": _ID, "revision_id": _ID, "idempotency_key": _KEY},
+        ["proposal_id", "revision_id", "idempotency_key"],
+    ),
+    _tool(
+        "get_reviews",
+        "Read Reviewer decisions, rationale, and current normalized Facts.",
+        {"proposal_id": _ID},
+        ["proposal_id"],
     ),
     _tool(
         "resume",
@@ -283,6 +329,17 @@ _TOOLS = [
     ),
     _tool("cancel", "Cancel a non-terminal Proposal.", {"proposal_id": _ID}, ["proposal_id"]),
     _tool("get_proposal", "Read current Proposal state.", {"proposal_id": _ID}, ["proposal_id"]),
+    _tool("get_task", "Read immutable Task and current status.", {"task_id": _ID}, ["task_id"]),
+    _tool("cancel_task", "Cancel a queued or running Task.", {"task_id": _ID}, ["task_id"]),
+    _tool(
+        "wait_for_task",
+        "Poll Task state for at most 30 seconds.",
+        {
+            "task_id": _ID,
+            "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 30},
+        },
+        ["task_id"],
+    ),
     _tool(
         "wait_for_events",
         "Poll Proposal events for at most 30 seconds.",

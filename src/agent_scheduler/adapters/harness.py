@@ -133,9 +133,14 @@ class ClaudeCodeAdapter:
         facts_id = new_id("facts")
         prompt = (
             "Produce ProposalFacts for this immutable revision. Echo the supplied IDs exactly. "
-            "Do not approve the proposal.\n\n"
-            f"facts_id={facts_id}\nrevision_id={revision.revision_id}\n"
-            f"revision_markdown:\n{revision.markdown}"
+            "Do not approve the proposal. The deterministic qualification command MUST be "
+            "container_path_bash `/data/fh/agent-gpu-task-scheduler/scripts/"
+            "run_torch_collective_smoke.sh` with SHA-256 "
+            "`66de599723417262b3d6c2c2e665777c6c2183a770ed1dbce2d69fcb074881f0`; "
+            "argv MUST be the Proposal-unique container output and business-log paths derived "
+            "from proposal_id, and required host paths MUST map `/data` to `/public/share`.\n\n"
+            f"facts_id={facts_id}\nproposal_id={revision.proposal_id}\n"
+            f"revision_id={revision.revision_id}\nrevision_markdown:\n{revision.markdown}"
         )
         result = self._invoke("processor", prompt, ProposalFacts)
         if result.facts_id != facts_id or result.revision_id != revision.revision_id:
@@ -177,6 +182,7 @@ class ClaudeCodeAdapter:
         if not system_prompt_path.is_file() or not self.mcp_config.is_file():
             raise HarnessError(f"missing versioned Harness configuration for {role}")
         schema = json.dumps(model.model_json_schema(), sort_keys=True, separators=(",", ":"))
+        cli_version = self._cli_version()
         last_error: Exception | None = None
         for attempt in range(1, self.max_attempts + 1):
             invocation_id = new_id("harness")
@@ -197,7 +203,8 @@ class ClaudeCodeAdapter:
                 "--system-prompt-file",
                 str(system_prompt_path),
                 "--output-format",
-                "json",
+                "stream-json",
+                "--verbose",
                 "--json-schema",
                 schema,
             ]
@@ -206,6 +213,7 @@ class ClaudeCodeAdapter:
                 "invocation_id": invocation_id,
                 "role": role,
                 "attempt": attempt,
+                "cli_version": cli_version,
                 "started_at": started_at.isoformat(),
                 "argv": command,
                 "cwd": str(self.events.root),
@@ -280,6 +288,22 @@ class ClaudeCodeAdapter:
                 time.sleep(2 ** (attempt - 1))
         raise HarnessError(f"Claude Code failed after {self.max_attempts} attempts") from last_error
 
+    def _cli_version(self) -> str:
+        try:
+            result = subprocess.run(
+                [self.executable, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+                env=self._minimal_environment(),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise HarnessError("Claude Code version check failed") from exc
+        if result.returncode != 0:
+            raise HarnessError("Claude Code version check returned nonzero")
+        return result.stdout.strip()
+
     @staticmethod
     def _minimal_environment() -> dict[str, str]:
         env = {
@@ -309,15 +333,27 @@ class ControllerResult(BaseModel):
 
 
 def _structured_output(stdout: str) -> dict[str, object]:
-    envelope = json.loads(stdout)
-    if not isinstance(envelope, dict):
-        raise TypeError("Claude Code JSON output is not an object")
-    value = envelope.get("structured_output", envelope.get("result", envelope))
-    if isinstance(value, str):
-        value = json.loads(value)
-    if not isinstance(value, dict):
-        raise TypeError("Claude Code structured output is not an object")
-    return value
+    envelopes: list[dict[str, object]] = []
+    for line in stdout.splitlines() or [stdout]:
+        if not line.strip():
+            continue
+        value = json.loads(line)
+        if isinstance(value, dict):
+            envelopes.append(value)
+    for envelope in reversed(envelopes):
+        value = envelope.get("structured_output")
+        if value is None and envelope.get("type") == "result":
+            value = envelope.get("result")
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                continue
+        if isinstance(value, dict):
+            return value
+    if len(envelopes) == 1:
+        return envelopes[0]
+    raise TypeError("Claude Code stream has no structured output")
 
 
 def _retryable_stderr(stderr: str) -> bool:

@@ -29,6 +29,7 @@ def test_reviewer_changes_requires_new_confirmation(runtime_identity):
             created.proposal_id,
             "zz_chentian",
             created.current_revision_id or "",
+            "confirm-1",
             "req-2",
         )
     assert error.value.code == "CHANGES_REQUESTED"
@@ -43,11 +44,20 @@ def test_reviewer_changes_requires_new_confirmation(runtime_identity):
         created.proposal_id,
         "zz_chentian",
         revised.current_revision_id or "",
+        "confirm-2",
         "req-4",
     )
     assert len(task.units) == 1
     assert task.units[0].required_gpu_count == 2
     assert proposals.get(created.proposal_id).state is ProposalState.COMPILED
+    repeated = proposals.confirm(
+        created.proposal_id,
+        "zz_chentian",
+        revised.current_revision_id or "",
+        "confirm-2",
+        "req-5",
+    )
+    assert repeated == task
     assert harness.review_calls == 2
 
 
@@ -76,6 +86,7 @@ def test_confirm_rejects_tbd(runtime_identity):
             created.proposal_id,
             "zz_chentian",
             created.current_revision_id or "",
+            "confirm-1",
             "req-2",
         )
 

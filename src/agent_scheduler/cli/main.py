@@ -11,8 +11,15 @@ from pathlib import Path
 import httpx
 import uvicorn
 
+from agent_scheduler.adapters.harness import ClaudeCodeAdapter, FakeHarnessAdapter
 from agent_scheduler.adapters.mcp import SubmitterMCPAdapter
 from agent_scheduler.config import Settings
+from agent_scheduler.domain.models import new_id
+from agent_scheduler.qualification import (
+    QualificationResult,
+    run_submitter_agent,
+    verify_qualification,
+)
 from agent_scheduler.runtime import init_runtime, load_runtime
 from agent_scheduler.storage.events import EventStore
 from agent_scheduler.worker.client import WorkerClient
@@ -37,6 +44,10 @@ def build_parser() -> argparse.ArgumentParser:
     mcp = subparsers.add_parser("mcp", help="run Submitter MCP Adapter on stdio")
     mcp.add_argument("--base-url", default="https://127.0.0.1:8443")
     mcp.add_argument("--username", default=os.environ.get("AGENT_SCHEDULER_USERNAME"))
+
+    qualify = subparsers.add_parser("qualify", help="run real four-task qualification")
+    qualify.add_argument("--base-url", default="https://127.0.0.1:8443")
+    qualify.add_argument("--timeout", type=int, default=45 * 60)
 
     inspect = subparsers.add_parser("inspect", help="inspect persisted events")
     inspect.add_argument("--state-root", type=Path, required=True)
@@ -80,12 +91,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "worker":
         settings = Settings.from_env()
         identity = load_runtime(settings.state_root)
+        event_store = EventStore(settings.state_root)
         driver = DockerWorkerDriver(
             DockerCLI(),
-            EventStore(settings.state_root),
+            event_store,
             identity.signing_public_key,
             identity.key_id,
             worker_id=settings.worker_id,
+        )
+        project_root = Path(__file__).resolve().parents[3]
+        controller = (
+            ClaudeCodeAdapter(
+                event_store,
+                prompts_dir=project_root / "prompts",
+                mcp_config=project_root / "config" / "empty-mcp.json",
+                timeout_seconds=300,
+            )
+            if settings.harness_mode == "claude"
+            else FakeHarnessAdapter()
         )
         client = WorkerClient(
             uri=args.uri,
@@ -94,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
             driver=driver,
             sampler=HySmiSampler(settings.vram_threshold),
             ca_file=str(identity.tls_certificate),
+            controller=controller,
         )
         asyncio.run(client.run())
         return 0
@@ -110,6 +134,30 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             adapter.close()
         return 0
+    if args.command == "qualify":
+        try:
+            settings = Settings.from_env()
+            identity = load_runtime(settings.state_root)
+            project_root = Path(__file__).resolve().parents[3]
+            result = run_submitter_agent(
+                project_root=project_root,
+                state_root=settings.state_root,
+                base_url=args.base_url,
+                tls_certificate=identity.tls_certificate,
+                timeout_seconds=args.timeout,
+            )
+            verified = verify_qualification(
+                result, state_root=settings.state_root, identity=identity
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            verified = QualificationResult(
+                run_id=new_id("qual"),
+                status="BLOCKED_QUALIFICATION",
+                items=(),
+                reason=f"qualification precondition failed: {type(exc).__name__}: {exc}",
+            )
+        print(verified.model_dump_json(indent=2))
+        return 0 if verified.status == "COMPLETED" else 3
     if args.command == "inspect":
         events = EventStore(args.state_root).list_events(args.object_type, args.object_id)
         print(json.dumps([event.model_dump(mode="json") for event in events], indent=2))

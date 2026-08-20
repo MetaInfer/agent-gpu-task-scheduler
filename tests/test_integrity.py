@@ -62,6 +62,8 @@ def test_compile_is_deterministic_and_signed():
     assert first.content_hash
     assert verify_model(first, public)
     assert not verify_model(first.model_copy(update={"policy_version": "tampered"}), public)
+    assert first.signature
+    assert not verify_model(first.model_copy(update={"signature": first.signature + "!"}), public)
 
 
 def test_rejects_non_approved_review():

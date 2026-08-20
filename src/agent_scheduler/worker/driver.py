@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -71,6 +72,18 @@ class FakeWorkerDriver:
             self.cleanup_ok,
             failure_reason="FAKE_RUN_NONZERO" if self.exit_code else None,
         )
+
+    def cancel(self, plan: ExecutionPlan, task: Task) -> bool:
+        return self.cleanup_ok
+
+    def query_status(
+        self,
+        assignment_id: str,
+        dispatch_generation: int,
+        lease_epoch: int,
+        task: Task,
+    ) -> str:
+        return "PREPARED" if self.prepared else "NOT_REGISTERED"
 
     def reconcile(self, plan: ExecutionPlan, task: Task) -> bool:
         return self.cleanup_ok
@@ -141,27 +154,43 @@ class DockerWorkerDriver:
         unit = next(unit for unit in task.units if unit.unit_id == plan.unit_id)
         if self._plans.get(plan.assignment_id) != plan:
             return ExecutionResult(1, False, False, True, failure_reason="PLAN_NOT_ACKED")
-        started = False
+        start_attempted = False
         forced = False
         failure_reason: str | None = None
         run_exit = 1
+        deadline = time.monotonic() + unit.timeout_seconds
+
+        def remaining(limit: int) -> int:
+            seconds = int(deadline - time.monotonic())
+            if seconds <= 0:
+                raise DockerTimeout("Task total deadline expired")
+            return min(limit, seconds)
+
         try:
             self._verify_signed(task)
             self._verify_signed(plan)
             self._validate_container(unit, require_stopped=True)
+            self._audit(
+                task,
+                "TASK_VERIFIED_PRE_DOCKER",
+                {
+                    "plan_id": plan.plan_id,
+                    "task_content_hash": task.content_hash or "",
+                    "lease_epoch": plan.lease_epoch,
+                    "dispatch_generation": plan.dispatch_generation,
+                },
+            )
+            start_attempted = True
             self.docker.start(plan.container_name)
-            started = True
-            setup_exit = self._run_commands(plan, task, "setup", unit.setup, timeout=120)
+            setup_exit = self._run_commands(plan, task, "setup", unit.setup, timeout=remaining(120))
             if setup_exit != 0:
                 failure_reason = "SETUP_NONZERO"
-                self._run_commands(plan, task, "teardown", unit.teardown, timeout=120)
+                self._run_commands(plan, task, "teardown", unit.teardown, timeout=remaining(120))
             else:
-                run_exit = self._run_commands(
-                    plan, task, "run", unit.run, timeout=unit.timeout_seconds
-                )
+                run_exit = self._run_commands(plan, task, "run", unit.run, timeout=remaining(300))
                 if run_exit != 0:
                     failure_reason = "RUN_NONZERO"
-                self._run_commands(plan, task, "teardown", unit.teardown, timeout=120)
+                self._run_commands(plan, task, "teardown", unit.teardown, timeout=remaining(120))
         except DockerTimeout:
             forced = True
             failure_reason = "RUN_TIMEOUT"
@@ -170,7 +199,9 @@ class DockerWorkerDriver:
             forced = True
             failure_reason = str(exc)
             run_exit = 1
-        cleanup_ok, warning = self._cleanup(plan.container_name) if started else (True, None)
+        cleanup_ok, warning = (
+            self._cleanup(plan.container_name) if start_attempted else (True, None)
+        )
         logs_present = all(Path(path).is_file() for path in unit.required_logs)
         outputs_present = all(Path(path).is_file() for path in unit.required_outputs)
         self._audit(
@@ -195,6 +226,46 @@ class DockerWorkerDriver:
             warning=warning,
             failure_reason=failure_reason,
         )
+
+    def query_status(
+        self,
+        assignment_id: str,
+        dispatch_generation: int,
+        lease_epoch: int,
+        task: Task,
+    ) -> str:
+        plan = self._plans.get(assignment_id)
+        if plan is not None:
+            completed = (
+                self.events.root
+                / "worker-inbox"
+                / self.worker_id
+                / task.execution_id
+                / "driver-events.jsonl"
+            )
+            if completed.is_file() and '"event_type":"EXECUTION_FINISHED"' in completed.read_text(
+                encoding="utf-8"
+            ):
+                return "FINISHED"
+            try:
+                if self.docker.inspect(plan.container_name).running:
+                    return "RUNNING"
+            except DockerError:
+                return "UNKNOWN"
+            return "PLAN_ACK"
+        if assignment_id in self._prepared:
+            return "PREPARED"
+        return "NOT_REGISTERED"
+
+    def cancel(self, plan: ExecutionPlan, task: Task) -> bool:
+        try:
+            self._verify_signed(task)
+            self._verify_signed(plan)
+            cleanup_ok, _warning = self._cleanup(plan.container_name)
+            self._audit(task, "CANCELLED_BY_MASTER", {"plan_id": plan.plan_id})
+            return cleanup_ok
+        except DriverError:
+            return False
 
     def reconcile(self, plan: ExecutionPlan, task: Task) -> bool:
         try:

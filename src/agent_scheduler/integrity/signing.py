@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 from collections.abc import Mapping
 from typing import Any, TypeVar
@@ -56,8 +57,11 @@ def verify_model(model: BaseModel, public_key: Ed25519PublicKey) -> bool:
     if hashlib.sha256(payload).hexdigest() != digest:
         return False
     try:
-        public_key.verify(base64.b64decode(signature), payload)
-    except (InvalidSignature, ValueError):
+        decoded = base64.b64decode(signature, validate=True)
+        if len(decoded) != 64 or base64.b64encode(decoded).decode("ascii") != signature:
+            return False
+        public_key.verify(decoded, payload)
+    except (binascii.Error, InvalidSignature, ValueError):
         return False
     return True
 

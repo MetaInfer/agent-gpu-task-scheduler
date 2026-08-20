@@ -90,6 +90,15 @@ def test_cleanup_failure_retains_entire_lease(runtime_identity):
         task.execution_id, actor="admin", reason="still running", request_id="req"
     )
     assert scheduler.leases()
+    lease_id = scheduler.leases()[0].lease_id
+    EventStore(root).delete_snapshot("leases", lease_id)
+    rebuilt = scheduler_for(root, identity, FakeWorkerDriver(cleanup_ok=False))
+    rebuilt.register_worker(worker())
+    assert rebuilt.leases()[0].lease_id == lease_id
+    second = signed_task(identity)
+    rebuilt.enqueue(second)
+    assert rebuilt.tick() == []
+    assert rebuilt.get_status(second.task_id).state is TaskState.QUEUED
 
 
 def test_tampered_task_is_rejected_before_prepare(runtime_identity):
@@ -102,6 +111,16 @@ def test_tampered_task_is_rejected_before_prepare(runtime_identity):
     with pytest.raises(SchedulingError, match="signature"):
         scheduler.enqueue(tampered)
     assert driver.prepared == []
+
+
+def test_queued_task_can_be_cancelled(runtime_identity):
+    root, identity = runtime_identity
+    task = signed_task(identity)
+    scheduler = scheduler_for(root, identity)
+    scheduler.enqueue(task)
+    status = scheduler.cancel_task(task.task_id, actor="zz_chentian", request_id="cancel-request")
+    assert status.state is TaskState.CANCELLED
+    assert scheduler.tick() == []
 
 
 def test_queued_task_rebuilds_after_snapshot_deletion(runtime_identity):

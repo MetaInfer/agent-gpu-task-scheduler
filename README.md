@@ -1,16 +1,19 @@
 # Agent GPU Task Scheduler MVP
 
-这是一个面向可信内部团队的 Agent 驱动 GPU 任务调度 MVP。它把 Proposal 协商、Reviewer 审核、确定性编译、签名 Task、GPU 资源 Lease、预建 Docker 容器生命周期和审计事件串成一个可追踪闭环。
+面向可信内部团队的 Agent 驱动 GPU 任务调度器。系统把 Proposal 协商、独立 Reviewer、确定性签名编译、GPU/容器 Lease、Worker WSS、预建 Docker 生命周期、观察界面和 Admin 恢复串成可审计闭环。
 
-## 当前资格范围
+## 资格范围
 
-- 单个真实 Worker，8 张 `K100_AI`，开发 profile 允许 `VRAM% < 90%`；生产默认仍为 `<2%`。
-- 仅复用白名单容器 `fh-sglang-deepseek-v4-flash`，同一容器严格串行，任务后保持 stopped。
-- 代码模型允许 `TaskUnit <= max_workers`；真实验收当前只覆盖一个 Worker 和一个 Unit。
-- 真实任务脚本位于 `scripts/torch_collective_smoke.py`，覆盖 1/2/4/8 卡 all-reduce 与 GEMM 正确性。
-- 默认 Ground Truth 根为 `/public/share/agent-scheduler-mvp`。
+- 单个真实 Worker，8 张 `K100_AI`；生产默认 `VRAM% < 2%`，资格 profile显式使用 `<90%`。
+- 唯一复用容器：`fh-sglang-deepseek-v4-flash`；严格串行，Task 后必须 stopped。
+- Python `>=3.10`，当前开发环境为 3.12。
+- 代码模型允许 `TaskUnit <= max_workers`；0.2.0 只资格验证一个 Worker/Unit。
+- 真实任务使用版本化 launcher和 SHA-256，分别完成1、2、4、8卡 ROCm all-reduce与GEMM数值校验。
+- NFS Ground Truth默认位于 `/public/share/agent-scheduler-mvp`。
 
-## 开发
+**代码与 Fake 门禁通过不代表真实资格完成。** 只有 `agent-scheduler qualify` 验证完整证据包后才能宣称 Goal完成；外部前置不足时结果为 `BLOCKED_QUALIFICATION`。
+
+## 本地门禁
 
 ```bash
 uv sync --extra test
@@ -19,22 +22,67 @@ uv run ruff check .
 uv run mypy src
 ```
 
-真实环境测试必须显式选择 marker：
+真实测试必须显式 opt-in：
 
 ```bash
-uv run pytest -m real_claude
-uv run pytest -m real_gpu
+RUN_REAL_CLAUDE=1 uv run pytest -m real_claude
+RUN_REAL_GPU=1 uv run pytest -m real_gpu
 ```
 
-## 启动
+## 初始化
+
+一次性创建 Worker Key、Ed25519 keypair和 loopback TLS证书：
 
 ```bash
-uv run agent-scheduler init-runtime --state-root /public/share/agent-scheduler-mvp
-uv run uvicorn agent_scheduler.api.app:app --host 127.0.0.1 --port 8443
+uv run agent-scheduler init-runtime \
+  --state-root /public/share/agent-scheduler-mvp
 ```
 
-`init-runtime` 不会覆盖既有密钥。真实 Claude 调用默认关闭；启用时由运维父进程显式提供 `ANTHROPIC_API_KEY`，适配器使用独立非交互进程和严格 JSON 输出。
+若任一身份文件已存在，命令会拒绝覆盖。仓库现有 `.env` 不由项目读取；运维 shell应在启动前显式加载所需环境，真实 `--bare` Claude契约必须提供 `ANTHROPIC_API_KEY`。
 
-## 重要边界
+## 启动真实闭环
 
-MVP 不实现真实认证、多租户隔离、镜像 pull、动态依赖安装、业务自动重试、数据库、HA、崩溃自动恢复或性能 SLO。`root` Master/Worker 属于可信管理域；Proposal Agent 的目标部署身份是 `zz_chentian`，但首版验收允许使用 root Claude Code。
+三个终端使用相同环境：
+
+```bash
+export AGENT_SCHEDULER_STATE_ROOT=/public/share/agent-scheduler-mvp
+export AGENT_SCHEDULER_PROFILE=qualification
+export AGENT_SCHEDULER_HARNESS_MODE=claude
+export AGENT_SCHEDULER_WORKER_MODE=remote
+```
+
+终端 1：loopback HTTPS/WSS Master。
+
+```bash
+uv run agent-scheduler serve
+```
+
+终端 2：root Worker，主动建立 WSS并每10秒上报真实 `hy-smi`。
+
+```bash
+uv run agent-scheduler worker
+```
+
+终端 3：真实 Claude Submitter通过本地 MCP Adapter一次提交四个 Proposal，并验证持久证据：
+
+```bash
+uv run agent-scheduler qualify
+```
+
+浏览器观察页为 `https://127.0.0.1:8443/`。开发证书是自签名 loopback证书；远程访问使用 SSH tunnel。
+
+## Admin
+
+```bash
+uv run agent-scheduler tick --actor admin --reason 'manual scheduler pass'
+uv run agent-scheduler drain --actor admin --reason maintenance
+uv run agent-scheduler compile-retry --proposal-id PROP --actor admin --reason fixed-validator
+uv run agent-scheduler reconcile --execution-id EXEC --actor admin --reason verified-stopped
+uv run agent-scheduler reload-users --users zz_chentian --actor admin --reason policy-update
+```
+
+所有状态变更走 loopback管理面并写审计；没有单 GPU强制释放命令。
+
+## 已知边界
+
+MVP 不实现真实认证、多租户隔离、镜像 pull、动态依赖安装、业务自动重试、数据库、HA、崩溃自动恢复、真实多 Worker/gang或性能 SLO。Master/Worker/root容器属于可信管理域；目标 Submitter OS身份是 `zz_chentian`，0.2.0 首版资格允许 root Claude Code。

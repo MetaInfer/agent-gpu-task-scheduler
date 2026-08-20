@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 ID = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]*_[0-9a-f]{32}$")]
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+Ed25519Signature = Annotated[str, Field(pattern=r"^[A-Za-z0-9+/]{86}==$")]
 AbsolutePath = Annotated[str, Field(pattern=r"^/(?:[A-Za-z0-9_.-]+/?)+$")]
 ImageDigest = Annotated[str, Field(pattern=r"^[A-Za-z0-9./:_-]+@sha256:[0-9a-f]{64}$")]
 
@@ -200,7 +201,7 @@ class Task(StrictModel):
     units: tuple[TaskUnit, ...] = Field(min_length=1, max_length=64)
     created_at: datetime
     content_hash: Sha256 | None = None
-    signature: str | None = None
+    signature: Ed25519Signature | None = None
 
     @model_validator(mode="after")
     def validate_task(self) -> Task:
@@ -263,7 +264,7 @@ class PrepareManifest(StrictModel):
     executable: Literal[False] = False
     created_at: datetime
     content_hash: Sha256 | None = None
-    signature: str | None = None
+    signature: Ed25519Signature | None = None
 
 
 class ExecutionPlan(StrictModel):
@@ -286,7 +287,7 @@ class ExecutionPlan(StrictModel):
     environment: tuple[tuple[str, str], ...] = ()
     created_at: datetime
     content_hash: Sha256 | None = None
-    signature: str | None = None
+    signature: Ed25519Signature | None = None
 
 
 class Proposal(StrictModel):

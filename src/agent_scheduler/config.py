@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,15 +18,17 @@ class Settings:
     allowed_users: frozenset[str]
     max_workers: int = 1
     worker_id: str = "worker-local-01"
+    auto_schedule: bool = True
 
     @classmethod
     def from_env(cls) -> Settings:
         qualification = os.environ.get("AGENT_SCHEDULER_PROFILE") == "qualification"
         default_threshold = "90" if qualification else "2"
         threshold = float(os.environ.get("AGENT_SCHEDULER_VRAM_THRESHOLD", default_threshold))
-        if threshold > 2 and not qualification:
+        maximum = 90.0 if qualification else 2.0
+        if not math.isfinite(threshold) or threshold <= 0 or threshold > maximum:
             raise ValueError(
-                "VRAM threshold above 2 requires AGENT_SCHEDULER_PROFILE=qualification"
+                f"VRAM threshold must be finite and in (0, {maximum}] for this profile"
             )
         harness_mode = os.environ.get("AGENT_SCHEDULER_HARNESS_MODE", "fake")
         worker_mode = os.environ.get("AGENT_SCHEDULER_WORKER_MODE", "remote")
@@ -48,4 +51,5 @@ class Settings:
             vram_threshold=threshold,
             allowed_users=users,
             max_workers=int(os.environ.get("AGENT_SCHEDULER_MAX_WORKERS", "1")),
+            auto_schedule=os.environ.get("AGENT_SCHEDULER_AUTO_SCHEDULE", "1") == "1",
         )

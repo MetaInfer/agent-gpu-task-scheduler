@@ -156,6 +156,10 @@ class EventStore:
                     event = Event.model_validate_json(line)
                 except ValueError as exc:
                     raise StoreCorruptionError(f"invalid event line {path}:{line_number}") from exc
+                if event.object_type != object_type or event.object_id != object_id:
+                    raise StoreCorruptionError(
+                        f"event stream binding mismatch at {path}:{line_number}"
+                    )
                 if event.sequence != expected:
                     raise StoreCorruptionError(
                         f"event sequence gap at {path}:{line_number}: expected {expected}, got {event.sequence}"

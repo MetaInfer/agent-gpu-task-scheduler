@@ -17,7 +17,10 @@ def test_proposal_confirm_schedule_and_observe(app_client):
     proposal = response.json()["proposal"]
     confirmed = client.post(
         f"/api/v1/proposals/{proposal['proposal_id']}/confirm",
-        headers={"X-Username": "zz_chentian"},
+        headers={
+            "X-Username": "zz_chentian",
+            "Idempotency-Key": "confirm-api-1",
+        },
         json={"revision_id": proposal["current_revision_id"]},
     )
     assert confirmed.status_code == 200
@@ -115,6 +118,10 @@ def test_dashboard_and_mcp_stdio_surface(app_client):
         "resume",
         "cancel",
         "get_proposal",
+        "get_reviews",
+        "get_task",
+        "cancel_task",
+        "wait_for_task",
         "wait_for_events",
         "get_logs",
     }

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -52,13 +54,18 @@ class WorkerHub:
                     f"MESSAGE_{envelope.message_type}",
                     worker_id,
                     envelope.message_id,
-                    {"sequence": envelope.sequence},
+                    {
+                        "sequence": envelope.sequence,
+                        "assignment_id": envelope.assignment_id,
+                        "dispatch_generation": envelope.dispatch_generation,
+                        "lease_epoch": envelope.lease_epoch,
+                    },
                 )
                 if envelope.message_type == "HEARTBEAT":
                     snapshot = strict_from_json_value(WorkerSnapshot, envelope.payload["worker"])
                     if snapshot.worker_id != worker_id:
                         raise WorkerProtocolError("heartbeat worker_id mismatch")
-                    self.on_heartbeat(snapshot)
+                    asyncio.create_task(asyncio.to_thread(self.on_heartbeat, snapshot))
                     await self._send_ack(worker_id, envelope)
                     continue
                 reply_to = envelope.payload.get("reply_to")
@@ -66,6 +73,7 @@ class WorkerHub:
                     future = self._pending.get(reply_to)
                     if future is not None and not future.done():
                         future.set_result(envelope)
+                    await self._send_ack(worker_id, envelope)
         except WebSocketDisconnect:
             pass
         finally:
@@ -158,44 +166,48 @@ class WorkerHub:
 
 
 class RemoteWorkerDriver(WorkerDriver):
-    def __init__(self, hub: WorkerHub, worker_id: str = "worker-local-01") -> None:
+    def __init__(self, hub: WorkerHub, state_root: str, worker_id: str = "worker-local-01") -> None:
         self.hub = hub
+        self.state_root = state_root
         self.worker_id = worker_id
 
     def prepare(self, manifest: PrepareManifest, task: Task) -> bool:
         response = self.hub.request(
             self.worker_id,
             "PREPARE",
-            {"manifest": manifest.model_dump(mode="json"), "task": task.model_dump(mode="json")},
+            {"manifest": manifest.model_dump(mode="json"), **self._task_reference(task)},
             assignment_id=manifest.assignment_id,
             dispatch_generation=manifest.dispatch_generation,
             lease_epoch=manifest.lease_epoch,
             timeout=30,
         )
+        self._ingest_worker_evidence(task)
         return response.payload.get("accepted") is True
 
     def acknowledge_plan(self, plan: ExecutionPlan, task: Task) -> bool:
         response = self.hub.request(
             self.worker_id,
             "PLAN",
-            {"plan": plan.model_dump(mode="json"), "task": task.model_dump(mode="json")},
+            {"plan": plan.model_dump(mode="json"), **self._task_reference(task)},
             assignment_id=plan.assignment_id,
             dispatch_generation=plan.dispatch_generation,
             lease_epoch=plan.lease_epoch,
             timeout=30,
         )
+        self._ingest_worker_evidence(task)
         return response.payload.get("accepted") is True
 
     def execute(self, plan: ExecutionPlan, task: Task) -> ExecutionResult:
         response = self.hub.request(
             self.worker_id,
             "EXECUTE",
-            {"plan": plan.model_dump(mode="json"), "task": task.model_dump(mode="json")},
+            {"plan": plan.model_dump(mode="json"), **self._task_reference(task)},
             assignment_id=plan.assignment_id,
             dispatch_generation=plan.dispatch_generation,
             lease_epoch=plan.lease_epoch,
             timeout=max(unit.timeout_seconds for unit in task.units) + 180,
         )
+        self._ingest_worker_evidence(task)
         return ExecutionResult(
             exit_code=int(response.payload["exit_code"]),
             logs_present=response.payload.get("logs_present") is True,
@@ -205,17 +217,82 @@ class RemoteWorkerDriver(WorkerDriver):
             failure_reason=_optional_string(response.payload.get("failure_reason")),
         )
 
+    def query_status(
+        self,
+        assignment_id: str,
+        dispatch_generation: int,
+        lease_epoch: int,
+        task: Task,
+    ) -> str:
+        response = self.hub.request(
+            self.worker_id,
+            "STATUS_QUERY",
+            self._task_reference(task),
+            assignment_id=assignment_id,
+            dispatch_generation=dispatch_generation,
+            lease_epoch=lease_epoch,
+            timeout=30,
+        )
+        value = response.payload.get("status")
+        return value if isinstance(value, str) else "UNKNOWN"
+
+    def cancel(self, plan: ExecutionPlan, task: Task) -> bool:
+        response = self.hub.request(
+            self.worker_id,
+            "CANCEL",
+            {"plan": plan.model_dump(mode="json"), **self._task_reference(task)},
+            assignment_id=plan.assignment_id,
+            dispatch_generation=plan.dispatch_generation,
+            lease_epoch=plan.lease_epoch,
+            timeout=60,
+        )
+        self._ingest_worker_evidence(task)
+        return response.payload.get("cancelled") is True
+
     def reconcile(self, plan: ExecutionPlan, task: Task) -> bool:
         response = self.hub.request(
             self.worker_id,
             "RECONCILE",
-            {"plan": plan.model_dump(mode="json"), "task": task.model_dump(mode="json")},
+            {"plan": plan.model_dump(mode="json"), **self._task_reference(task)},
             assignment_id=plan.assignment_id,
             dispatch_generation=plan.dispatch_generation,
             lease_epoch=plan.lease_epoch,
             timeout=30,
         )
+        self._ingest_worker_evidence(task)
         return response.payload.get("safe") is True
+
+    def _ingest_worker_evidence(self, task: Task) -> None:
+        path = (
+            Path(self.state_root)
+            / "worker-inbox"
+            / self.worker_id
+            / task.execution_id
+            / "driver-events.jsonl"
+        )
+        if not path.is_file():
+            return
+        for line in path.read_text(encoding="utf-8").splitlines():
+            value = json.loads(line)
+            if not isinstance(value, dict) or value.get("task_id") != task.task_id:
+                raise WorkerProtocolError("Worker evidence is malformed or cross-bound")
+            event_id = value.get("event_id")
+            if not isinstance(event_id, str):
+                raise WorkerProtocolError("Worker evidence lacks event_id")
+            if not self.hub.events.immutable_exists("worker-evidence", event_id):
+                self.hub.events.write_immutable("worker-evidence", event_id, value)
+
+    def _task_reference(self, task: Task) -> dict[str, object]:
+        if task.content_hash is None:
+            raise WorkerProtocolError("Task has no content hash")
+        return {
+            "task_id": task.task_id,
+            "task_content_hash": task.content_hash,
+            "task_path": f"{self.state_root}/immutable/tasks/{task.task_id}.json",
+            "task_canonical_path": (
+                f"{self.state_root}/immutable/tasks/{task.task_id}.canonical.json"
+            ),
+        }
 
 
 def _optional_string(value: object) -> str | None:

@@ -7,6 +7,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from datetime import timedelta
+from pathlib import Path
 from threading import RLock
 from typing import Any, cast
 
@@ -15,6 +16,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from agent_scheduler.adapters.harness import HarnessAdapter, HarnessError
 from agent_scheduler.domain.compiler import CompilationContext, CompileError, compile_task
 from agent_scheduler.domain.models import (
+    CommandKind,
     IdempotencyRecord,
     Proposal,
     ProposalFacts,
@@ -48,6 +50,8 @@ _REQUIRED_HEADINGS = (
     "## Multi-node Coordination",
     "## Risks and Notes",
 )
+_QUALIFICATION_LAUNCHER = "/data/fh/agent-gpu-task-scheduler/scripts/run_torch_collective_smoke.sh"
+_QUALIFICATION_LAUNCHER_SHA256 = "66de599723417262b3d6c2c2e665777c6c2183a770ed1dbce2d69fcb074881f0"
 _TERMINAL = {
     ProposalState.REJECTED,
     ProposalState.EXPIRED,
@@ -258,12 +262,29 @@ class ProposalService:
             )
             return record.proposal
 
-    def confirm(self, proposal_id: str, username: str, revision_id: str, request_id: str) -> Task:
+    def confirm(
+        self,
+        proposal_id: str,
+        username: str,
+        revision_id: str,
+        idempotency_key: str,
+        request_id: str,
+    ) -> Task:
         self._check_user(username)
         with self._lock:
             record = self._get(proposal_id)
             self._check_owner(record.proposal, username)
             self._check_lifetime(record, request_id)
+            operation = f"confirm:{proposal_id}"
+            request = {"revision_id": revision_id}
+            cached = self._idempotent_result(username, operation, idempotency_key, request)
+            if cached is not None:
+                outcome = cached.response.get("outcome")
+                if outcome == "COMPILED" and record.task is not None:
+                    return record.task
+                if isinstance(outcome, str):
+                    raise ProposalError(f"cached confirmation outcome: {outcome}", code=outcome)
+                raise ProposalError("cached confirmation has no outcome")
             if record.proposal.state is not ProposalState.AWAITING_CONFIRMATION:
                 raise ProposalError("proposal is not awaiting confirmation", code="INVALID_STATE")
             if record.proposal.current_revision_id != revision_id:
@@ -306,6 +327,14 @@ class ProposalService:
                     request_id,
                     {"error": str(exc)},
                 )
+                self._save_idempotency(
+                    username,
+                    operation,
+                    idempotency_key,
+                    request,
+                    proposal_id,
+                    {"outcome": "PROCESSING_ERROR"},
+                )
                 raise ProposalError(str(exc), code="PROCESSING_ERROR") from exc
             self.events.write_immutable("reviews", review.review_id, review)
             record.reviews[review.review_id] = review
@@ -326,6 +355,14 @@ class ProposalService:
                     request_id,
                     {"review_id": review.review_id},
                 )
+                self._save_idempotency(
+                    username,
+                    operation,
+                    idempotency_key,
+                    request,
+                    proposal_id,
+                    {"outcome": "CHANGES_REQUESTED", "review_id": review.review_id},
+                )
                 raise ProposalError("review requested changes", code="CHANGES_REQUESTED")
             if review.decision is ReviewDecision.REJECT:
                 record.proposal = record.proposal.model_copy(
@@ -339,6 +376,14 @@ class ProposalService:
                     "reviewer",
                     request_id,
                     {"review_id": review.review_id},
+                )
+                self._save_idempotency(
+                    username,
+                    operation,
+                    idempotency_key,
+                    request,
+                    proposal_id,
+                    {"outcome": "REJECTED", "review_id": review.review_id},
                 )
                 raise ProposalError("review rejected proposal", code="REJECTED")
             record.proposal = record.proposal.model_copy(
@@ -380,6 +425,14 @@ class ProposalService:
                     request_id,
                     {"error": str(exc)},
                 )
+                self._save_idempotency(
+                    username,
+                    operation,
+                    idempotency_key,
+                    request,
+                    proposal_id,
+                    {"outcome": "COMPILE_FAILED"},
+                )
                 raise ProposalError(str(exc), code="COMPILE_FAILED") from exc
             self.events.write_immutable("tasks", task.task_id, task)
             self.events.write_immutable_bytes(
@@ -405,6 +458,14 @@ class ProposalService:
                 "compiler",
                 request_id,
                 {"execution_id": task.execution_id},
+            )
+            self._save_idempotency(
+                username,
+                operation,
+                idempotency_key,
+                request,
+                proposal_id,
+                {"outcome": "COMPILED", "task_id": task.task_id},
             )
             return task
 
@@ -504,6 +565,14 @@ class ProposalService:
 
     def get_task(self, proposal_id: str) -> Task | None:
         return self._get(proposal_id).task
+
+    def get_reviews(self, proposal_id: str) -> list[Review]:
+        return sorted(self._get(proposal_id).reviews.values(), key=lambda review: review.created_at)
+
+    def get_current_facts(self, proposal_id: str) -> ProposalFacts | None:
+        record = self._get(proposal_id)
+        facts_id = record.proposal.current_facts_id
+        return record.facts.get(facts_id) if facts_id else None
 
     def list_proposals(self) -> list[Proposal]:
         return sorted(
@@ -657,3 +726,29 @@ class ProposalService:
     def _validate_facts(proposal: Proposal, facts: ProposalFacts) -> None:
         if facts.submitter_username != proposal.username:
             raise ProposalError("Facts username differs from Proposal username")
+        if facts.required_gpu_count not in {1, 2, 4, 8}:
+            raise ProposalError("qualification GPU count must be 1, 2, 4, or 8")
+        if len(facts.run) != 1:
+            raise ProposalError("qualification requires exactly one run command")
+        command = facts.run[0]
+        if (
+            command.kind is not CommandKind.CONTAINER_PATH_BASH
+            or command.container_path != _QUALIFICATION_LAUNCHER
+            or command.sha256 != _QUALIFICATION_LAUNCHER_SHA256
+            or len(command.argv) != 2
+        ):
+            raise ProposalError("qualification run command does not match frozen launcher")
+        output, business_log = command.argv
+        expected_prefix = "/data/agent-scheduler-mvp/"
+        if not output.startswith(f"{expected_prefix}outputs/{proposal.proposal_id}"):
+            raise ProposalError("qualification output path is not Proposal-unique")
+        if not business_log.startswith(f"{expected_prefix}logs/{proposal.proposal_id}"):
+            raise ProposalError("qualification business log path is not Proposal-unique")
+        expected_host_output = output.replace("/data", "/public/share", 1)
+        expected_host_log = business_log.replace("/data", "/public/share", 1)
+        if facts.required_outputs != (expected_host_output,) or facts.required_logs != (
+            expected_host_log,
+        ):
+            raise ProposalError("required artifacts do not match launcher argv")
+        if any(Path(path).exists() for path in facts.required_outputs + facts.required_logs):
+            raise ProposalError("qualification artifact paths must not exist before execution")

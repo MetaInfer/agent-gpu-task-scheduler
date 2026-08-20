@@ -49,3 +49,14 @@ def test_sequence_gap_is_rejected(tmp_path: Path):
     path.write_text(json.dumps(data) + "\n", encoding="utf-8")
     with pytest.raises(StoreCorruptionError, match="sequence gap"):
         store.list_events("tasks", object_id)
+
+
+def test_cross_stream_event_binding_is_rejected(tmp_path: Path):
+    store = EventStore(tmp_path / "state")
+    first_id = new_id("task")
+    second_id = new_id("task")
+    event = store.append("tasks", second_id, "CREATED", "test", "req")
+    path = store.events_root / "tasks" / f"{first_id}.jsonl"
+    path.write_text(event.model_dump_json() + "\n", encoding="utf-8")
+    with pytest.raises(StoreCorruptionError, match="binding mismatch"):
+        store.list_events("tasks", first_id)

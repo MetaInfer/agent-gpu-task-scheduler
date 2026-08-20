@@ -1,0 +1,622 @@
+"""Real Claude + WSS + Docker + GPU qualification orchestration and evidence checks."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Any, Literal
+
+from agent_scheduler.domain.models import (
+    ExecutionPlan,
+    PrepareManifest,
+    Proposal,
+    ProposalFacts,
+    ResourceLease,
+    Review,
+    StrictModel,
+    Task,
+    TaskStatus,
+    WorkerSnapshot,
+    new_id,
+    strict_from_json_value,
+    utc_now,
+)
+from agent_scheduler.integrity import canonical_bytes, verify_model
+from agent_scheduler.runtime import RuntimeIdentity
+from agent_scheduler.storage import EventStore, StoreCorruptionError
+from agent_scheduler.worker.docker import DockerCLI, DockerError
+
+_LAUNCHER_PATH = "/data/fh/agent-gpu-task-scheduler/scripts/run_torch_collective_smoke.sh"
+_LAUNCHER_SHA256 = "66de599723417262b3d6c2c2e665777c6c2183a770ed1dbce2d69fcb074881f0"
+_TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "CLEANUP_FAILED"}
+
+
+class QualificationItem(StrictModel):
+    card_count: Literal[1, 2, 4, 8]
+    proposal_id: str
+    task_id: str
+    state: str
+
+
+class QualificationResult(StrictModel):
+    schema_version: Literal["v1"] = "v1"
+    run_id: str
+    status: Literal["COMPLETED", "BLOCKED_QUALIFICATION"]
+    items: tuple[QualificationItem, ...]
+    reason: str | None = None
+
+
+def run_submitter_agent(
+    *,
+    project_root: Path,
+    state_root: Path,
+    base_url: str,
+    tls_certificate: Path,
+    timeout_seconds: int = 45 * 60,
+    executable: str = "claude",
+) -> QualificationResult:
+    run_id = new_id("qual")
+    store: EventStore | None = None
+    invocation_id = new_id("harness")
+    started = utc_now()
+    command: list[str] = []
+    audit: dict[str, object] = {
+        "schema_version": "v1",
+        "invocation_id": invocation_id,
+        "run_id": run_id,
+        "role": "submitter",
+        "started_at": started.isoformat(),
+    }
+    try:
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            return _blocked((), "ANTHROPIC_API_KEY is required by the --bare contract", run_id)
+        store = EventStore(state_root)
+        gate_failure = _run_local_gates(project_root, store, run_id)
+        if gate_failure:
+            return _blocked((), gate_failure, run_id)
+        profile = _master_profile(base_url, tls_certificate)
+        if profile != {
+            "qualification": True,
+            "harness_mode": "claude",
+            "worker_mode": "remote",
+        }:
+            return _blocked((), f"Master is not in real qualification mode: {profile}", run_id)
+        store.write_immutable(
+            "qualification-runs",
+            run_id,
+            {
+                "schema_version": "v1",
+                "run_id": run_id,
+                "started_at": started.isoformat(),
+                "profile": profile,
+            },
+        )
+        qualification_dir = state_root / "qualification"
+        qualification_dir.mkdir(parents=True, exist_ok=True)
+        mcp_config = qualification_dir / f"submitter-mcp-{run_id}.json"
+        uv_path = shutil.which("uv")
+        if uv_path is None:
+            return _blocked((), "uv executable not found", run_id)
+        mcp_config.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "submitter": {
+                            "command": str(Path(uv_path).resolve()),
+                            "args": [
+                                "run",
+                                "agent-scheduler",
+                                "mcp",
+                                "--base-url",
+                                base_url,
+                                "--username",
+                                "zz_chentian",
+                            ],
+                            "cwd": str(project_root),
+                            "env": {"AGENT_SCHEDULER_STATE_ROOT": str(state_root)},
+                        }
+                    }
+                },
+                sort_keys=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        schema = json.dumps(
+            QualificationResult.model_json_schema(), sort_keys=True, separators=(",", ":")
+        )
+        allowed = ",".join(
+            f"mcp__submitter__{name}"
+            for name in (
+                "create_proposal",
+                "reply",
+                "confirm_revision",
+                "resume",
+                "cancel",
+                "get_proposal",
+                "get_reviews",
+                "get_task",
+                "cancel_task",
+                "wait_for_task",
+                "wait_for_events",
+                "get_logs",
+            )
+        )
+        command = [
+            executable,
+            "--bare",
+            "--print",
+            "--no-session-persistence",
+            "--disable-slash-commands",
+            "--permission-mode",
+            "dontAsk",
+            "--tools",
+            "",
+            "--allowedTools",
+            allowed,
+            "--strict-mcp-config",
+            "--mcp-config",
+            str(mcp_config),
+            "--system-prompt-file",
+            str(project_root / "prompts" / "submitter.md"),
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--json-schema",
+            schema,
+        ]
+        prompt = (
+            f"qualification_run_id={run_id}\n"
+            "Run the four-task qualification. Echo run_id exactly. All created Proposal text MUST "
+            f"include `Qualification Run: {run_id}`. Return BLOCKED_QUALIFICATION if any Task "
+            "fails or does not become terminal within the available deadline."
+        )
+        env = {
+            "HOME": os.environ.get("HOME", "/root"),
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "ANTHROPIC_API_KEY": os.environ["ANTHROPIC_API_KEY"],
+            "DISABLE_UPDATES": "1",
+            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
+            "SSL_CERT_FILE": str(tls_certificate),
+        }
+        if os.environ.get("ANTHROPIC_BASE_URL"):
+            env["ANTHROPIC_BASE_URL"] = os.environ["ANTHROPIC_BASE_URL"]
+        cli_version = _claude_version(executable, env)
+        completed = subprocess.run(
+            command,
+            input=prompt,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout_seconds,
+            cwd=project_root,
+            env=env,
+        )
+        audit.update(
+            {
+                "ended_at": utc_now().isoformat(),
+                "argv": command,
+                "cli_version": cli_version,
+                "cwd": str(project_root),
+                "exit_code": completed.returncode,
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
+            }
+        )
+        store.write_immutable("harness", invocation_id, audit)
+        if completed.returncode != 0:
+            return _blocked((), f"Submitter Claude exited with code {completed.returncode}", run_id)
+        result = strict_from_json_value(
+            QualificationResult, _stream_structured_output(completed.stdout)
+        )
+        if result.run_id != run_id:
+            return _blocked(result.items, "Submitter returned a different run_id", run_id)
+        return result
+    except subprocess.TimeoutExpired:
+        audit.update(
+            {"ended_at": utc_now().isoformat(), "argv": command, "error": "submitter_timeout"}
+        )
+        if store is not None:
+            store.write_immutable("harness", invocation_id, audit)
+        return _blocked((), "Submitter qualification deadline expired", run_id)
+    except (OSError, DockerError, StoreCorruptionError, json.JSONDecodeError, ValueError) as exc:
+        audit.update(
+            {
+                "ended_at": utc_now().isoformat(),
+                "argv": command,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
+        if store is not None and not store.immutable_exists("harness", invocation_id):
+            store.write_immutable("harness", invocation_id, audit)
+        return _blocked((), f"qualification launch failed: {type(exc).__name__}: {exc}", run_id)
+
+
+def verify_qualification(
+    result: QualificationResult,
+    *,
+    state_root: Path,
+    identity: RuntimeIdentity,
+    docker: DockerCLI | None = None,
+) -> QualificationResult:
+    """Fail closed unless the complete current-run evidence graph validates."""
+    if result.status != "COMPLETED":
+        return result
+    try:
+        store = EventStore(state_root)
+        store.validate_all_events()
+        run_record = store.read_immutable("qualification-runs", result.run_id)
+        if run_record.get("profile") != {
+            "qualification": True,
+            "harness_mode": "claude",
+            "worker_mode": "remote",
+        }:
+            return _blocked(result.items, "qualification run profile is invalid", result.run_id)
+        gate_records = [
+            value
+            for value in store.iter_immutable("qualification-gates")
+            if value.get("run_id") == result.run_id and value.get("passed") is True
+        ]
+        if len(gate_records) != 1:
+            return _blocked(
+                result.items, "local quality gates are not bound and passing", result.run_id
+            )
+        expected_cards = {1, 2, 4, 8}
+        if {item.card_count for item in result.items} != expected_cards or len(result.items) != 4:
+            return _blocked(
+                result.items, "result does not contain exactly 1/2/4/8 cards", result.run_id
+            )
+        all_harness = list(store.iter_immutable("harness"))
+        submitter = [
+            item
+            for item in all_harness
+            if item.get("run_id") == result.run_id
+            and item.get("role") == "submitter"
+            and item.get("exit_code") == 0
+        ]
+        if len(submitter) != 1:
+            return _blocked(result.items, "current Submitter evidence is incomplete", result.run_id)
+        for item in result.items:
+            failure = _verify_item(item, result.run_id, store, identity, all_harness)
+            if failure:
+                return _blocked(result.items, failure, result.run_id)
+        leases = _active_leases(store)
+        execution_ids = {
+            strict_from_json_value(Task, store.read_immutable("tasks", item.task_id)).execution_id
+            for item in result.items
+        }
+        if any(lease.execution_id in execution_ids for lease in leases.values()):
+            return _blocked(result.items, "qualification execution retains a Lease", result.run_id)
+        inspection = (docker or DockerCLI()).inspect("fh-sglang-deepseek-v4-flash")
+        if not inspection.exists or inspection.running:
+            return _blocked(result.items, "reuse container is not confirmed stopped", result.run_id)
+        return result
+    except (OSError, DockerError, StoreCorruptionError, json.JSONDecodeError, ValueError) as exc:
+        return _blocked(
+            result.items,
+            f"qualification evidence failed closed: {type(exc).__name__}: {exc}",
+            result.run_id,
+        )
+
+
+def _verify_item(
+    item: QualificationItem,
+    run_id: str,
+    store: EventStore,
+    identity: RuntimeIdentity,
+    harness_records: list[dict[str, Any]],
+) -> str | None:
+    task = strict_from_json_value(Task, store.read_immutable("tasks", item.task_id))
+    if task.proposal_id != item.proposal_id or not verify_model(task, identity.signing_public_key):
+        return f"Task/Proposal/signature binding invalid: {item.task_id}"
+    canonical_path = store.immutable_root / "tasks" / f"{task.task_id}.canonical.json"
+    if canonical_path.read_bytes() != canonical_bytes(task):
+        return f"canonical Task sidecar invalid: {task.task_id}"
+    proposal_data = store.read_snapshot("proposals", item.proposal_id)
+    if proposal_data is None:
+        return f"Proposal snapshot missing: {item.proposal_id}"
+    proposal = strict_from_json_value(Proposal, proposal_data)
+    revision_data = store.read_immutable("revisions", task.revision_id)
+    revision_markdown = revision_data.get("markdown")
+    if (
+        proposal.state.value != "COMPILED"
+        or not isinstance(revision_markdown, str)
+        or f"Qualification Run: {run_id}" not in revision_markdown
+    ):
+        return f"Proposal is not bound to current qualification run: {item.proposal_id}"
+    facts = strict_from_json_value(ProposalFacts, store.read_immutable("facts", task.facts_id))
+    review = strict_from_json_value(Review, store.read_immutable("reviews", task.review_id))
+    unit = task.units[0] if len(task.units) == 1 else None
+    if (
+        unit is None
+        or unit.required_gpu_count != item.card_count
+        or unit.run[0].container_path != _LAUNCHER_PATH
+        or unit.run[0].sha256 != _LAUNCHER_SHA256
+        or facts.revision_id != task.revision_id
+        or review.revision_id != task.revision_id
+        or review.decision.value != "APPROVE"
+    ):
+        return f"frozen workload/Facts/Review invalid: {task.task_id}"
+    status = _latest_task_status(store, task.task_id)
+    if status is None:
+        return f"Task status history missing: {task.task_id}"
+    if status.state.value != "COMPLETED" or item.state != "COMPLETED":
+        return f"Task is not COMPLETED: {task.task_id}"
+    lease_actions = {
+        value.get("action")
+        for value in store.iter_immutable("lease-history")
+        if isinstance(value.get("lease"), dict)
+        and value["lease"].get("execution_id") == task.execution_id
+    }
+    if not {"COMMITTED", "RELEASED"}.issubset(lease_actions):
+        return f"Lease commit/release evidence incomplete: {task.task_id}"
+    plans = [
+        strict_from_json_value(ExecutionPlan, value)
+        for value in store.iter_immutable("plans")
+        if value.get("task_id") == task.task_id
+    ]
+    if len(plans) != 1:
+        return f"Task does not have exactly one immutable Plan: {task.task_id}"
+    plan = plans[0]
+    if (
+        not verify_model(plan, identity.signing_public_key)
+        or plan.key_id != identity.key_id
+        or plan.task_content_hash != task.content_hash
+        or plan.execution_id != task.execution_id
+        or len(plan.gpu_ids) != item.card_count
+    ):
+        return f"Execution Plan binding/signature invalid: {task.task_id}"
+    manifests = [
+        strict_from_json_value(PrepareManifest, value)
+        for value in store.iter_immutable("manifests")
+        if value.get("assignment_id") == plan.assignment_id
+    ]
+    if (
+        len(manifests) != 1
+        or not verify_model(manifests[0], identity.signing_public_key)
+        or manifests[0].lease_epoch != plan.lease_epoch
+        or manifests[0].gpu_ids != plan.gpu_ids
+        or manifests[0].dispatch_generation != plan.dispatch_generation
+    ):
+        return f"PrepareManifest binding/signature invalid: {task.task_id}"
+    samples = [
+        strict_from_json_value(WorkerSnapshot, value)
+        for value in store.iter_immutable("worker-samples")
+        if value.get("worker_id") == plan.worker_id
+    ]
+    fresh_sample = next(
+        (
+            sample
+            for sample in reversed(samples)
+            if sample.last_heartbeat_at >= task.created_at
+            and all(
+                gpu.gpu_id in plan.gpu_ids and gpu.vram_percent < 90 and bool(gpu.raw_line)
+                for gpu in sample.gpus
+                if gpu.gpu_id in plan.gpu_ids
+            )
+            and {gpu.gpu_id for gpu in sample.gpus if gpu.gpu_id in plan.gpu_ids}
+            == set(plan.gpu_ids)
+        ),
+        None,
+    )
+    if fresh_sample is None:
+        return f"fresh raw hy-smi evidence missing: {task.task_id}"
+    worker_object_id = f"worker_{hashlib.sha256(plan.worker_id.encode()).hexdigest()[:32]}"
+    protocol_events = {
+        event.event_type
+        for event in store.list_events("workers", worker_object_id)
+        if event.payload.get("assignment_id") == plan.assignment_id
+    }
+    required_protocol = {
+        "SEND_PREPARE",
+        "MESSAGE_PREPARE_RESULT",
+        "SEND_PLAN",
+        "MESSAGE_PLAN_RESULT",
+        "SEND_EXECUTE",
+        "MESSAGE_EXECUTE_RESULT",
+    }
+    if not required_protocol.issubset(protocol_events):
+        return f"current WSS protocol evidence incomplete: {task.task_id}"
+    event_types = {event.event_type for event in store.list_events("tasks", task.task_id)}
+    required = {"PREPARED", "PLAN_ACK", "RUNNING", "COMPLETED"}
+    if not required.issubset(event_types):
+        return f"barrier evidence incomplete: {task.task_id}"
+    worker_events = list(store.iter_immutable("worker-evidence"))
+    evidence = [value for value in worker_events if value.get("task_id") == task.task_id]
+    if not any(value.get("event_type") == "TASK_VERIFIED_PRE_DOCKER" for value in evidence):
+        return f"pre-Docker verification evidence missing: {task.task_id}"
+    if not any(value.get("event_type") == "EXECUTION_FINISHED" for value in evidence):
+        return f"Docker lifecycle evidence missing: {task.task_id}"
+    roles = {
+        value.get("role")
+        for value in harness_records
+        if value.get("exit_code") == 0 and _record_mentions(value, task.revision_id)
+    }
+    if not {"processor", "reviewer"}.issubset(roles):
+        return f"Processor/Reviewer evidence is not bound to revision: {task.revision_id}"
+    controller = [
+        value
+        for value in harness_records
+        if value.get("role") == "worker-controller"
+        and value.get("exit_code") == 0
+        and _record_mentions(value, plan.assignment_id)
+    ]
+    if len(controller) != 1:
+        return f"Worker Controller evidence is not bound to assignment: {plan.assignment_id}"
+    framework_dir = store.root / "framework-logs" / task.task_id / unit.unit_id / task.execution_id
+    run_records = []
+    for path in sorted(framework_dir.glob("run-*.json")):
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(value, dict):
+            run_records.append(value)
+    if (
+        len(run_records) != 1
+        or run_records[0].get("exit_code") != 0
+        or run_records[0].get("argv", [None, None])[1] != _LAUNCHER_PATH
+    ):
+        return f"frozen Docker exec evidence invalid: {task.task_id}"
+    for artifact_path_value in unit.required_logs + unit.required_outputs:
+        artifact = Path(artifact_path_value)
+        if not artifact.is_file() or artifact.stat().st_mtime < task.created_at.timestamp():
+            return f"required current-run artifact missing or stale: {artifact_path_value}"
+    output_path = Path(unit.required_outputs[0])
+    output = json.loads(output_path.read_text(encoding="utf-8"))
+    ranks = output.get("ranks")
+    expected_value = item.card_count * (item.card_count + 1) / 2
+    if (
+        output.get("world_size") != item.card_count
+        or output.get("all_reduce") != "ok"
+        or output.get("gemm") != "ok"
+        or output.get("rocm_version") is None
+        or not isinstance(ranks, list)
+        or {rank.get("rank") for rank in ranks if isinstance(rank, dict)}
+        != set(range(item.card_count))
+        or {rank.get("local_rank") for rank in ranks if isinstance(rank, dict)}
+        != set(range(item.card_count))
+        or any(
+            not isinstance(rank, dict)
+            or rank.get("all_reduce_value") != expected_value
+            or not isinstance(rank.get("gemm_elapsed_seconds"), (int, float))
+            for rank in ranks
+        )
+    ):
+        return f"numerical rank evidence invalid: {task.task_id}"
+    return None
+
+
+def _latest_task_status(store: EventStore, task_id: str) -> TaskStatus | None:
+    statuses = [
+        strict_from_json_value(TaskStatus, value)
+        for value in store.iter_immutable("task-status-history")
+        if value.get("task_id") == task_id
+    ]
+    return max(statuses, key=lambda status: status.updated_at) if statuses else None
+
+
+def _active_leases(store: EventStore) -> dict[str, ResourceLease]:
+    active: dict[str, ResourceLease] = {}
+    for value in store.iter_immutable("lease-history"):
+        lease = strict_from_json_value(ResourceLease, value["lease"])
+        action = value.get("action")
+        if action in {"HELD", "COMMITTED"}:
+            active[lease.lease_id] = lease
+        elif action == "RELEASED":
+            active.pop(lease.lease_id, None)
+        else:
+            raise ValueError("unknown Lease history action")
+    return active
+
+
+def _record_mentions(record: dict[str, Any], identifier: str) -> bool:
+    return identifier in json.dumps(record, sort_keys=True, ensure_ascii=False)
+
+
+def _master_profile(base_url: str, certificate: Path) -> dict[str, object]:
+    import httpx
+
+    response = httpx.get(f"{base_url}/health", verify=str(certificate), timeout=10)
+    response.raise_for_status()
+    value = response.json()
+    if not isinstance(value, dict):
+        raise TypeError("Master health is not an object")
+    return {
+        "qualification": value.get("qualification"),
+        "harness_mode": value.get("harness_mode"),
+        "worker_mode": value.get("worker_mode"),
+    }
+
+
+def _run_local_gates(project_root: Path, store: EventStore, run_id: str) -> str | None:
+    uv_path = shutil.which("uv")
+    if uv_path is None:
+        return "uv executable not found for local gates"
+    commands = (
+        [uv_path, "run", "pytest", "-m", "not real_claude and not real_gpu", "-q"],
+        [uv_path, "run", "ruff", "check", "."],
+        [uv_path, "run", "mypy", "src"],
+    )
+    results: list[dict[str, object]] = []
+    passed = True
+    env = os.environ.copy()
+    for name in ("RUN_REAL_CLAUDE", "RUN_REAL_GPU", "RUN_FULL_QUALIFICATION"):
+        env.pop(name, None)
+    for command in commands:
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=project_root,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10 * 60,
+            )
+            results.append(
+                {
+                    "argv": command,
+                    "exit_code": completed.returncode,
+                    "stdout": completed.stdout,
+                    "stderr": completed.stderr,
+                }
+            )
+            passed = passed and completed.returncode == 0
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            results.append({"argv": command, "error": f"{type(exc).__name__}: {exc}"})
+            passed = False
+    store.write_immutable(
+        "qualification-gates",
+        new_id("gate"),
+        {
+            "schema_version": "v1",
+            "run_id": run_id,
+            "passed": passed,
+            "timestamp": utc_now().isoformat(),
+            "results": results,
+        },
+    )
+    return None if passed else "one or more local quality gates failed"
+
+
+def _stream_structured_output(stdout: str) -> dict[str, object]:
+    for line in reversed(stdout.splitlines()):
+        if not line.strip():
+            continue
+        envelope = json.loads(line)
+        if not isinstance(envelope, dict):
+            continue
+        value = envelope.get("structured_output")
+        if value is None and envelope.get("type") == "result":
+            value = envelope.get("result")
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                continue
+        if isinstance(value, dict):
+            return value
+    raise ValueError("Claude stream has no structured qualification output")
+
+
+def _claude_version(executable: str, env: dict[str, str]) -> str:
+    result = subprocess.run(
+        [executable, "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+        env=env,
+    )
+    if result.returncode != 0:
+        raise OSError("Claude Code version check returned nonzero")
+    return result.stdout.strip()
+
+
+def _blocked(items: tuple[QualificationItem, ...], reason: str, run_id: str) -> QualificationResult:
+    return QualificationResult(
+        run_id=run_id, status="BLOCKED_QUALIFICATION", items=items, reason=reason
+    )
