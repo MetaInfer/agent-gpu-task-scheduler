@@ -25,6 +25,7 @@ dist/
 # Runtime state and logs
 .runtime/
 runtime/
+.claude/worktrees/
 *.log
 
 # Editors and operating systems
