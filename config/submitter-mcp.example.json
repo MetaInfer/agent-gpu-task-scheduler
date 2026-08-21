@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "submitter": {
+      "command": "uv",
+      "args": [
+        "run",
+        "agent-scheduler",
+        "mcp",
+        "--base-url",
+        "https://127.0.0.1:8443",
+        "--username",
+        "zz_chentian"
+      ],
+      "cwd": "/public/share/fh/agent-gpu-task-scheduler",
+      "env": {
+        "AGENT_SCHEDULER_STATE_ROOT": "/public/share/agent-scheduler-mvp"
+      }
+    }
+  }
+}
