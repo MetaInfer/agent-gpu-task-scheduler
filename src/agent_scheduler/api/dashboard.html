@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent GPU Scheduler</title>
+<style>
+:root{
+  --bg:#0d1117; --panel:#141b24; --panel-2:#1a2230; --line:#242e3d;
+  --ink:#e6edf3; --dim:#8b98a8; --faint:#5c6b7d;
+  --ok:#3fb950; --warn:#d29922; --bad:#f85149; --idle:#6e7681; --live:#3b8eea;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  --ui:system-ui,-apple-system,"Segoe UI","Noto Sans CJK SC","PingFang SC",sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--ui)}
+body{padding:20px;max-width:1560px;margin:0 auto;font-size:14px;line-height:1.45}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+
+/* ── status bar ───────────────────────────────────────────── */
+#bar{display:flex;align-items:center;gap:22px;flex-wrap:wrap;
+  background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--ok);
+  border-radius:10px;padding:14px 18px;margin-bottom:16px}
+#bar.warn{border-left-color:var(--warn)} #bar.bad{border-left-color:var(--bad)}
+#bar h1{font-size:15px;letter-spacing:.13em;text-transform:uppercase;margin:0;font-weight:650}
+.stat{display:flex;flex-direction:column;gap:1px}
+.stat .k{font-size:10px;letter-spacing:.11em;text-transform:uppercase;color:var(--faint)}
+.stat .v{font-size:14px;font-weight:600}
+.spacer{margin-left:auto}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:7px;vertical-align:1px}
+.s-ok{color:var(--ok)} .s-warn{color:var(--warn)} .s-bad{color:var(--bad)} .s-idle{color:var(--dim)}
+.d-ok{background:var(--ok)} .d-warn{background:var(--warn)} .d-bad{background:var(--bad)}
+.d-idle{background:var(--idle)} .d-live{background:var(--live)}
+
+/* ── panels ───────────────────────────────────────────────── */
+section{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:16px 18px;margin-bottom:16px}
+h2{font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--faint);
+  margin:0 0 13px;font-weight:650}
+.empty{color:var(--faint);font-size:13px;padding:2px 0}
+
+/* ── gpu grid ─────────────────────────────────────────────── */
+#gpus{display:grid;grid-template-columns:repeat(auto-fit,minmax(232px,1fr));gap:9px}
+.gpu{display:flex;align-items:center;gap:11px;background:var(--panel-2);
+  border:1px solid var(--line);border-radius:7px;padding:9px 12px}
+.gpu .id{font-family:var(--mono);font-size:12px;color:var(--dim);width:44px;flex:none}
+.meter{flex:1;height:7px;border-radius:4px;background:#0b1017;overflow:hidden}
+.meter i{display:block;height:100%;border-radius:4px;width:0;background:var(--ok);
+  transition:width .35s ease}
+.meter i.warn{background:var(--warn)} .meter i.bad{background:var(--bad)}
+.gpu .pct{font-family:var(--mono);font-size:12px;width:40px;text-align:right;flex:none}
+.gpu .st{font-size:10px;letter-spacing:.05em;width:78px;text-align:right;flex:none}
+
+/* ── pipeline ─────────────────────────────────────────────── */
+#stages{display:grid;grid-template-columns:150px 1fr 116px;gap:12px;
+  margin-bottom:9px;align-items:center}
+#stages .heads{display:grid;grid-template-columns:repeat(6,1fr)}
+#stages .heads span{font-size:9.5px;letter-spacing:.1em;color:var(--faint);text-align:center}
+.row{display:grid;grid-template-columns:150px 1fr 116px;gap:12px;align-items:center;
+  padding:7px 0;border-top:1px solid var(--line)}
+.row .pid{font-family:var(--mono);font-size:12px;color:var(--dim);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.track{display:grid;grid-template-columns:repeat(6,1fr);align-items:center;position:relative}
+.seg{height:3px;background:var(--line);position:relative;border-radius:2px}
+.seg::after{content:"";position:absolute;right:-4px;top:50%;transform:translateY(-50%);
+  width:9px;height:9px;border-radius:50%;background:var(--line);border:2px solid var(--panel)}
+.seg.done{background:var(--ok)} .seg.done::after{background:var(--ok)}
+.seg.now{background:var(--live)}
+.seg.now::after{background:var(--live);box-shadow:0 0 0 3px #3b8eea33}
+.seg.err{background:var(--bad)} .seg.err::after{background:var(--bad)}
+.row .tail{font-size:11.5px;text-align:right;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cards{font-family:var(--mono);color:var(--dim)}
+
+/* ── alerts ───────────────────────────────────────────────── */
+#alerts{display:none;border-left:4px solid var(--bad)}
+#alerts.on{display:block}
+.alert{display:flex;gap:11px;align-items:baseline;padding:6px 0;
+  border-top:1px solid var(--line);font-size:13px}
+.alert:first-of-type{border-top:0}
+.alert .tag{font-size:9.5px;letter-spacing:.09em;padding:2px 7px;border-radius:4px;
+  background:#f8514922;color:var(--bad);flex:none;font-weight:650}
+.alert .msg{color:var(--ink)} .alert .ref{font-family:var(--mono);color:var(--faint);font-size:11.5px}
+
+/* ── footer ───────────────────────────────────────────────── */
+#foot{display:flex;gap:30px;flex-wrap:wrap;color:var(--dim);font-size:12px;
+  padding:2px 4px 0}
+#foot b{color:var(--ink);font-family:var(--mono);font-weight:600}
+</style>
+</head>
+<body>
+
+<div id="bar">
+  <h1>Agent GPU Scheduler</h1>
+  <div class="stat"><span class="k">Master</span><span class="v" id="m-state">—</span></div>
+  <div class="stat"><span class="k">Workers</span><span class="v mono" id="m-workers">—</span></div>
+  <div class="stat"><span class="k">Integrity</span><span class="v" id="m-integrity">—</span></div>
+  <div class="stat"><span class="k">Profile</span><span class="v" id="m-profile">—</span></div>
+  <div class="stat"><span class="k">Harness</span><span class="v" id="m-harness">—</span></div>
+  <div class="stat spacer"><span class="k">Updated</span><span class="v mono" id="m-clock">—</span></div>
+</div>
+
+<section id="alerts"><h2>Attention</h2><div id="alert-list"></div></section>
+
+<section>
+  <h2>GPU · <span id="gpu-sub" class="mono"></span></h2>
+  <div id="gpus"></div>
+</section>
+
+<section>
+  <h2>Pipeline</h2>
+  <div id="stages">
+    <span></span>
+    <div class="heads">
+      <span>PROPOSE</span><span>REVIEW</span><span>COMPILE</span>
+      <span>SCHEDULE</span><span>RUN</span><span>DONE</span>
+    </div>
+    <span></span>
+  </div>
+  <div id="pipeline"></div>
+</section>
+
+<div id="foot">
+  <span>QUEUE <b id="f-queue">—</b></span>
+  <span>LEASES <b id="f-leases">—</b></span>
+  <span>CONTAINER <b id="f-container">—</b></span>
+  <span>FRAMEWORK LOGS <b id="f-logs">—</b></span>
+  <span>AUDIT STREAMS <b id="f-audit">—</b></span>
+  <span class="spacer">匿名只读 · 每 2 秒刷新</span>
+</div>
+
+<template id="t-gpu">
+  <div class="gpu">
+    <span class="id"></span>
+    <span class="meter"><i></i></span>
+    <span class="pct mono"></span>
+    <span class="st"></span>
+  </div>
+</template>
+
+<template id="t-row">
+  <div class="row">
+    <span class="pid"></span>
+    <span class="track"></span>
+    <span class="tail"></span>
+  </div>
+</template>
+
+<template id="t-alert">
+  <div class="alert"><span class="tag"></span><span class="msg"></span><span class="ref"></span></div>
+</template>
+
+<script>
+"use strict";
+
+// Proposal state -> furthest pipeline stage reached, and whether it ended badly.
+// Stages: 0 PROPOSE, 1 REVIEW, 2 COMPILE, 3 SCHEDULE, 4 RUN, 5 DONE.
+const PROPOSAL_STAGE = {
+  CLARIFYING:            [0, false],
+  AWAITING_CONFIRMATION: [0, false],
+  IN_REVIEW:             [1, false],
+  CHANGES_REQUESTED:     [1, false],
+  APPROVED:              [2, false],
+  COMPILING:             [2, false],
+  COMPILED:              [3, false],
+  PROCESSING_ERROR:      [0, true],
+  REJECTED:              [1, true],
+  COMPILE_FAILED:        [2, true],
+  CANCELLED:             [0, true],
+  EXPIRED:               [0, true],
+};
+
+const TASK_STAGE = {
+  CREATED: [3, false], QUEUED: [3, false], BLOCKED: [3, false], PREPARING: [3, false],
+  RESERVED: [3, false], DISPATCHED: [3, false],
+  STARTING: [4, false], RUNNING: [4, false], FINALIZING: [4, false],
+  COMPLETED: [5, false],
+  FAILED: [4, true], CANCELLED: [4, true], CLEANUP_FAILED: [4, true],
+  RECONCILIATION_REQUIRED: [4, true],
+};
+
+// Task states that demand a human look, with the reason shown in the alert row.
+const TASK_ALERTS = {
+  BLOCKED: "admission blocked — GPU, lease or container unavailable",
+  FAILED: "execution failed",
+  CLEANUP_FAILED: "container stop unconfirmed — lease deliberately held",
+  RECONCILIATION_REQUIRED: "needs admin reconcile before the lease is released",
+};
+
+const $ = (id) => document.getElementById(id);
+const short = (v) => (typeof v === "string" && v.length > 14 ? v.slice(0, 10) + "…" + v.slice(-4) : v || "—");
+
+function meterClass(pct, threshold) {
+  if (pct >= threshold) return "bad";
+  if (pct >= threshold * 0.8) return "warn";
+  return "";
+}
+
+function stateClass(state) {
+  if (state === "AVAILABLE") return "s-ok";
+  if (state === "DRIFTED") return "s-warn";
+  return "s-idle";
+}
+
+function renderBar(master, workerCount, stale) {
+  const bar = $("bar");
+  const draining = master.draining;
+  const corrupt = master.integrity !== "valid";
+  const offline = workerCount === 0;
+  bar.className = stale || corrupt ? "bad" : (draining || offline ? "warn" : "");
+
+  $("m-state").textContent = stale ? "LOST CONNECTION" : (draining ? "DRAINING" : "READY");
+  $("m-state").className = "v " + (stale ? "s-bad" : draining ? "s-warn" : "s-ok");
+
+  $("m-workers").textContent = String(workerCount);
+  $("m-workers").className = "v mono " + (offline ? "s-bad" : "s-ok");
+
+  $("m-integrity").textContent = master.integrity;
+  $("m-integrity").className = "v " + (corrupt ? "s-bad" : "s-ok");
+
+  const p = master.profile || {};
+  $("m-profile").textContent =
+    (p.qualification ? "qualification" : "production") + " · VRAM<" + p.vram_threshold + "%";
+  $("m-harness").textContent = master.harness_mode + " / " + master.worker_mode;
+  $("m-clock").textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+}
+
+function renderGpus(gpus, threshold) {
+  const host = $("gpus");
+  host.textContent = "";
+  if (!gpus.length) {
+    const p = document.createElement("div");
+    p.className = "empty";
+    p.textContent = "没有已连接的 Worker，无 GPU 采样。";
+    host.appendChild(p);
+    $("gpu-sub").textContent = "";
+    return;
+  }
+  const avail = gpus.filter((g) => g.state === "AVAILABLE").length;
+  $("gpu-sub").textContent = avail + "/" + gpus.length + " AVAILABLE";
+  const tpl = $("t-gpu");
+  for (const g of gpus) {
+    const node = tpl.content.cloneNode(true);
+    node.querySelector(".id").textContent = "GPU " + g.gpu_id;
+    const fill = node.querySelector("i");
+    fill.style.width = Math.min(100, Math.max(0, g.vram_percent)) + "%";
+    fill.className = meterClass(g.vram_percent, threshold);
+    node.querySelector(".pct").textContent = g.vram_percent + "%";
+    const st = node.querySelector(".st");
+    st.textContent = g.state;
+    st.className = "st " + stateClass(g.state);
+    host.appendChild(node);
+  }
+}
+
+function renderPipeline(data) {
+  const host = $("pipeline");
+  host.textContent = "";
+  const proposals = data.proposals || [];
+  if (!proposals.length) {
+    const p = document.createElement("div");
+    p.className = "empty";
+    p.textContent = "还没有 Proposal。";
+    host.appendChild(p);
+    return;
+  }
+
+  // Join proposal -> unit (for card count and task id) -> task status -> lease (for gpu ids).
+  const unitByProposal = new Map();
+  for (const u of data.units || []) unitByProposal.set(u.proposal_id, u);
+  const statusByTask = new Map();
+  for (const t of data.tasks || []) statusByTask.set(t.task_id, t);
+  const leaseByExecution = new Map();
+  for (const l of data.leases || []) leaseByExecution.set(l.execution_id, l);
+
+  const tpl = $("t-row");
+  const ordered = proposals.slice().sort((a, b) => (a.created_at < b.created_at ? -1 : 1));
+  for (const p of ordered) {
+    const node = tpl.content.cloneNode(true);
+    node.querySelector(".pid").textContent = short(p.proposal_id);
+
+    let [stage, failed] = PROPOSAL_STAGE[p.state] || [0, false];
+    let label = p.state;
+    const unit = unitByProposal.get(p.proposal_id);
+    const status = unit ? statusByTask.get(unit.task_id) : undefined;
+    if (status) {
+      const [ts, tf] = TASK_STAGE[status.state] || [3, false];
+      stage = ts;
+      failed = tf;
+      label = status.state;
+    }
+
+    const track = node.querySelector(".track");
+    for (let i = 0; i < 6; i++) {
+      const seg = document.createElement("span");
+      let cls = "seg";
+      if (failed && i === stage) cls += " err";
+      else if (i < stage) cls += " done";
+      else if (i === stage) cls += (stage === 5 ? " done" : " now");
+      seg.className = cls;
+      track.appendChild(seg);
+    }
+
+    const tail = node.querySelector(".tail");
+    const lease = status ? leaseByExecution.get(status.execution_id) : undefined;
+    const cards = unit ? unit.required_gpu_count + " 卡" : "—";
+    tail.textContent = label + " · " + cards + (lease ? " · gpu " + lease.gpu_ids.join(",") : "");
+    tail.className = "tail " + (failed ? "s-bad" : stage === 5 ? "s-ok" : "s-idle");
+    host.appendChild(node);
+  }
+}
+
+function renderAlerts(data) {
+  const host = $("alert-list");
+  host.textContent = "";
+  const tpl = $("t-alert");
+  const rows = [];
+
+  if (data.master.integrity !== "valid") {
+    rows.push(["GROUND TRUTH", "事件流校验失败，停止提交并用 inspect 排查", data.master.integrity]);
+  }
+  for (const t of data.tasks || []) {
+    const why = TASK_ALERTS[t.state];
+    if (why) rows.push([t.state, t.failure_reason || why, short(t.task_id)]);
+  }
+  const container = (data.containers || [])[0];
+  if (container && container.error) {
+    rows.push(["CONTAINER", "docker inspect 失败：" + container.error, container.name]);
+  }
+  const busy = (data.tasks || []).some((t) => TASK_STAGE[t.state] && TASK_STAGE[t.state][0] === 4);
+  if (container && container.running && !busy) {
+    rows.push(["CONTAINER", "容器在运行但没有执行中的 Task — 可能是残留", container.name]);
+  }
+  const active = new Set((data.tasks || [])
+    .filter((t) => TASK_STAGE[t.state] && TASK_STAGE[t.state][0] < 5 && !TASK_STAGE[t.state][1])
+    .map((t) => t.execution_id));
+  for (const l of data.leases || []) {
+    if (!active.has(l.execution_id)) {
+      rows.push(["LEASE", "残留租约：gpu " + l.gpu_ids.join(",") + " 无对应活跃执行", short(l.lease_id)]);
+    }
+  }
+
+  for (const [tag, msg, ref] of rows) {
+    const node = tpl.content.cloneNode(true);
+    node.querySelector(".tag").textContent = tag;
+    node.querySelector(".msg").textContent = msg;
+    node.querySelector(".ref").textContent = ref;
+    host.appendChild(node);
+  }
+  $("alerts").className = rows.length ? "on" : "";
+}
+
+function renderFoot(data) {
+  const container = (data.containers || [])[0] || {};
+  $("f-queue").textContent = (data.queue || []).length;
+  $("f-leases").textContent = (data.leases || []).length;
+  $("f-container").textContent = container.error
+    ? "unknown"
+    : container.running ? "running" : container.exists ? "stopped" : "absent";
+  $("f-logs").textContent = (data.framework_logs || {}).count ?? "—";
+  $("f-audit").textContent = (data.audit_streams || {}).count ?? "—";
+}
+
+let last = null;
+
+async function refresh() {
+  let data;
+  try {
+    const response = await fetch("/api/v1/observe/summary", { cache: "no-store" });
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    data = await response.json();
+  } catch (error) {
+    // Keep the last good frame on screen: blanking the wall display on a transient
+    // network blip is worse than showing state that is a few seconds old.
+    if (last) renderBar(last.master, (last.workers || []).length, true);
+    return;
+  }
+  last = data;
+  const threshold = (data.master.profile || {}).vram_threshold || 100;
+  renderBar(data.master, (data.workers || []).length, false);
+  renderGpus(data.gpus || [], threshold);
+  renderPipeline(data);
+  renderAlerts(data);
+  renderFoot(data);
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

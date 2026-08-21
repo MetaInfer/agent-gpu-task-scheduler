@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -536,29 +537,16 @@ def create_app(settings: Settings, identity: RuntimeIdentity | None = None) -> F
     def observe_summary(request: Request) -> dict[str, object]:
         request_id = _request_id(request)
         tasks = proposals.list_tasks()
-        container: dict[str, object]
-        try:
-            inspection = DockerCLI().inspect("fh-sglang-deepseek-v4-flash")
-            container = {
-                "name": "fh-sglang-deepseek-v4-flash",
-                "exists": inspection.exists,
-                "running": inspection.running,
-                "image_id": inspection.image_id,
-            }
-        except DockerError as exc:
-            container = {
-                "name": "fh-sglang-deepseek-v4-flash",
-                "exists": False,
-                "running": False,
-                "error": type(exc).__name__,
-            }
-        framework_logs = [
-            str(path.relative_to(settings.state_root))
-            for path in sorted((settings.state_root / "framework-logs").rglob("*.json"))
-        ]
+        container = _container_summary("fh-sglang-deepseek-v4-flash")
         return {
             "request_id": request_id,
-            "master": {"draining": context.draining, "profile": _profile(settings)},
+            "master": {
+                "draining": context.draining,
+                "profile": _profile(settings),
+                "integrity": _cached_integrity(events),
+                "harness_mode": settings.harness_mode,
+                "worker_mode": settings.worker_mode,
+            },
             "workers": [item.model_dump(mode="json") for item in scheduler.workers()],
             "gpus": [
                 gpu.model_dump(mode="json") for worker in scheduler.workers() for gpu in worker.gpus
@@ -566,16 +554,24 @@ def create_app(settings: Settings, identity: RuntimeIdentity | None = None) -> F
             "proposals": [item.model_dump(mode="json") for item in proposals.list_proposals()],
             "reviews": [item.model_dump(mode="json") for item in proposals.list_reviews()],
             "tasks": [item.model_dump(mode="json") for item in scheduler.statuses()],
-            "units": [unit.model_dump(mode="json") for task in tasks for unit in task.units],
+            # TaskUnit carries no back-reference, so the observation surface adds the owning
+            # Task and Proposal; without it the dashboard cannot join a unit to its Proposal.
+            "units": [
+                {
+                    **unit.model_dump(mode="json"),
+                    "task_id": task.task_id,
+                    "execution_id": task.execution_id,
+                    "proposal_id": task.proposal_id,
+                }
+                for task in tasks
+                for unit in task.units
+            ],
             "queue": scheduler.queued_task_ids(),
             "plans": [item.model_dump(mode="json") for item in scheduler.plans()],
             "leases": [item.model_dump(mode="json") for item in scheduler.leases()],
             "containers": [container],
-            "framework_logs": framework_logs,
-            "audit_streams": [
-                str(path.relative_to(events.events_root))
-                for path in sorted(events.events_root.rglob("*.jsonl"))
-            ],
+            "framework_logs": _log_index(settings.state_root / "framework-logs", "*.json"),
+            "audit_streams": _log_index(events.events_root, "*.jsonl"),
         }
 
     @app.get("/api/v1/observe/events/{object_type}/{object_id}")
@@ -643,6 +639,78 @@ def _request_id(request: Request) -> str:
     return request.headers.get("X-Request-ID", str(uuid.uuid4()))
 
 
+# The dashboard polls every 2s, so every uncached observe request would fork a `docker inspect`
+# and re-walk two unbounded directory trees. One refresh window of staleness is invisible on
+# screen and bounds the cost to one pass per window no matter how many tabs are open.
+_OBSERVE_CACHE_TTL_SECONDS = 2.0
+# Integrity validation parses every event file, so it must not run at the poll rate. Ground
+# Truth corruption is a standing condition, not a transient, and half a minute of staleness
+# costs an operator nothing.
+_INTEGRITY_CACHE_TTL_SECONDS = 30.0
+_LOG_INDEX_RECENT = 20
+_CONTAINER_CACHE: dict[str, tuple[float, dict[str, object]]] = {}
+_LOG_INDEX_CACHE: dict[tuple[str, str], tuple[float, dict[str, object]]] = {}
+_INTEGRITY_CACHE: dict[str, tuple[float, str]] = {}
+
+
+def _cached_integrity(events: EventStore) -> str:
+    key = str(events.events_root)
+    cached = _INTEGRITY_CACHE.get(key)
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < _INTEGRITY_CACHE_TTL_SECONDS:
+        return cached[1]
+    try:
+        events.validate_all_events()
+        integrity = "valid"
+    except StoreCorruptionError as exc:
+        integrity = type(exc).__name__
+    _INTEGRITY_CACHE[key] = (now, integrity)
+    return integrity
+
+
+def _container_summary(name: str) -> dict[str, object]:
+    cached = _CONTAINER_CACHE.get(name)
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < _OBSERVE_CACHE_TTL_SECONDS:
+        return cached[1]
+    summary: dict[str, object]
+    try:
+        inspection = DockerCLI().inspect(name)
+        summary = {
+            "name": name,
+            "exists": inspection.exists,
+            "running": inspection.running,
+            "image_id": inspection.image_id,
+        }
+    except DockerError as exc:
+        summary = {
+            "name": name,
+            "exists": False,
+            "running": False,
+            "error": type(exc).__name__,
+        }
+    _CONTAINER_CACHE[name] = (now, summary)
+    return summary
+
+
+def _log_index(root: Path, pattern: str) -> dict[str, object]:
+    """Summarize an append-only tree as a count plus its newest entries.
+
+    Returning every path made the response grow for the life of the deployment. Paths are
+    keyed by UUIDv7, which is time-ordered, so a reverse lexicographic sort yields the
+    newest entries without a stat() per file.
+    """
+    key = (str(root), pattern)
+    cached = _LOG_INDEX_CACHE.get(key)
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < _OBSERVE_CACHE_TTL_SECONDS:
+        return cached[1]
+    paths = sorted((str(path.relative_to(root)) for path in root.rglob(pattern)), reverse=True)
+    index: dict[str, object] = {"count": len(paths), "recent": paths[:_LOG_INDEX_RECENT]}
+    _LOG_INDEX_CACHE[key] = (now, index)
+    return index
+
+
 _PROPOSAL_ERROR_STATUS = {
     "NOT_FOUND": 404,
     "USERNAME_NOT_ALLOWED": 403,
@@ -701,21 +769,4 @@ def _admin_object_id() -> str:
     return "admin_00000000000070008000000000000000"
 
 
-_DASHBOARD_HTML = """<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>Agent GPU Scheduler</title><style>
-:root{font-family:ui-monospace,monospace;color:#102019;background:#eef4ef}body{max-width:1200px;margin:auto;padding:24px}
-h1{font-family:system-ui;margin-bottom:4px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
-.card{background:white;border:1px solid #b7c8ba;border-radius:8px;padding:14px;box-shadow:0 2px 8px #10201912}
-.good{color:#156b3a}.bad{color:#a13030}pre{white-space:pre-wrap;overflow:auto;font-size:12px}small{color:#52665a}
-</style></head><body><h1>Agent GPU Scheduler</h1><small>匿名只读 · 每 5 秒刷新</small>
-<div id="cards" class="grid"></div><pre id="raw"></pre><script>
-async function refresh(){const r=await fetch('/api/v1/observe/summary');const d=await r.json();
-const cards=document.querySelector('#cards');cards.innerHTML='';
-for(const w of d.workers){const e=document.createElement('section');e.className='card';
-e.innerHTML=`<b>${w.worker_id}</b><p class="${w.online?'good':'bad'}">${w.online?'ONLINE':'OFFLINE'}</p>`+
-w.gpus.map(g=>`GPU ${g.gpu_id}: ${g.vram_percent}% ${g.state}`).join('<br>');cards.appendChild(e)}
-const q=document.createElement('section');q.className='card';q.innerHTML=`<b>Tasks</b><p>${d.tasks.length}</p>`+
-d.tasks.map(t=>`${t.task_id.slice(0,18)}… ${t.state}`).join('<br>');cards.appendChild(q);
-document.querySelector('#raw').textContent=JSON.stringify(d.proposals,null,2)}refresh();setInterval(refresh,5000);
-</script></body></html>"""
+_DASHBOARD_HTML = (Path(__file__).with_name("dashboard.html")).read_text(encoding="utf-8")

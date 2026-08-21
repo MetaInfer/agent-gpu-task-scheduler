@@ -10,6 +10,7 @@ from agent_scheduler.adapters.mcp import (
     SubmitterMCPAdapter,
     _response_object,
 )
+from agent_scheduler.worker.docker import DockerError
 
 
 def test_proposal_confirm_schedule_and_observe(app_client):
@@ -122,7 +123,10 @@ def test_dashboard_and_mcp_stdio_surface(app_client):
     client, _app = app_client
     dashboard = client.get("/")
     assert dashboard.status_code == 200
-    assert "每 5 秒刷新" in dashboard.text
+    assert 'id="pipeline"' in dashboard.text
+    assert 'id="gpus"' in dashboard.text
+    assert 'id="alerts"' in dashboard.text
+    assert "2000" in dashboard.text
 
     adapter = SubmitterMCPAdapter("https://example.invalid", "zz_chentian")
     incoming = io.StringIO(
@@ -186,3 +190,34 @@ def test_mcp_adapter_error_falls_back_to_body_text():
     response = httpx.Response(502, text="upstream exploded", request=request)
     with pytest.raises(MCPAdapterError, match="upstream exploded"):
         _response_object(response)
+
+
+def test_summary_log_indexes_are_counted_not_enumerated(app_client):
+    """Both indexes grow without bound, so the summary must not walk and return them whole."""
+    client, _app = app_client
+    body = client.get("/api/v1/observe/summary").json()
+    for key in ("framework_logs", "audit_streams"):
+        index = body[key]
+        assert isinstance(index, dict), key
+        assert isinstance(index["count"], int), key
+        assert isinstance(index["recent"], list), key
+        assert len(index["recent"]) <= 20, key
+
+
+def test_summary_caches_docker_inspection(app_client, monkeypatch):
+    """A 2s dashboard poll must not shell out to `docker inspect` on every request."""
+    from agent_scheduler.api import app as app_module
+
+    calls = []
+
+    def fake_inspect(self, name):
+        calls.append(name)
+        raise DockerError("no docker in tests")
+
+    monkeypatch.setattr(app_module.DockerCLI, "inspect", fake_inspect)
+    app_module._CONTAINER_CACHE.clear()
+
+    client, _app = app_client
+    for _ in range(4):
+        assert client.get("/api/v1/observe/summary").status_code == 200
+    assert len(calls) == 1

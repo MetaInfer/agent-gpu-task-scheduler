@@ -364,9 +364,14 @@ Submitter 接口需要 `X-Username` 头；写操作需要 `Idempotency-Key`。
 | GET | `/api/v1/logs/{task}/{unit}/{exec}/{name}` | Framework 日志字节，`?offset=N` |
 | GET | `/api/v1/observe/summary` | Master profile、Worker 与 GPU、Proposal、容器状态 |
 | GET | `/api/v1/observe/events/{type}/{id}` | 只读事件 |
-| GET | `/` | 观察界面（每 5 秒刷新） |
+| GET | `/` | 观察界面（每 2 秒刷新，只读） |
 
 `/api/v1/observe/**` 是 GET-only，其他方法一律 `405`。
+
+观察界面用的就是 `observe/summary` 这一个端点，2 秒轮询。为此 summary 里的几项做了缓存与瘦身：
+`docker inspect` 与目录索引缓存 2 秒，`integrity` 缓存 30 秒（它要解析全部事件文件，不能按轮询频率跑），
+`framework_logs` 与 `audit_streams` 返回 `{"count", "recent"}` 而不是全量路径列表。
+**不要用 `/health` 做高频轮询**，它每次都会完整校验事件流。
 
 ### 错误语义
 
