@@ -8,8 +8,9 @@ from agent_scheduler.qualification import (
 )
 
 
-def test_missing_api_key_is_structured_block(monkeypatch, tmp_path: Path):
+def test_missing_credentials_are_a_structured_block(monkeypatch, tmp_path: Path):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     result = run_submitter_agent(
         project_root=Path.cwd(),
         state_root=tmp_path / "state",
@@ -18,6 +19,7 @@ def test_missing_api_key_is_structured_block(monkeypatch, tmp_path: Path):
     )
     assert result.status == "BLOCKED_QUALIFICATION"
     assert "ANTHROPIC_API_KEY" in (result.reason or "")
+    assert "ANTHROPIC_AUTH_TOKEN" in (result.reason or "")
     assert result.run_id.startswith("qual_")
 
 

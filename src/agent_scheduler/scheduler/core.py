@@ -27,6 +27,14 @@ from agent_scheduler.domain.state import transition_task
 from agent_scheduler.integrity.signing import canonical_bytes, sign_model, verify_model
 from agent_scheduler.storage.events import EventStore
 
+# The approved container image already ships ROCm SMI here; prepending the existing
+# directory to its own frozen search path avoids modifying the image baseline.
+_CONTAINER_LD_LIBRARY_PATH = (
+    "/opt/dtk/.hyhal/rocm_smi/lib:/opt/dtk/dcc/gcvm/lib:/opt/dtk/hip/lib:"
+    "/opt/dtk/llvm/lib:/opt/dtk/lib:/opt/dtk/lib64:/opt/hyhal/lib:/opt/hyhal/lib64:"
+    "/opt/dtk/dushmem/lib:/opt/dtk/opencl/lib:/opt/ucx/lib:/opt/mpi/lib:/opt/hwloc/lib"
+)
+
 
 class SchedulingError(RuntimeError):
     pass
@@ -434,6 +442,7 @@ class Scheduler:
                         environment=(
                             ("HIP_VISIBLE_DEVICES", ",".join(map(str, manifest.gpu_ids))),
                             ("ROCR_VISIBLE_DEVICES", ",".join(map(str, manifest.gpu_ids))),
+                            ("LD_LIBRARY_PATH", _CONTAINER_LD_LIBRARY_PATH),
                             ("TASK_ID", task.task_id),
                             ("UNIT_ID", unit.unit_id),
                             ("EXECUTION_ID", task.execution_id),

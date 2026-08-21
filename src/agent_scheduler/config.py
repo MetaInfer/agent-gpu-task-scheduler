@@ -7,6 +7,12 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+# Admission ceilings per profile. Production stays strict; the qualification profile is an
+# explicitly configured, audited exception for the authorized 8x K100_AI node, whose GPUs
+# carry resident memory from co-tenant containers.
+PRODUCTION_VRAM_CEILING = 2.0
+QUALIFICATION_VRAM_CEILING = 97.0
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -23,9 +29,8 @@ class Settings:
     @classmethod
     def from_env(cls) -> Settings:
         qualification = os.environ.get("AGENT_SCHEDULER_PROFILE") == "qualification"
-        default_threshold = "90" if qualification else "2"
-        threshold = float(os.environ.get("AGENT_SCHEDULER_VRAM_THRESHOLD", default_threshold))
-        maximum = 90.0 if qualification else 2.0
+        maximum = QUALIFICATION_VRAM_CEILING if qualification else PRODUCTION_VRAM_CEILING
+        threshold = float(os.environ.get("AGENT_SCHEDULER_VRAM_THRESHOLD", str(maximum)))
         if not math.isfinite(threshold) or threshold <= 0 or threshold > maximum:
             raise ValueError(
                 f"VRAM threshold must be finite and in (0, {maximum}] for this profile"

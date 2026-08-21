@@ -12,6 +12,7 @@ from typing import Any, Literal
 
 import httpx
 
+from agent_scheduler.config import QUALIFICATION_VRAM_CEILING
 from agent_scheduler.domain.models import (
     ExecutionPlan,
     PrepareManifest,
@@ -74,8 +75,12 @@ def run_submitter_agent(
         "started_at": started.isoformat(),
     }
     try:
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            return _blocked((), "ANTHROPIC_API_KEY is required by the --bare contract", run_id)
+        if not os.environ.get("ANTHROPIC_API_KEY") and not os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+            return _blocked(
+                (),
+                "ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN is required for real Claude roles",
+                run_id,
+            )
         store = EventStore(state_root)
         gate_failure = _run_local_gates(project_root, store, run_id)
         if gate_failure:
@@ -151,10 +156,11 @@ def run_submitter_agent(
         )
         command = [
             executable,
-            "--bare",
             "--print",
             "--no-session-persistence",
             "--disable-slash-commands",
+            "--setting-sources",
+            "",
             "--permission-mode",
             "dontAsk",
             "--tools",
@@ -181,13 +187,14 @@ def run_submitter_agent(
         env = {
             "HOME": os.environ.get("HOME", "/root"),
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-            "ANTHROPIC_API_KEY": os.environ["ANTHROPIC_API_KEY"],
             "DISABLE_UPDATES": "1",
             "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
             "SSL_CERT_FILE": str(tls_certificate),
         }
-        if os.environ.get("ANTHROPIC_BASE_URL"):
-            env["ANTHROPIC_BASE_URL"] = os.environ["ANTHROPIC_BASE_URL"]
+        for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
+            value = os.environ.get(name)
+            if value:
+                env[name] = value
         cli_version = _claude_version(executable, env)
         last_reason = "Submitter exhausted retry attempts"
         for attempt in range(1, 5):
@@ -471,7 +478,7 @@ def _verify_item(
             and all(
                 gpu.gpu_id in plan.gpu_ids
                 and gpu.state.value == "AVAILABLE"
-                and gpu.vram_percent < 90
+                and gpu.vram_percent < QUALIFICATION_VRAM_CEILING
                 and bool(gpu.raw_line)
                 and gpu.sampled_at <= plan.created_at
                 and (plan.created_at - gpu.sampled_at).total_seconds() <= 30

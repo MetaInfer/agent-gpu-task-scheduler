@@ -95,7 +95,7 @@ MVP MUST：
 - 保存脱敏 argv、工作目录、起止时间、退出码、结构化输出和工具事件；
 - 默认关闭真实模型调用，必须通过显式 opt-in 开启。
 
-未来低权限 Submitter使用 `claude --bare -p`，父进程仅通过最小环境 allowlist传入 `ANTHROPIC_API_KEY`。项目不读取 `.env`，不复用 `/root` 私有安装。
+真实角色使用 `claude --print --setting-sources ""`，禁用内置工具、slash command、session持久化和外部 settings/MCP；父进程仅通过最小环境 allowlist 传入 `ANTHROPIC_API_KEY` 或 `ANTHROPIC_AUTH_TOKEN`（0.2.0 授权使用后者）。项目不读取 `.env`，不复用 `/root` 私有安装。
 
 ## 5. 固定部署
 
@@ -230,7 +230,7 @@ Worker MUST 在产生任何 Docker副作用前拒绝：未知 Schema版本、has
 - `VRAM% < 2%`；
 - 容器锁可取得。
 
-0.2.0真实资格 profile明确覆盖生产门槛：授权 GPU 0–7，使用 `VRAM% < 90%`。该 profile必须显式配置并在事件中审计，不得成为生产默认值。
+0.2.0真实资格 profile明确覆盖生产门槛：授权 GPU 0–7，使用 `VRAM% < 97%`。该门槛由运维显式批准，用于容纳同节点其他租户容器的常驻显存；profile必须显式配置并在事件中审计，不得成为生产默认值，调度器也不得为了让资格通过而自行抬高门槛。
 
 Worker每10秒采集一次 `hy-smi`。理论空闲但超过当前 profile门槛的 GPU为 `DRIFTED`。连续3次低于门槛后恢复 `AVAILABLE`。
 

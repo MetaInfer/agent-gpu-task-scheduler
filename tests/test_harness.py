@@ -70,7 +70,8 @@ def test_claude_adapter_uses_restricted_cli_and_validates_output(tmp_path, monke
     assert facts.revision_id == item.revision_id
     command = captured["command"]
     for required in (
-        "--bare",
+        "--print",
+        "--setting-sources",
         "--no-session-persistence",
         "--disable-slash-commands",
         "--strict-mcp-config",

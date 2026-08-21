@@ -189,10 +189,11 @@ class ClaudeCodeAdapter:
             started_at = utc_now()
             command = [
                 self.executable,
-                "--bare",
                 "--print",
                 "--no-session-persistence",
                 "--disable-slash-commands",
+                "--setting-sources",
+                "",
                 "--permission-mode",
                 "dontAsk",
                 "--tools",
@@ -314,6 +315,7 @@ class ClaudeCodeAdapter:
         }
         for name in (
             "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
             "ANTHROPIC_BASE_URL",
             "HTTP_PROXY",
             "HTTPS_PROXY",

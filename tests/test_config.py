@@ -3,10 +3,10 @@ import pytest
 from agent_scheduler.config import Settings
 
 
-def test_qualification_threshold_cannot_exceed_90(monkeypatch):
+def test_qualification_threshold_cannot_exceed_ceiling(monkeypatch):
     monkeypatch.setenv("AGENT_SCHEDULER_PROFILE", "qualification")
     monkeypatch.setenv("AGENT_SCHEDULER_VRAM_THRESHOLD", "100")
-    with pytest.raises(ValueError, match="90"):
+    with pytest.raises(ValueError, match="97"):
         Settings.from_env()
 
 

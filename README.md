@@ -4,7 +4,7 @@
 
 ## 资格范围
 
-- 单个真实 Worker，8 张 `K100_AI`；生产默认 `VRAM% < 2%`，资格 profile显式使用 `<90%`。
+- 单个真实 Worker，8 张 `K100_AI`；生产默认 `VRAM% < 2%`，资格 profile显式使用 `<97%`。
 - 唯一复用容器：`fh-sglang-deepseek-v4-flash`；严格串行，Task 后必须 stopped。
 - Python `>=3.10`，当前开发环境为 3.12。
 - 代码模型允许 `TaskUnit <= max_workers`；0.2.0 只资格验证一个 Worker/Unit。
@@ -38,7 +38,7 @@ uv run agent-scheduler init-runtime \
   --state-root /public/share/agent-scheduler-mvp
 ```
 
-若任一身份文件已存在，命令会拒绝覆盖。仓库现有 `.env` 不由项目读取；运维 shell应在启动前显式加载所需环境，真实 `--bare` Claude契约必须提供 `ANTHROPIC_API_KEY`。
+若任一身份文件已存在，命令会拒绝覆盖。仓库现有 `.env` 不由项目读取；运维 shell 应在启动前显式加载所需环境。真实 Claude 角色使用受限非交互调用（`--print --setting-sources ""`，禁用内置工具/slash command/session/外部 settings），认证由父进程提供 `ANTHROPIC_API_KEY` 或 `ANTHROPIC_AUTH_TOKEN`。
 
 ## 启动真实闭环
 
