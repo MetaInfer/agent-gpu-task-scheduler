@@ -13,6 +13,12 @@
 
 **代码与 Fake 门禁通过不代表真实资格完成。** 只有 `agent-scheduler qualify` 验证完整证据包后才能宣称 Goal完成；外部前置不足时结果为 `BLOCKED_QUALIFICATION`。
 
+## 文档
+
+- [使用文档](docs/usage.md) — 安装、配置、启动、提交、运维、排障的完整指南
+- [系统 Spec](docs/agent-task-scheduler-spec.md) — 架构与设计约束
+- [资格状态](docs/qualification-status.md) — 真实资格证据
+
 ## 本地门禁
 
 ```bash
