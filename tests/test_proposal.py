@@ -99,3 +99,58 @@ def test_state_rebuilds_after_snapshot_deletion(runtime_identity):
     rebuilt = service(root, identity, FakeHarnessAdapter())
     assert rebuilt.get(created.proposal_id) == created
     assert rebuilt.get_revision(created.proposal_id, created.current_revision_id or "")
+
+
+class _FlagArgvHarness(FakeHarnessAdapter):
+    """Processor that passes torchrun flags instead of the frozen two-argument form."""
+
+    def process(self, revision):
+        facts = super().process(revision)
+        command = facts.run[0]
+        return facts.model_copy(
+            update={
+                "run": (
+                    command.model_copy(
+                        update={
+                            "argv": (
+                                "--nproc-per-node",
+                                "1",
+                                "--output",
+                                command.argv[0],
+                                "--log",
+                                command.argv[1],
+                            )
+                        }
+                    ),
+                )
+            }
+        )
+
+
+def test_frozen_launcher_rejects_flag_style_argv(runtime_identity):
+    root, identity = runtime_identity
+    proposals = service(root, identity, _FlagArgvHarness())
+    with pytest.raises(ProposalError) as error:
+        proposals.create("zz_chentian", proposal_markdown(1), "create-flags", "req-flags")
+    assert error.value.code == "INVALID_PROPOSAL"
+    assert "frozen launcher" in str(error.value)
+
+
+def test_rejected_facts_leave_no_orphan_proposal(runtime_identity):
+    root, identity = runtime_identity
+    proposals = service(root, identity, _FlagArgvHarness())
+    with pytest.raises(ProposalError):
+        proposals.create("zz_chentian", proposal_markdown(1), "create-orphan", "req-orphan")
+    # The caller never received an ID, so no provisional record may survive to occupy
+    # state or reappear in a rebuilt snapshot.
+    assert proposals._records == {}
+
+
+def test_launcher_script_and_validator_agree_on_argv_arity():
+    """The validator's two-argument rule must match the launcher's own usage check."""
+    script = Path("scripts/run_torch_collective_smoke.sh").read_text(encoding="utf-8")
+    assert "$# -ne 2" in script
+    assert "usage: %s OUTPUT BUSINESS_LOG" in script
+    prompt = Path("prompts/processor.md").read_text(encoding="utf-8")
+    assert "exactly two positional elements" in prompt
+    assert "--nproc-per-node" in prompt

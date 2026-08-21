@@ -117,7 +117,7 @@ class SubmitterMCPAdapter:
             params={"offset": offset},
             headers=self._headers(),
         )
-        response.raise_for_status()
+        _raise_for_status(response)
         return {
             "data": response.text,
             "next_offset": int(response.headers.get("X-Next-Offset", offset)),
@@ -252,8 +252,35 @@ class SubmitterMCPAdapter:
         return headers
 
 
+def _raise_for_status(response: httpx.Response) -> None:
+    """Surface the control plane's structured error body.
+
+    ``httpx.raise_for_status`` reports only the status line, which leaves the Submitter
+    agent unable to tell a validation rejection from a genuine conflict. The control
+    plane always answers errors with ``{"error_code": ..., "message": ...}``, so relay
+    both instead of discarding them.
+    """
+    if not response.is_error:
+        return
+    detail = ""
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    if isinstance(body, dict):
+        code = body.get("error_code")
+        message = body.get("message") or body.get("detail")
+        detail = " ".join(str(part) for part in (code, message) if part)
+    if not detail:
+        detail = response.text.strip()[:500]
+    raise MCPAdapterError(
+        f"{response.request.method} {response.request.url} failed with HTTP "
+        f"{response.status_code}: {detail or 'no error body'}"
+    )
+
+
 def _response_object(response: httpx.Response) -> dict[str, object]:
-    response.raise_for_status()
+    _raise_for_status(response)
     value = response.json()
     if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
         raise TypeError("REST response must be a JSON object")

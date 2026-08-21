@@ -1,9 +1,15 @@
 import io
 import json
 
+import httpx
+import pytest
 from conftest import proposal_markdown
 
-from agent_scheduler.adapters.mcp import SubmitterMCPAdapter
+from agent_scheduler.adapters.mcp import (
+    MCPAdapterError,
+    SubmitterMCPAdapter,
+    _response_object,
+)
 
 
 def test_proposal_confirm_schedule_and_observe(app_client):
@@ -152,3 +158,31 @@ def test_dashboard_and_mcp_stdio_surface(app_client):
         "wait_for_events",
         "get_logs",
     }
+
+
+def test_mcp_adapter_surfaces_control_plane_error_body():
+    """A bare status line leaves the Submitter agent unable to correct its submission."""
+    adapter = SubmitterMCPAdapter("https://example.invalid", "zz_chentian")
+    request = httpx.Request("POST", "https://example.invalid/api/v1/proposals")
+    response = httpx.Response(
+        422,
+        json={
+            "error_code": "INVALID_PROPOSAL",
+            "message": "qualification run command does not match frozen launcher",
+        },
+        request=request,
+    )
+    with pytest.raises(MCPAdapterError) as error:
+        _response_object(response)
+    message = str(error.value)
+    assert "422" in message
+    assert "INVALID_PROPOSAL" in message
+    assert "frozen launcher" in message
+    adapter.close()
+
+
+def test_mcp_adapter_error_falls_back_to_body_text():
+    request = httpx.Request("GET", "https://example.invalid/api/v1/proposals/prop_x")
+    response = httpx.Response(502, text="upstream exploded", request=request)
+    with pytest.raises(MCPAdapterError, match="upstream exploded"):
+        _response_object(response)

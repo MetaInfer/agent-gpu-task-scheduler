@@ -643,9 +643,18 @@ def _request_id(request: Request) -> str:
     return request.headers.get("X-Request-ID", str(uuid.uuid4()))
 
 
+_PROPOSAL_ERROR_STATUS = {
+    "NOT_FOUND": 404,
+    "USERNAME_NOT_ALLOWED": 403,
+    # Content rejections, not state conflicts: a 409 would tell the caller to retry later,
+    # when the only useful response is to correct the submission.
+    "INVALID_PROPOSAL": 422,
+    "IDEMPOTENCY_REQUIRED": 422,
+}
+
+
 def _proposal_http_error(exc: ProposalError, request_id: str) -> HTTPException:
-    status_code = 404 if exc.code == "NOT_FOUND" else 409
-    return _error(status_code, exc.code, str(exc), request_id)
+    return _error(_PROPOSAL_ERROR_STATUS.get(exc.code, 409), exc.code, str(exc), request_id)
 
 
 def _error_body(

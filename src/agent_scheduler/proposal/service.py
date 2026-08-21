@@ -152,7 +152,13 @@ class ProposalService:
                     record.proposal.model_dump(mode="json"),
                 )
                 raise ProposalError(str(exc), code="PROCESSING_ERROR") from exc
-            self._validate_facts(proposal, facts)
+            try:
+                self._validate_facts(proposal, facts)
+            except ProposalError:
+                # Nothing was persisted or announced for this Proposal yet, so drop the
+                # provisional record instead of leaving an unreachable CLARIFYING entry.
+                self._records.pop(proposal.proposal_id, None)
+                raise
             self.events.write_immutable("facts", facts.facts_id, facts)
             record.facts[facts.facts_id] = facts
             deadline = utc_now() + timedelta(minutes=30)
