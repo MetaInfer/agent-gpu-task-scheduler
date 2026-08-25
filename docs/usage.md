@@ -75,14 +75,24 @@ RUN_REAL_GPU=1   uv run pytest -m real_gpu       # 真实 hy-smi 与容器前置
 uv run agent-scheduler init-runtime --state-root /public/share/agent-scheduler-mvp
 ```
 
-在 `<state-root>/secrets/`（目录 `0700`，文件 `0600`）生成：
+在 `<state-root>/secrets/`（目录 `0700`，文件 `0600`，仅 root 可读）生成五项：
 
 | 文件 | 用途 |
 | --- | --- |
 | `worker-api-key` | Worker WSS 的 Bearer 凭据 |
 | `ed25519-private.pem` / `ed25519-public.pem` | 编译产物签名密钥对 |
 | `ed25519-key-id` | 密钥标识，写入签名负载 |
-| `tls-certificate.pem` / `tls-private-key.pem` | loopback 自签证书 |
+| `tls-private-key.pem` | loopback TLS 私钥 |
+
+另在 `<state-root>/tls/`（目录 `0750`，文件 `0640`，属组与 state-root 相同）生成：
+
+| 文件 | 用途 |
+| --- | --- |
+| `certificate.pem` | loopback 自签证书——公开材料，用于客户端验证 Master，不用于认证调用方 |
+
+证书刻意放在 `secrets/` 之外：它是非机密材料，只要 OS 账号属于 state-root 的属组就能读到，
+不需要 root。这正是 `agent-scheduler mcp` 命令能以非 root 的 Submitter 账号运行的原因——
+它只需要这一个文件，从不读取另外五项。
 
 **任一文件已存在时命令直接拒绝，不覆盖。** 需要轮换必须人工归档后重建。
 
@@ -418,7 +428,8 @@ uv run agent-scheduler inspect --state-root /public/share/agent-scheduler-mvp \
 
 ```
 <state-root>/
-├── secrets/            # 0700，密钥与证书
+├── secrets/            # 0700，仅 root 可读的密钥（不含 TLS 证书）
+├── tls/                # 0750，certificate.pem 0640，属组与 state-root 相同——非 root Submitter 可读
 ├── immutable/          # 不可变对象，按类型分目录
 │   ├── revisions/  facts/  reviews/  compilation-contexts/
 │   ├── tasks/  plans/  manifests/  task-status-history/

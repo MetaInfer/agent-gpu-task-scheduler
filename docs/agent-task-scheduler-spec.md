@@ -208,9 +208,11 @@ Worker MUST 在产生任何 Docker副作用前拒绝：未知 Schema版本、has
   worker-inbox/<worker>/<assignment>/
   outputs/
   secrets/
+  tls/
 ```
 
 - Master是 Proposal、Task、Plan、调度、Harness记录和审计的唯一逻辑写者。
+- `tls/` 内的证书是非机密材料，属组随 state-root；Submitter 只需读它，不需要 root 或 `secrets/` 访问权限。
 - 单写入队列串行化状态变化。
 - API成功响应必须晚于对应事件 fsync。
 - 不可变对象使用同目录临时文件、fsync、atomic rename、目录 fsync。

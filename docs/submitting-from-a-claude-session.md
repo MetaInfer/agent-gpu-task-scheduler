@@ -192,17 +192,25 @@ printf '%s\n%s\n' \
 | `/mcp` 里没有 `submitter` | 配置没被加载 | 确认启动目录，或改用 `--scope user` |
 | `submitter` 显示 `failed` | Adapter 进程起不来 | 用上面的手动验证命令看真实报错 |
 | `mcp requires --username` | 没传 `--username` | 加参数，或设 `AGENT_SCHEDULER_USERNAME` |
-| 连接被拒 / TLS 失败 | Master 没起，或 `AGENT_SCHEDULER_STATE_ROOT` 不对 | Adapter 用 `<state-root>/secrets/tls-certificate.pem` 作 CA，路径必须和 Master 一致 |
+| 连接被拒 / TLS 失败 | Master 没起，或 `AGENT_SCHEDULER_STATE_ROOT` 不对 | Adapter 用 `<state-root>/tls/certificate.pem` 作 CA，路径必须和 Master 一致 |
 | `403 USERNAME_NOT_ALLOWED` | 用户名不在白名单 | 用 `zz_chentian`，或 `reload-users` 加人 |
 | `422 INVALID_PROPOSAL` | 内容不合契约 | 读 `message`。最常见是 argv 不是两个位置参数 |
 | `409 IDEMPOTENCY_CONFLICT` | 同键不同负载 | 换新幂等键 |
 | Task 长期 `BLOCKED` | 准入不满足 | 看观察界面 GPU 状态；容器严格串行，排队正常 |
-| 权限不足读不到证书 | `secrets/` 是 `0700` root | Adapter 需以 root 运行 |
+| 权限不足读不到证书 | Submitter 账号不在 state-root 的属组里 | `stat -c '%G' <state-root>` 查看属组，把 Submitter 账号加进该组；证书路径是 `<state-root>/tls/certificate.pem`，不是 `secrets/` 下 |
 
 ## 安全提醒
 
-MCP Adapter 进程会 `load_runtime()`，**因此持有 Worker API Key 与 Ed25519 私钥**。
-它必须以 root 运行，也不要把它暴露给不可信的调用方。
+MCP Adapter 进程只读取 `<state-root>/tls/certificate.pem`（非机密材料，用于验证 Master 的
+TLS），**从不读取 Worker API Key 或 Ed25519 私钥**。这意味着它不需要 root——只要运行它的
+OS 账号是 state-root 属组的成员就够了，这也正好吻合最初的设计：Submitter 本就该是低权限的
+`zz_chentian`，而不是 root。
+
+在验证用的主机上，`uv` 托管的 Python 解释器安装在 `/root` 下，而 `/root` 本身对非 root 账号
+不可遍历——这是该主机的一个独立限制，与本节描述的权限修复无关。如果你的部署里解释器不在
+`/root` 下，这条限制不适用。
+
+不要把这个进程暴露给不可信的调用方——证书路径可读不代表进程本身可以被任意人启动。
 
 `--username` 只是设置 `X-Username` 头，**控制面不做真实认证**——任何能连上端口的人都能冒充
 `zz_chentian`。这是已知的 MVP 边界（见 `docs/agent-task-scheduler-spec.md`），不是配置错误。
