@@ -20,7 +20,7 @@ from agent_scheduler.qualification import (
     run_submitter_agent,
     verify_qualification,
 )
-from agent_scheduler.runtime import init_runtime, load_runtime
+from agent_scheduler.runtime import init_runtime, load_runtime, load_tls_certificate
 from agent_scheduler.storage.events import EventStore
 from agent_scheduler.worker.client import WorkerClient
 from agent_scheduler.worker.docker import DockerCLI
@@ -128,10 +128,8 @@ def main(argv: list[str] | None = None) -> int:
         if not args.username:
             raise SystemExit("mcp requires --username or AGENT_SCHEDULER_USERNAME")
         settings = Settings.from_env()
-        identity = load_runtime(settings.state_root)
-        adapter = SubmitterMCPAdapter(
-            args.base_url, args.username, verify=str(identity.tls_certificate)
-        )
+        tls_certificate = load_tls_certificate(settings.state_root)
+        adapter = SubmitterMCPAdapter(args.base_url, args.username, verify=str(tls_certificate))
         try:
             adapter.run_stdio()
         finally:
