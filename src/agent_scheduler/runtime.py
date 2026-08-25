@@ -29,6 +29,21 @@ class RuntimeIdentity:
     tls_private_key: Path
 
 
+def _sync_group(path: Path, reference: Path) -> None:
+    """Match `path`'s owning group to `reference`'s.
+
+    The TLS certificate is the one artifact a non-root Submitter must be able to read.
+    Matching state_root's own group — already set up for the Submitter's OS account by
+    whoever provisioned the deployment — is what lets that read happen without granting
+    root or loosening anything else.
+    """
+    os.chown(path, -1, os.stat(reference).st_gid)
+
+
+def _tls_certificate_path(state_root: Path) -> Path:
+    return state_root / "tls" / "certificate.pem"
+
+
 def _development_certificate() -> tuple[bytes, bytes]:
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
@@ -76,12 +91,19 @@ def init_runtime(state_root: Path) -> dict[str, str]:
     secrets_dir = state_root / "secrets"
     secrets_dir.mkdir(exist_ok=True)
     os.chmod(secrets_dir, 0o700)
+    # The TLS certificate is not secret material — it is the public half a client uses to
+    # verify the loopback Master, and the Submitter is deliberately unprivileged (see spec
+    # section 8), so it must be reachable without touching anything in `secrets/`.
+    tls_dir = state_root / "tls"
+    tls_dir.mkdir(exist_ok=True)
+    os.chmod(tls_dir, 0o750)
+    _sync_group(tls_dir, state_root)
     paths = {
         "worker_api_key": secrets_dir / "worker-api-key",
         "key_id": secrets_dir / "ed25519-key-id",
         "ed25519_private": secrets_dir / "ed25519-private.pem",
         "ed25519_public": secrets_dir / "ed25519-public.pem",
-        "tls_certificate": secrets_dir / "tls-certificate.pem",
+        "tls_certificate": _tls_certificate_path(state_root),
         "tls_private_key": secrets_dir / "tls-private-key.pem",
     }
     if any(path.exists() for path in paths.values()):
@@ -105,9 +127,24 @@ def init_runtime(state_root: Path) -> dict[str, str]:
     tls_key, tls_certificate = _development_certificate()
     paths["tls_private_key"].write_bytes(tls_key)
     paths["tls_certificate"].write_bytes(tls_certificate)
-    for path in paths.values():
-        os.chmod(path, 0o600)
+    for name, path in paths.items():
+        os.chmod(path, 0o640 if name == "tls_certificate" else 0o600)
+    _sync_group(paths["tls_certificate"], state_root)
     return {name: str(path) for name, path in paths.items()}
+
+
+def load_tls_certificate(state_root: Path) -> Path:
+    """Return the loopback Master's TLS certificate without touching secret material.
+
+    This is deliberately independent of `load_runtime`: the certificate is public (it lets
+    a client verify the server; it does not authenticate the caller), so a caller that only
+    needs TLS verification — the Submitter MCP Adapter — must never be forced to read the
+    Ed25519 signing key or Worker API key just to reach it.
+    """
+    certificate = _tls_certificate_path(state_root)
+    if not certificate.is_file():
+        raise FileNotFoundError(f"TLS certificate is missing: {certificate}")
+    return certificate
 
 
 def load_runtime(state_root: Path) -> RuntimeIdentity:
@@ -116,7 +153,7 @@ def load_runtime(state_root: Path) -> RuntimeIdentity:
     public_path = secrets_dir / "ed25519-public.pem"
     key_id_path = secrets_dir / "ed25519-key-id"
     worker_key_path = secrets_dir / "worker-api-key"
-    tls_certificate = secrets_dir / "tls-certificate.pem"
+    tls_certificate = _tls_certificate_path(state_root)
     tls_private_key = secrets_dir / "tls-private-key.pem"
     required = (
         private_path,
@@ -160,6 +197,7 @@ def validate_runtime(state_root: Path, identity: RuntimeIdentity) -> None:
         "worker-inbox",
         "outputs",
         "secrets",
+        "tls",
     )
     missing = [name for name in required_directories if not (state_root / name).is_dir()]
     if missing:
