@@ -38,6 +38,9 @@ addopts = "-q"
 markers = [
   "real_claude: requires an explicitly provisioned Claude Code CLI",
   "real_gpu: requires Docker, hy-smi, and an authorized GPU profile",
+  "real_codex: requires an authenticated Codex CLI",
+  "real_pi: requires an authenticated pi CLI with pi-mcp-adapter installed",
+  "real_dsh: requires an authenticated dsh with dsh-mcp-bridge installed",
 ]
 
 [tool.ruff]
