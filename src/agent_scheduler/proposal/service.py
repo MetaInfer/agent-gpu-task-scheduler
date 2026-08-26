@@ -749,13 +749,27 @@ class ProposalService:
         if len(facts.run) != 1:
             raise ProposalError("qualification requires exactly one run command")
         command = facts.run[0]
-        if (
-            command.kind is not CommandKind.CONTAINER_PATH_BASH
-            or command.container_path != _QUALIFICATION_LAUNCHER
-            or command.sha256 != _QUALIFICATION_LAUNCHER_SHA256
-            or len(command.argv) != 2
-        ):
-            raise ProposalError("qualification run command does not match frozen launcher")
+        if command.kind is not CommandKind.CONTAINER_PATH_BASH:
+            raise ProposalError(
+                "qualification run command must be container_path_bash, not "
+                f"{command.kind.value}"
+            )
+        if command.container_path != _QUALIFICATION_LAUNCHER:
+            raise ProposalError(
+                "qualification run command must invoke the frozen launcher "
+                f"{_QUALIFICATION_LAUNCHER}, not {command.container_path}"
+            )
+        if command.sha256 != _QUALIFICATION_LAUNCHER_SHA256:
+            raise ProposalError(
+                "qualification launcher SHA-256 must be "
+                f"{_QUALIFICATION_LAUNCHER_SHA256}, not {command.sha256}"
+            )
+        if len(command.argv) != 2:
+            raise ProposalError(
+                "the frozen launcher takes exactly two positional arguments "
+                "`<container-output-path> <container-log-path>` and accepts no flags; "
+                f"got {len(command.argv)} arguments: {list(command.argv)}"
+            )
         output, business_log = command.argv
         expected_prefix = "/data/agent-scheduler-mvp/"
         if not output.startswith(f"{expected_prefix}outputs/{proposal.proposal_id}"):
@@ -767,6 +781,12 @@ class ProposalService:
         if facts.required_outputs != (expected_host_output,) or facts.required_logs != (
             expected_host_log,
         ):
-            raise ProposalError("required artifacts do not match launcher argv")
+            raise ProposalError(
+                "required host artifacts must be the launcher argv remapped through the "
+                f"`/data` -> `/public/share` bind mount: outputs must be "
+                f"({expected_host_output!r},) and logs must be ({expected_host_log!r},); "
+                f"got outputs {list(facts.required_outputs)} and logs "
+                f"{list(facts.required_logs)}"
+            )
         if any(Path(path).exists() for path in facts.required_outputs + facts.required_logs):
             raise ProposalError("qualification artifact paths must not exist before execution")

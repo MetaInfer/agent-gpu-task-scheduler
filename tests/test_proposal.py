@@ -1,10 +1,20 @@
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
 from conftest import proposal_markdown
 
 from agent_scheduler.adapters.harness import FakeHarnessAdapter
-from agent_scheduler.domain.models import ProposalState, ReviewDecision
+from agent_scheduler.domain.models import (
+    Command,
+    CommandKind,
+    Proposal,
+    ProposalFacts,
+    ProposalState,
+    ReviewDecision,
+    new_id,
+    utc_now,
+)
 from agent_scheduler.proposal import ProposalError, ProposalService
 from agent_scheduler.storage import EventStore
 
@@ -16,6 +26,48 @@ def service(root: Path, identity, harness: FakeHarnessAdapter) -> ProposalServic
         identity.signing_private_key,
         key_id=identity.key_id,
         allowed_users={"zz_chentian"},
+    )
+
+
+def _minimal_proposal(proposal_id: str) -> Proposal:
+    now = utc_now()
+    return Proposal(
+        proposal_id=proposal_id,
+        username="zz_chentian",
+        state=ProposalState.CLARIFYING,
+        processor_rounds=1,
+        review_count=0,
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(days=7),
+        submitter_deadline=None,
+    )
+
+
+def _frozen_facts(proposal_id: str, output: str, business_log: str) -> ProposalFacts:
+    return ProposalFacts(
+        facts_id=new_id("facts"),
+        revision_id=new_id("rev"),
+        worker_count=1,
+        gpu_count=8,
+        required_gpu_count=1,
+        required_worker_id="worker-local-01",
+        container_name="fh-sglang-deepseek-v4-flash",
+        submitter_username="zz_chentian",
+        container_user="root",
+        image_digest="harbor.sourcefind.cn:5443/dcu/admin/base/custom@sha256:" + "0" * 64,
+        run=(
+            Command(
+                kind=CommandKind.CONTAINER_PATH_BASH,
+                container_path="/data/fh/agent-gpu-task-scheduler/scripts/"
+                "run_torch_collective_smoke.sh",
+                sha256="c1cf6dee074e03c026dd7272e358d7b15c65b6ff3b6ae1c1f71e7efae341de0c",
+                argv=(output, business_log),
+            ),
+        ),
+        required_logs=(business_log.replace("/data", "/public/share", 1),),
+        required_outputs=(output.replace("/data", "/public/share", 1),),
+        timeout_seconds=600,
     )
 
 
@@ -154,3 +206,62 @@ def test_launcher_script_and_validator_agree_on_argv_arity():
     prompt = Path("prompts/processor.md").read_text(encoding="utf-8")
     assert "exactly two positional elements" in prompt
     assert "--nproc-per-node" in prompt
+
+
+def test_frozen_launcher_rejection_states_the_expected_argv_shape(tmp_path: Path):
+    """The 422 message is the only teaching channel once a Proposal is already in flight."""
+    from agent_scheduler.domain.models import Command, CommandKind, ProposalFacts, new_id
+    from agent_scheduler.proposal.service import ProposalError, ProposalService
+
+    proposal_id = new_id("prop")
+    facts = ProposalFacts(
+        facts_id=new_id("facts"),
+        revision_id=new_id("rev"),
+        worker_count=1,
+        gpu_count=8,
+        required_gpu_count=1,
+        required_worker_id="worker-local-01",
+        container_name="fh-sglang-deepseek-v4-flash",
+        submitter_username="zz_chentian",
+        container_user="root",
+        image_digest="harbor.sourcefind.cn:5443/dcu/admin/base/custom@sha256:" + "0" * 64,
+        run=(
+            Command(
+                kind=CommandKind.CONTAINER_PATH_BASH,
+                container_path="/data/fh/agent-gpu-task-scheduler/scripts/"
+                "run_torch_collective_smoke.sh",
+                sha256="c1cf6dee074e03c026dd7272e358d7b15c65b6ff3b6ae1c1f71e7efae341de0c",
+                argv=("--nproc-per-node", "1", "--output", "/data/out.json"),
+            ),
+        ),
+        required_logs=("/public/share/agent-scheduler-mvp/logs/x.log",),
+        required_outputs=("/public/share/agent-scheduler-mvp/outputs/x.json",),
+        timeout_seconds=600,
+    )
+    proposal = _minimal_proposal(proposal_id)
+
+    with pytest.raises(ProposalError) as caught:
+        ProposalService._validate_facts(proposal, facts)
+
+    message = str(caught.value)
+    assert "exactly two positional arguments" in message
+    assert "<container-output-path> <container-log-path>" in message
+    assert "4" in message  # the count actually supplied
+
+
+def test_artifact_mismatch_rejection_states_the_expected_host_paths():
+    from agent_scheduler.proposal.service import ProposalError, ProposalService
+
+    proposal_id = new_id("prop")
+    output = f"/data/agent-scheduler-mvp/outputs/{proposal_id}.json"
+    business_log = f"/data/agent-scheduler-mvp/logs/{proposal_id}.log"
+    facts = _frozen_facts(proposal_id, output, business_log).model_copy(
+        update={"required_outputs": ("/public/share/wrong.json",)}
+    )
+
+    with pytest.raises(ProposalError) as caught:
+        ProposalService._validate_facts(_minimal_proposal(proposal_id), facts)
+
+    message = str(caught.value)
+    assert "/public/share/agent-scheduler-mvp/outputs/" in message
+    assert "bind mount" in message
