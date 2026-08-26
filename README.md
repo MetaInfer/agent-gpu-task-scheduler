@@ -29,12 +29,26 @@ uv run ruff check .
 uv run mypy src
 ```
 
-真实测试必须显式 opt-in：
+真实测试必须显式 opt-in，分三层，成本依次上升：
 
 ```bash
-RUN_REAL_CLAUDE=1 uv run pytest -m real_claude
-RUN_REAL_GPU=1 uv run pytest -m real_gpu
+# T1（默认门禁的一部分，见上）：结构/生成逻辑正确性，零成本，不发真实请求
+
+# T2：单个 Agent 真实连通性检查——建一个 Proposal 就停，不跑 GPU
+RUN_REAL_CLAUDE=1 uv run pytest tests/test_real_onboarding.py -m real_claude
+RUN_REAL_CODEX=1  uv run pytest tests/test_real_onboarding.py -m real_codex
+RUN_REAL_PI=1     uv run pytest tests/test_real_onboarding.py -m real_pi
+RUN_REAL_DSH=1    uv run pytest tests/test_real_onboarding.py -m real_dsh
+
+# T3：单个 Agent 完整 1/2/4/8 卡资格闭环——真实 GPU，复用容器严格串行，一次只跑一个
+RUN_REAL_GPU=1 RUN_FULL_QUALIFICATION=1 RUN_REAL_CLAUDE=1 \
+  uv run pytest tests/test_real_qualification.py -m real_claude
 ```
+
+T2 需要 Master 已用 `AGENT_SCHEDULER_HARNESS_MODE=fake` 启动（见下）；T3 需要
+`AGENT_SCHEDULER_HARNESS_MODE=claude`（Processor/Reviewer 始终是 Claude，与被测试的
+Submitter harness 无关）且 Worker 已连接。四个 harness 的一次性安装前置见
+[从 Agent 会话提交](docs/submitting-from-an-agent-session.md)。
 
 ## 初始化
 
@@ -70,10 +84,12 @@ uv run agent-scheduler serve
 uv run agent-scheduler worker
 ```
 
-终端 3：真实 Claude Submitter通过本地 MCP Adapter一次提交四个 Proposal，并验证持久证据：
+终端 3：真实 Submitter 通过本地 MCP Adapter 一次提交四个 Proposal，并验证持久证据。
+默认是 Claude ​Code；`--harness` 可选 `codex`/`pi`/`dsh`，四者殊途同归到同一条
+`agent-scheduler mcp` 命令，Processor/Reviewer 始终跑 Claude，与 `--harness` 无关：
 
 ```bash
-uv run agent-scheduler qualify
+uv run agent-scheduler qualify [--harness claude|codex|pi|dsh]
 ```
 
 浏览器观察页为 `https://127.0.0.1:8443/`。开发证书是自签名 loopback证书；远程访问使用 SSH tunnel。

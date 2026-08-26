@@ -60,12 +60,25 @@ uv run ruff check .
 uv run mypy src
 ```
 
-涉及真实计费或真实硬件的测试必须显式 opt-in：
+涉及真实计费或真实硬件的测试必须显式 opt-in，分三层，成本依次上升：
 
 ```bash
-RUN_REAL_CLAUDE=1 uv run pytest -m real_claude   # 一次计费的 Claude 调用
-RUN_REAL_GPU=1   uv run pytest -m real_gpu       # 真实 hy-smi 与容器前置检查
+# T1（上面的默认门禁已覆盖）：配置生成/契约逻辑正确性，零成本
+
+# T2：单个 Agent 真实连通性检查——建一个 Proposal 就停，Master 用 fake harness 即可，不碰 GPU
+RUN_REAL_CLAUDE=1 uv run pytest tests/test_real_onboarding.py -m real_claude
+RUN_REAL_CODEX=1  uv run pytest tests/test_real_onboarding.py -m real_codex
+RUN_REAL_PI=1     uv run pytest tests/test_real_onboarding.py -m real_pi
+RUN_REAL_DSH=1    uv run pytest tests/test_real_onboarding.py -m real_dsh
+
+# T3：单个 Agent 完整 1/2/4/8 卡资格闭环——真实 GPU，复用容器严格串行，一次只跑一个
+RUN_REAL_GPU=1 RUN_FULL_QUALIFICATION=1 RUN_REAL_CODEX=1 \
+  uv run pytest tests/test_real_qualification.py -m real_codex
 ```
+
+四个 Agent（Claude ​Code、Codex CLI、pi、dsh）都能跑 T2/T3；四家的一次性安装前置
+（如 `pi install npm:pi-mcp-adapter`、`dsh plugin --profile headless add dsh-mcp-bridge`）
+见 [从 Agent 会话提交](submitting-from-an-agent-session.md)。
 
 ---
 
@@ -281,10 +294,13 @@ curl -sk $BASE/api/v1/tasks/$TASK
 ### 6.3 一键资格闭环
 
 ```bash
-uv run agent-scheduler qualify [--base-url https://127.0.0.1:8443] [--timeout N]
+uv run agent-scheduler qualify [--base-url https://127.0.0.1:8443] [--timeout N] \
+  [--harness claude|codex|pi|dsh]
 ```
 
-拉起真实 Claude Submitter，一次提交 1/2/4/8 卡四个 Proposal，然后独立验证完整证据包。
+拉起真实 Submitter（默认 Claude ​Code，`--harness` 选其他三家），一次提交 1/2/4/8 卡
+四个 Proposal，然后独立验证完整证据包。四个 harness 各自产出独立可验证的证据包——
+`--harness` 只决定谁写 Proposal，Master 内部的 Processor/Reviewer 始终是 Claude。
 详见第 11 节。
 
 ---
@@ -481,11 +497,13 @@ uv run agent-scheduler inspect --state-root /public/share/agent-scheduler-mvp \
 ## 11. 资格验证
 
 ```bash
-uv run agent-scheduler qualify
+uv run agent-scheduler qualify [--harness claude|codex|pi|dsh]
 ```
 
-流程：跑本地门禁并留证 → 检查 `/health` profile → 写 MCP 配置 → 拉起真实 Claude Submitter
-一次提交四个 Proposal → 轮询到终态 → 独立验证证据包。
+流程：跑本地门禁并留证 → 检查 `/health` profile → 生成该 harness 的接入配置 → 拉起真实
+Submitter 一次提交四个 Proposal → 轮询到终态 → 独立验证证据包。结果不依赖 Submitter
+自述——驱动按 `Qualification Run: <run_id>` 标记从 Ground Truth 反推 items，四个 harness
+在结构化输出能力上的差异因此不影响正确性。
 
 验证器**默认失败**，逐项检查：run_id 绑定、门禁记录、Task/Plan/Manifest 签名、
 `hy-smi` 样本新鲜度（≤30 秒且早于计划创建时间）、WSS 协议事件、Worker 证据、
