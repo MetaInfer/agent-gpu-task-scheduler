@@ -16,7 +16,7 @@ import pytest
 
 from agent_scheduler.adapters.submitter import build_submitter_invocation
 from agent_scheduler.domain.models import new_id
-from agent_scheduler.runtime import load_runtime
+from agent_scheduler.runtime import load_tls_certificate
 from agent_scheduler.storage import EventStore
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -27,9 +27,9 @@ def _run_submitter(harness: str, tmp_path: Path, run_id: str) -> subprocess.Comp
     state_root = Path(
         os.environ.get("AGENT_SCHEDULER_STATE_ROOT", "/public/share/agent-scheduler-mvp")
     )
-    identity = load_runtime(state_root)
+    tls_certificate = load_tls_certificate(state_root)
     response = httpx.get(
-        f"{BASE_URL}/health", verify=str(identity.tls_certificate), timeout=10
+        f"{BASE_URL}/health", verify=str(tls_certificate), timeout=10
     )
     response.raise_for_status()
     uv_path = shutil.which("uv")
@@ -42,7 +42,7 @@ def _run_submitter(harness: str, tmp_path: Path, run_id: str) -> subprocess.Comp
         base_url=BASE_URL,
         username="zz_chentian",
         uv_path=Path(uv_path).resolve(),
-        tls_certificate=identity.tls_certificate,
+        tls_certificate=tls_certificate,
         run_id=run_id,
     )
     prompt = (
@@ -87,7 +87,7 @@ def test_harness_creates_a_proposal_through_its_own_onboarding(
     state_root = Path(
         os.environ.get("AGENT_SCHEDULER_STATE_ROOT", "/public/share/agent-scheduler-mvp")
     )
-    run_id = new_id("t2")
+    run_id = new_id("t_two")
 
     completed = _run_submitter(harness, tmp_path, run_id)
 
