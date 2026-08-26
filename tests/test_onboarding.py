@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+
+import pytest
 
 from agent_scheduler.adapters.onboarding import (
     CANONICAL_SKILL_DIR,
+    HARNESSES,
+    OnboardingError,
+    build_onboarding,
     read_skill_frontmatter,
+    write_onboarding,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -29,3 +36,89 @@ def test_claude_skill_directory_points_at_the_canonical_skill():
     canonical = PROJECT_ROOT / CANONICAL_SKILL_DIR
     assert claude_skill.is_symlink()
     assert claude_skill.resolve() == canonical.resolve()
+
+
+def _build(harness: str, tmp_path: Path):
+    return build_onboarding(
+        harness,
+        output_dir=tmp_path / "run",
+        project_root=PROJECT_ROOT,
+        state_root=Path("/public/share/agent-scheduler-mvp"),
+        base_url="https://127.0.0.1:8443",
+        username="zz_chentian",
+        uv_path=Path("/usr/local/bin/uv"),
+    )
+
+
+@pytest.mark.parametrize("harness", HARNESSES)
+def test_every_harness_reaches_the_same_mcp_command(harness: str, tmp_path: Path):
+    """No Agent gets a bespoke server; the onboarding differs, the target does not."""
+    config = _build(harness, tmp_path)
+    rendered = json.dumps(
+        {
+            "argv": list(config.argv),
+            "env": config.env,
+            "files": {path.name: content for path, content in config.files.items()},
+        }
+    )
+    assert "agent-scheduler" in rendered
+    assert "/usr/local/bin/uv" in rendered
+    assert "https://127.0.0.1:8443" in rendered
+    assert "zz_chentian" in rendered
+    assert "/public/share/agent-scheduler-mvp" in rendered
+
+
+@pytest.mark.parametrize("harness", HARNESSES)
+def test_generated_files_land_only_under_the_output_directory(harness: str, tmp_path: Path):
+    """Per-run config must never touch a user dotfile."""
+    output_dir = tmp_path / "run"
+    config = _build(harness, tmp_path)
+    for path in config.files:
+        assert path.parent == output_dir
+
+
+def test_claude_config_is_a_valid_strict_mcp_config(tmp_path: Path):
+    config = _build("claude", tmp_path)
+    write_onboarding(config)
+    assert "--strict-mcp-config" in config.argv
+    index = config.argv.index("--mcp-config")
+    written = Path(config.argv[index + 1])
+    server = json.loads(written.read_text(encoding="utf-8"))["mcpServers"]["submitter"]
+    assert server["command"] == "/usr/local/bin/uv"
+    assert server["args"][:3] == ["run", "agent-scheduler", "mcp"]
+    assert server["env"]["AGENT_SCHEDULER_STATE_ROOT"] == "/public/share/agent-scheduler-mvp"
+
+
+def test_pi_reuses_the_same_mcp_json_shape_and_promotes_direct_tools(tmp_path: Path):
+    config = _build("pi", tmp_path)
+    written = next(path for path in config.files if path.name == "mcp.json")
+    server = json.loads(config.files[written])["mcpServers"]["submitter"]
+    # Without directTools the 12 tools hide behind pi-mcp-adapter's proxy tool.
+    assert set(server["directTools"]) == {
+        "create_proposal",
+        "reply",
+        "confirm_revision",
+        "get_reviews",
+        "resume",
+        "cancel",
+        "get_proposal",
+        "get_task",
+        "cancel_task",
+        "wait_for_task",
+        "wait_for_events",
+        "get_logs",
+    }
+    assert config.env["PI_CODING_AGENT_DIR"] == str(written.parent)
+
+
+def test_codex_config_is_passed_as_flags_and_writes_no_file(tmp_path: Path):
+    config = _build("codex", tmp_path)
+    assert config.files == {}
+    assert config.argv.count("-c") == 4
+    joined = " ".join(config.argv)
+    assert "mcp_servers.submitter.command=/usr/local/bin/uv" in joined
+
+
+def test_unknown_harness_is_rejected(tmp_path: Path):
+    with pytest.raises(OnboardingError):
+        _build("gemini", tmp_path)

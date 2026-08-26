@@ -2,10 +2,28 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
 CANONICAL_SKILL_DIR = ".agents/skills/submit-gpu-task"
+
+HARNESSES = ("claude", "codex", "pi", "dsh")
+
+SUBMITTER_TOOLS = (
+    "create_proposal",
+    "reply",
+    "confirm_revision",
+    "get_reviews",
+    "resume",
+    "cancel",
+    "get_proposal",
+    "get_task",
+    "cancel_task",
+    "wait_for_task",
+    "wait_for_events",
+    "get_logs",
+)
 
 
 class OnboardingError(ValueError):
@@ -43,3 +61,155 @@ def read_skill_frontmatter(path: Path) -> SkillFrontmatter:
     if missing:
         raise OnboardingError(f"skill frontmatter is missing {sorted(missing)}: {path}")
     return SkillFrontmatter(name=fields["name"], description=fields["description"])
+
+
+@dataclass(frozen=True)
+class OnboardingConfig:
+    harness: str
+    files: dict[Path, str]
+    argv: tuple[str, ...]
+    env: dict[str, str]
+
+
+def build_onboarding(
+    harness: str,
+    *,
+    output_dir: Path,
+    project_root: Path,
+    state_root: Path,
+    base_url: str,
+    username: str,
+    uv_path: Path,
+) -> OnboardingConfig:
+    """Describe how one harness is pointed at the Submitter MCP server.
+
+    Every harness ends up invoking the same command; only the declaration
+    mechanism differs. Nothing here writes outside ``output_dir``.
+    """
+    if harness not in HARNESSES:
+        raise OnboardingError(f"unknown harness {harness!r}; expected one of {list(HARNESSES)}")
+    args = [
+        "run",
+        "agent-scheduler",
+        "mcp",
+        "--base-url",
+        base_url,
+        "--username",
+        username,
+    ]
+    env = {"AGENT_SCHEDULER_STATE_ROOT": str(state_root)}
+    server: dict[str, object] = {
+        "command": str(uv_path),
+        "args": args,
+        "cwd": str(project_root),
+        "env": env,
+    }
+    if harness == "claude":
+        path = output_dir / "mcp.json"
+        return OnboardingConfig(
+            harness=harness,
+            files={path: _mcp_json(server)},
+            argv=("--strict-mcp-config", "--mcp-config", str(path)),
+            env={},
+        )
+    if harness == "pi":
+        path = output_dir / "mcp.json"
+        promoted = {**server, "directTools": list(SUBMITTER_TOOLS)}
+        return OnboardingConfig(
+            harness=harness,
+            files={path: _mcp_json(promoted)},
+            argv=(),
+            env={"PI_CODING_AGENT_DIR": str(output_dir)},
+        )
+    if harness == "codex":
+        return OnboardingConfig(
+            harness=harness,
+            files={},
+            argv=(
+                "-c",
+                f"mcp_servers.submitter.command={uv_path}",
+                "-c",
+                f"mcp_servers.submitter.args={json.dumps(args)}",
+                "-c",
+                f'mcp_servers.submitter.cwd="{project_root}"',
+                "-c",
+                (
+                    "mcp_servers.submitter.env="
+                    f'{{AGENT_SCHEDULER_STATE_ROOT="{state_root}"}}'
+                ),
+            ),
+            env={},
+        )
+    path = output_dir / "submitter-mcp.patch.yml"
+    return OnboardingConfig(
+        harness=harness,
+        files={path: _dsh_patch(server, project_root)},
+        argv=("--patch", str(path)),
+        env={},
+    )
+
+
+def write_onboarding(config: OnboardingConfig) -> None:
+    for path, content in config.files.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+
+def _mcp_json(server: dict[str, object]) -> str:
+    return json.dumps({"mcpServers": {"submitter": server}}, sort_keys=True, indent=2) + "\n"
+
+
+def _dsh_patch(server: dict[str, object], project_root: Path) -> str:
+    """Render a cordis patch overlay declaring the submitter MCP server and skill root.
+
+    Verified against the real ``dsh-mcp-bridge`` package (its own
+    ``cordis.patch.yml``) and ``dsh --profile headless --dump-config`` output,
+    both empirically inspected and round-tripped through ``dsh --patch``:
+
+    * A patch file is a list of directives; ``insert`` appends a list of
+      cordis entries shaped ``id`` / ``name`` / ``config`` — *not* a bare
+      flat list of entries as originally assumed.
+    * The MCP server plugin's real package name is
+      ``@deepseek-ai/dsh-mcp-client`` (the bundle name ``dsh-mcp-bridge`` is
+      only the npm package that ships example patch entries using it), and
+      its stdio config keys are ``serverName``, ``transport``, ``command``,
+      ``args``, ``cwd``, ``env`` — there is no ``servers.<name>`` nesting.
+    * ``@deepseek-ai/dsh-skill-filesystem`` declares extra skill roots via
+      ``customSkillDirs`` (a list of paths), not ``roots``. Its provider
+      name defaults to ``local``, so a second instance needs an explicit,
+      distinct ``providerName`` to avoid colliding with the harness's
+      built-in provider.
+    """
+    args = server["args"]
+    assert isinstance(args, list)
+    env = server["env"]
+    assert isinstance(env, dict)
+    rendered_args = ", ".join(_yaml_double_quoted(str(item)) for item in args)
+    rendered_env = "\n".join(
+        f"          {key}: {_yaml_double_quoted(str(value))}" for key, value in env.items()
+    )
+    return (
+        "# Generated per qualification run. Do not edit; regenerate instead.\n"
+        "- insert:\n"
+        "    - id: mcp-submitter\n"
+        "      name: '@deepseek-ai/dsh-mcp-client'\n"
+        "      config:\n"
+        "        serverName: submitter\n"
+        "        transport: stdio\n"
+        f"        command: {_yaml_double_quoted(str(server['command']))}\n"
+        f"        args: [{rendered_args}]\n"
+        f"        cwd: {_yaml_double_quoted(str(server['cwd']))}\n"
+        "        env:\n"
+        f"{rendered_env}\n"
+        "    - id: skill-filesystem-submitter\n"
+        "      name: '@deepseek-ai/dsh-skill-filesystem'\n"
+        "      config:\n"
+        "        providerName: submitter\n"
+        "        customSkillDirs:\n"
+        f"          - {_yaml_double_quoted(str(project_root / '.agents' / 'skills'))}\n"
+    )
+
+
+def _yaml_double_quoted(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
