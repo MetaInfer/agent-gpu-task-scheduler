@@ -122,3 +122,24 @@ def test_codex_config_is_passed_as_flags_and_writes_no_file(tmp_path: Path):
 def test_unknown_harness_is_rejected(tmp_path: Path):
     with pytest.raises(OnboardingError):
         _build("gemini", tmp_path)
+
+
+def test_onboarding_doc_covers_every_harness():
+    doc = (PROJECT_ROOT / "docs" / "submitting-from-an-agent-session.md").read_text(
+        encoding="utf-8"
+    )
+    for harness in HARNESSES:
+        assert harness in doc.lower(), f"onboarding doc does not mention {harness}"
+    # The one-time installs are the接入方's responsibility and must be stated.
+    assert "pi install npm:pi-mcp-adapter" in doc
+    assert "dsh plugin" in doc and "dsh-mcp-bridge" in doc
+
+
+def test_no_document_still_points_at_the_old_claude_only_filename():
+    stale = []
+    for path in PROJECT_ROOT.glob("**/*.md"):
+        if ".claude/worktrees" in str(path) or ".venv" in str(path):
+            continue
+        if "submitting-from-a-claude-session" in path.read_text(encoding="utf-8"):
+            stale.append(str(path.relative_to(PROJECT_ROOT)))
+    assert stale == []

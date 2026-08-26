@@ -233,7 +233,7 @@ curl -sk https://127.0.0.1:8443/health
 > 主机上一定能跑起来——如果 `uv` 或项目的 Python 解释器本身装在只有 root 能进的目录下
 > （例如 `/root`），非 root 账号会在执行这条命令本身时失败，而不是在读证书时失败。这是
 > 独立于本文档权限修复的主机配置问题，参见
-> [从 Claude 会话提交 · 安全提醒](submitting-from-a-claude-session.md#安全提醒)。
+> [从 Agent 会话提交 · 安全提醒](submitting-from-an-agent-session.md#安全提醒)。
 
 工具清单：
 

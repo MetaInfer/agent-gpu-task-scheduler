@@ -16,7 +16,7 @@
 ## 文档
 
 - [使用文档](docs/usage.md) — 安装、配置、启动、提交、运维、排障的完整指南
-- [从 Claude 会话提交](docs/submitting-from-a-claude-session.md) — 给会话装 MCP 与 Skill 的详细操作
+- [从 Agent 会话提交](docs/submitting-from-an-agent-session.md) — 给 Claude ​Code/Codex CLI/pi/dsh 会话装 MCP 与 Skill 的详细操作
 - [系统 Spec](docs/agent-task-scheduler-spec.md) — 架构与设计约束
 - [资格状态](docs/qualification-status.md) — 真实资格证据
 
