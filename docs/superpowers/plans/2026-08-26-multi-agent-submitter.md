@@ -963,7 +963,7 @@ def test_pi_invocation_carries_credentials_into_the_isolated_agent_dir(
     assert (isolated / "models-store.json").is_file()
 ```
 
-在 `build_submitter_invocation` 的 pi 分支前加入：
+在 `build_submitter_invocation` 内，紧接 `write_onboarding(onboarding)` 之后、`binary = executable or submitter_executable(harness)` 之前插入一行（这是 if/elif 链之外的独立语句，不要塞进链内）：
 
 ```python
     if harness == "pi":
@@ -1058,7 +1058,7 @@ def _seed_qualification_item(
         created_at=utc_now(),
     )
     store.write_immutable("revisions", revision.revision_id, revision)
-    store.write_snapshot_value(
+    store.write_snapshot(
         "proposals",
         task.proposal_id,
         {"proposal_id": task.proposal_id, "state": "COMPILED"},
@@ -1141,7 +1141,7 @@ def test_reconstruction_keeps_a_task_that_did_not_complete(runtime_identity):
     assert {item.card_count: item.state for item in result.items}[8] == "FAILED"
 ```
 
-`store.write_snapshot_value` 是占位名：`EventStore.write_snapshot` 现有签名接受 pydantic 模型。先看 `src/agent_scheduler/storage/events.py` 里 `write_snapshot` 与 `read_snapshot` 的实际签名——若它只收模型，就直接用 `store.write_snapshot("proposals", proposal_id, proposal)` 并构造一个真实的 `Proposal`（`state=ProposalState.COMPILED`，其余字段照 `tests/conftest.py` 的风格填），不要为测试新增存储 API。
+`EventStore.write_snapshot(object_type, object_id, payload)` accepts `BaseModel | Mapping[str, Any]` directly — the plain dict above is valid as written, no model construction needed.
 
 - [ ] **Step 2: 运行测试确认失败**
 
@@ -1438,6 +1438,9 @@ Expected: FAIL，`AttributeError: 'Namespace' object has no attribute 'harness'`
 2. 删除函数内手工拼装 `mcp_config`、`schema`、`allowed`、`command`、`prompt`、`env` 的整段（当前第 105-198 行），替换为：
 
 ```python
+        uv_path = shutil.which("uv")
+        if uv_path is None:
+            return _blocked((), "uv executable not found", run_id)
         run_dir = state_root / "qualification" / run_id
         invocation = build_submitter_invocation(
             harness,
@@ -1457,16 +1460,11 @@ Expected: FAIL，`AttributeError: 'Namespace' object has no attribute 'harness'`
         cli_version = _harness_version(command[0], env)
 ```
 
+`shutil` 已在文件顶部导入（第 8 行），无需新增。
+
 3. `audit` 字典初始化处（第 70-76 行）加入 `"harness": harness`。
 4. 把 `_claude_version` 重命名为 `_harness_version`，其错误信息中的 `Claude ​Code` 改为参数化的可执行名。
-5. 重试循环里，成功分支不再解析 stdout，改为：
-
-```python
-            return reconstruct_qualification_result(store, run_id)
-```
-
-删除 `_stream_structured_output` 及其唯一调用，以及针对结构化输出的 `except (json.JSONDecodeError, TypeError, ValueError)` 重试分支。**保留** exit code 非零时的 `_retryable_submitter_failure` 重试——它是夹具自身的健壮性，不是对 Agent 输出的依赖。
-6. 非零 exit code 时不再直接 `_blocked` 返回，而是先重建再判断：Agent 可能做完全部工作后才因非致命原因退出非零。改为：
+5. 替换重试循环内、从 `if completed.returncode != 0:`（第 239 行）到 `return result`（第 256 行）的**整段**——原文两个分支（非零 exit code 直接 `_blocked`；零 exit code 解析 stdout 结构化输出）合并为一处，一律先驱动侧重建再判断，不再解析 stdout：
 
 ```python
             if completed.returncode != 0:
@@ -1480,9 +1478,13 @@ Expected: FAIL，`AttributeError: 'Namespace' object has no attribute 'harness'`
                 if _retryable_submitter_failure(completed.stderr) and attempt < 4:
                     continue
                 return _blocked(reconstructed.items, last_reason, run_id)
+            return reconstruct_qualification_result(store, run_id)
 ```
 
-7. `harness_mode` profile 校验保持不变——它校验的是 Master 的 Processor/Reviewer 模式，与 Submitter 是谁无关。
+这一改动的理由：Agent 可能做完全部工作后才因非致命原因退出非零，所以非零 exit code 不再直接判定失败,而是先重建再看结果是否已经 `COMPLETED`。**保留** `_retryable_submitter_failure` 重试——它是夹具自身对进程失败的健壮性，不是对 Agent 输出格式的依赖。
+
+6. 删除 `_stream_structured_output` 函数定义整体（现第 692-709 行）——它的唯一调用点已随上一步的替换一并移除，模块顶部 `import json` 仍被其他代码使用，不要删除。
+7. `harness_mode` profile 校验（第 88-94 行）保持不变——它校验的是 Master 的 Processor/Reviewer 模式，与 Submitter 是谁无关。
 
 导入：`from agent_scheduler.adapters.submitter import build_submitter_invocation`。
 
