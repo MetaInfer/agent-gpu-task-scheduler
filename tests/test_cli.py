@@ -29,6 +29,7 @@ def test_mcp_command_never_calls_load_runtime(tmp_path: Path, monkeypatch):
 
     def fake_run_stdio(self):
         started["called"] = True
+        started["verify"] = self.verify
 
     monkeypatch.setattr(SubmitterMCPAdapter, "run_stdio", fake_run_stdio)
 
@@ -37,3 +38,4 @@ def test_mcp_command_never_calls_load_runtime(tmp_path: Path, monkeypatch):
     )
     assert exit_code == 0
     assert started["called"]
+    assert started["verify"] == str(root / "tls" / "certificate.pem")

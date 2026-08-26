@@ -31,6 +31,7 @@ def test_tls_certificate_and_directory_are_group_readable(tmp_path: Path):
     tls_dir = certificate.parent
     assert certificate == root / "tls" / "certificate.pem"
     assert not (root / "secrets" / "tls-certificate.pem").exists()
+    assert stat.S_IMODE(os.stat(root / "secrets").st_mode) == 0o700
     state_root_gid = os.stat(root).st_gid
     assert stat.S_IMODE(os.stat(tls_dir).st_mode) == 0o750
     assert os.stat(tls_dir).st_gid == state_root_gid

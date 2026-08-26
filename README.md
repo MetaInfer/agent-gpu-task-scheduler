@@ -93,3 +93,7 @@ uv run agent-scheduler reload-users --users zz_chentian --actor admin --reason p
 ## 已知边界
 
 MVP 不实现真实认证、多租户隔离、镜像 pull、动态依赖安装、业务自动重试、数据库、HA、崩溃自动恢复、真实多 Worker/gang或性能 SLO。Master/Worker/root容器属于可信管理域；目标 Submitter OS身份是 `zz_chentian`，0.2.0 首版资格允许 root Claude Code。
+
+非 root 的 Submitter 账号能读取 loopback TLS 证书（见 `docs/usage.md` §3），但如果部署主机
+把 `uv`/Python 解释器装在只有 root 能进的目录下（例如 `/root`），命令本身仍会失败——这是
+主机配置问题，不是本项目代码的权限模型问题，需要单独把解释器装到 Submitter 账号可达的路径。

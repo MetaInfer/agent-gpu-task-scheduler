@@ -94,6 +94,27 @@ uv run agent-scheduler init-runtime --state-root /public/share/agent-scheduler-m
 不需要 root。这正是 `agent-scheduler mcp` 命令能以非 root 的 Submitter 账号运行的原因——
 它只需要这一个文件，从不读取另外五项。
 
+### 升级已有部署
+
+0.2.0 之前创建的 state root 证书仍在旧路径 `<state-root>/secrets/tls-certificate.pem`
+（`0600`，仅 root 可读），没有 `tls/` 目录。**不做迁移就直接重启会导致 `serve`、`worker`、
+`qualify` 和全部 Admin 子命令立即报 `FileNotFoundError` 退出**——`init-runtime` 拒绝在已有
+身份上重跑，所以这不是一个会自愈的问题。升级前手动执行一次：
+
+```bash
+state_root=/public/share/agent-scheduler-mvp   # 换成实际路径
+group=$(stat -c '%G' "$state_root")
+
+install -d -m 0750 "$state_root/tls"
+chgrp "$group" "$state_root/tls"
+mv "$state_root/secrets/tls-certificate.pem" "$state_root/tls/certificate.pem"
+chmod 0640 "$state_root/tls/certificate.pem"
+chgrp "$group" "$state_root/tls/certificate.pem"
+```
+
+之后再重启 Master/Worker。该操作只搬动证书这一份非机密文件，不影响另外五项密钥或已有的
+签名/审计历史。
+
 **任一文件已存在时命令直接拒绝，不覆盖。** 需要轮换必须人工归档后重建。
 
 这些密钥永远不得进入 Git、Task 负载、argv、观察 API 或普通日志。仓库里的 `.env`
@@ -207,6 +228,12 @@ curl -sk https://127.0.0.1:8443/health
   }
 }
 ```
+
+> 非 root 的 Submitter 账号能读到 `<state-root>/tls/certificate.pem` 不代表这条命令在当前
+> 主机上一定能跑起来——如果 `uv` 或项目的 Python 解释器本身装在只有 root 能进的目录下
+> （例如 `/root`），非 root 账号会在执行这条命令本身时失败，而不是在读证书时失败。这是
+> 独立于本文档权限修复的主机配置问题，参见
+> [从 Claude 会话提交 · 安全提醒](submitting-from-a-claude-session.md#安全提醒)。
 
 工具清单：
 
