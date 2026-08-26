@@ -136,10 +136,16 @@ def test_onboarding_doc_covers_every_harness():
 
 
 def test_no_document_still_points_at_the_old_claude_only_filename():
+    # `.superpowers/` is gitignored SDD run scratch (this task's own brief/report
+    # necessarily quote the old filename while describing the rename).
+    # `docs/superpowers/` holds historical SDD specs and plans: point-in-time records
+    # of decisions as they were authored, not living docs expected to track renames.
+    excluded_prefixes = (".venv", ".superpowers", "docs/superpowers")
     stale = []
     for path in PROJECT_ROOT.glob("**/*.md"):
-        if ".claude/worktrees" in str(path) or ".venv" in str(path):
+        relative = path.relative_to(PROJECT_ROOT)
+        if any(str(relative).startswith(prefix) for prefix in excluded_prefixes):
             continue
         if "submitting-from-a-claude-session" in path.read_text(encoding="utf-8"):
-            stale.append(str(path.relative_to(PROJECT_ROOT)))
+            stale.append(str(relative))
     assert stale == []
