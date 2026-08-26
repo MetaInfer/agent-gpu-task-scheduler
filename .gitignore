@@ -28,6 +28,9 @@ runtime/
 .claude/worktrees/
 *.log
 
+# Subagent-driven-development scratch workspace
+.superpowers/
+
 # Editors and operating systems
 .vscode/
 .idea/
