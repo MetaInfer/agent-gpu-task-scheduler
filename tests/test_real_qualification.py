@@ -42,11 +42,21 @@ def test_real_gpu_and_container_preconditions():
     assert inspection.exists and not inspection.running
 
 
-@pytest.mark.real_claude
+@pytest.mark.parametrize(
+    ("harness", "marker_env"),
+    [
+        pytest.param("claude", "RUN_REAL_CLAUDE", marks=pytest.mark.real_claude),
+        pytest.param("codex", "RUN_REAL_CODEX", marks=pytest.mark.real_codex),
+        pytest.param("pi", "RUN_REAL_PI", marks=pytest.mark.real_pi),
+        pytest.param("dsh", "RUN_REAL_DSH", marks=pytest.mark.real_dsh),
+    ],
+)
 @pytest.mark.real_gpu
-def test_complete_real_qualification():
+def test_complete_real_qualification(harness: str, marker_env: str):
     if os.environ.get("RUN_FULL_QUALIFICATION") != "1":
         pytest.skip("set RUN_FULL_QUALIFICATION=1 after Master and Worker are running")
+    if os.environ.get(marker_env) != "1":
+        pytest.skip(f"set {marker_env}=1 to qualify the {harness} Submitter")
     root = Path(os.environ.get("AGENT_SCHEDULER_STATE_ROOT", "/public/share/agent-scheduler-mvp"))
     identity = load_runtime(root)
     result = run_submitter_agent(
@@ -54,6 +64,9 @@ def test_complete_real_qualification():
         state_root=root,
         base_url="https://127.0.0.1:8443",
         tls_certificate=identity.tls_certificate,
+        harness=harness,
     )
-    verified = verify_qualification(result, state_root=root, identity=identity)
+    verified = verify_qualification(
+        result, state_root=root, identity=identity, harness=harness
+    )
     assert verified.status == "COMPLETED", verified.reason
