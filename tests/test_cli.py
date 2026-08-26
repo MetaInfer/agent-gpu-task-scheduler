@@ -39,3 +39,25 @@ def test_mcp_command_never_calls_load_runtime(tmp_path: Path, monkeypatch):
     assert exit_code == 0
     assert started["called"]
     assert started["verify"] == str(root / "tls" / "certificate.pem")
+
+
+def test_qualify_accepts_a_harness_flag():
+    from agent_scheduler.cli.main import build_parser
+
+    args = build_parser().parse_args(["qualify", "--harness", "dsh"])
+    assert args.harness == "dsh"
+
+
+def test_qualify_defaults_to_claude():
+    from agent_scheduler.cli.main import build_parser
+
+    assert build_parser().parse_args(["qualify"]).harness == "claude"
+
+
+def test_qualify_rejects_an_unknown_harness():
+    import pytest
+
+    from agent_scheduler.cli.main import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["qualify", "--harness", "gemini"])

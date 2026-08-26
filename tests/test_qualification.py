@@ -168,3 +168,124 @@ def test_reconstruction_keeps_a_task_that_did_not_complete(runtime_identity):
 
     assert result.status == "BLOCKED_QUALIFICATION"
     assert {item.card_count: item.state for item in result.items}[8] == "FAILED"
+
+
+def _seed_run_preconditions(
+    store: EventStore, run_id: str, *, harness: str | None
+) -> QualificationResult:
+    """Seed just enough for verification to reach the Submitter-evidence check.
+
+    A full passing evidence graph needs Plans, manifests, worker samples, protocol
+    events and on-disk artifacts. The harness binding is decided before any of that,
+    so seed up to that point and assert on which check rejects.
+    """
+    store.write_immutable(
+        "qualification-runs",
+        run_id,
+        {
+            "schema_version": "v1",
+            "run_id": run_id,
+            "started_at": utc_now().isoformat(),
+            "profile": {
+                "qualification": True,
+                "harness_mode": "claude",
+                "worker_mode": "remote",
+            },
+        },
+    )
+    store.write_immutable(
+        "qualification-gates",
+        new_id("gate"),
+        {
+            "schema_version": "v1",
+            "run_id": run_id,
+            "passed": True,
+            "timestamp": utc_now().isoformat(),
+            "results": [
+                {"argv": ["uv", "run", "pytest", "-q"], "exit_code": 0},
+                {"argv": ["uv", "run", "ruff", "check", "."], "exit_code": 0},
+                {"argv": ["uv", "run", "mypy", "src"], "exit_code": 0},
+            ],
+        },
+    )
+    items = tuple(
+        QualificationItem(
+            card_count=cards,
+            proposal_id=f"prop_{cards}",
+            task_id=f"task_{cards}",
+            state="COMPLETED",
+        )
+        for cards in (1, 2, 4, 8)
+    )
+    invocation_id = new_id("harness")
+    record: dict[str, object] = {
+        "schema_version": "v1",
+        "invocation_id": invocation_id,
+        "run_id": run_id,
+        "role": "submitter",
+        "exit_code": 0,
+        "started_at": utc_now().isoformat(),
+        "stdout": " ".join(f"{item.proposal_id} {item.task_id}" for item in items),
+    }
+    if harness is not None:
+        record["harness"] = harness
+    store.write_immutable("harness", invocation_id, record)
+    return QualificationResult(run_id=run_id, status="COMPLETED", items=items)
+
+
+class _StoppedDocker:
+    """Stand in for DockerCLI so verification never shells out in a unit test."""
+
+    def inspect(self, name: str):
+        from agent_scheduler.worker.docker import ContainerInspection
+
+        return ContainerInspection(exists=True, running=False)
+
+
+def test_verification_rejects_submitter_evidence_from_another_harness(runtime_identity):
+    from agent_scheduler.qualification import verify_qualification
+
+    root, identity = runtime_identity
+    result = _seed_run_preconditions(EventStore(root), "qual_harness", harness="codex")
+
+    rejected = verify_qualification(
+        result, state_root=root, identity=identity, harness="pi", docker=_StoppedDocker()
+    )
+
+    assert rejected.status == "BLOCKED_QUALIFICATION"
+    assert rejected.reason is not None
+    assert "pi Submitter evidence is incomplete" in rejected.reason
+
+
+def test_verification_accepts_submitter_evidence_from_the_named_harness(runtime_identity):
+    from agent_scheduler.qualification import verify_qualification
+
+    root, identity = runtime_identity
+    result = _seed_run_preconditions(EventStore(root), "qual_harness_ok", harness="codex")
+
+    verified = verify_qualification(
+        result, state_root=root, identity=identity, harness="codex", docker=_StoppedDocker()
+    )
+
+    # The graph past this point is intentionally absent, so it still blocks — but on a
+    # later check, which is what proves the harness binding itself was accepted.
+    assert verified.status == "BLOCKED_QUALIFICATION"
+    assert verified.reason is not None
+    assert "Submitter evidence is incomplete" not in verified.reason
+
+
+def test_legacy_submitter_evidence_without_a_harness_field_counts_as_claude(
+    runtime_identity,
+):
+    """Evidence recorded before the field existed was produced by Claude Code."""
+    from agent_scheduler.qualification import verify_qualification
+
+    root, identity = runtime_identity
+    result = _seed_run_preconditions(EventStore(root), "qual_legacy", harness=None)
+
+    verified = verify_qualification(
+        result, state_root=root, identity=identity, harness="claude", docker=_StoppedDocker()
+    )
+
+    assert verified.reason is not None
+    assert "Submitter evidence is incomplete" not in verified.reason

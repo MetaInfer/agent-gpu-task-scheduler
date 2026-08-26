@@ -13,6 +13,7 @@ import uvicorn
 
 from agent_scheduler.adapters.harness import ClaudeCodeAdapter, FakeHarnessAdapter
 from agent_scheduler.adapters.mcp import SubmitterMCPAdapter
+from agent_scheduler.adapters.onboarding import HARNESSES
 from agent_scheduler.config import Settings
 from agent_scheduler.domain.models import new_id
 from agent_scheduler.qualification import (
@@ -48,6 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     qualify = subparsers.add_parser("qualify", help="run real four-task qualification")
     qualify.add_argument("--base-url", default="https://127.0.0.1:8443")
     qualify.add_argument("--timeout", type=int, default=45 * 60)
+    qualify.add_argument("--harness", choices=HARNESSES, default="claude")
 
     inspect = subparsers.add_parser("inspect", help="inspect Ground Truth objects/resources")
     inspect.add_argument("--state-root", type=Path, required=True)
@@ -146,9 +148,13 @@ def main(argv: list[str] | None = None) -> int:
                 base_url=args.base_url,
                 tls_certificate=identity.tls_certificate,
                 timeout_seconds=args.timeout,
+                harness=args.harness,
             )
             verified = verify_qualification(
-                result, state_root=settings.state_root, identity=identity
+                result,
+                state_root=settings.state_root,
+                identity=identity,
+                harness=args.harness,
             )
         except (OSError, TypeError, ValueError) as exc:
             verified = QualificationResult(

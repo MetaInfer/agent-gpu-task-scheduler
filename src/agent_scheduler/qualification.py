@@ -12,6 +12,7 @@ from typing import Any, Literal, cast
 
 import httpx
 
+from agent_scheduler.adapters.submitter import build_submitter_invocation
 from agent_scheduler.config import QUALIFICATION_VRAM_CEILING
 from agent_scheduler.domain.models import (
     ExecutionPlan,
@@ -60,7 +61,8 @@ def run_submitter_agent(
     base_url: str,
     tls_certificate: Path,
     timeout_seconds: int = 45 * 60,
-    executable: str = "claude",
+    executable: str | None = None,
+    harness: str = "claude",
 ) -> QualificationResult:
     run_id = new_id("qual")
     store: EventStore | None = None
@@ -72,6 +74,7 @@ def run_submitter_agent(
         "invocation_id": invocation_id,
         "run_id": run_id,
         "role": "submitter",
+        "harness": harness,
         "started_at": started.isoformat(),
     }
     try:
@@ -102,100 +105,26 @@ def run_submitter_agent(
                 "profile": profile,
             },
         )
-        qualification_dir = state_root / "qualification"
-        qualification_dir.mkdir(parents=True, exist_ok=True)
-        mcp_config = qualification_dir / f"submitter-mcp-{run_id}.json"
         uv_path = shutil.which("uv")
         if uv_path is None:
             return _blocked((), "uv executable not found", run_id)
-        mcp_config.write_text(
-            json.dumps(
-                {
-                    "mcpServers": {
-                        "submitter": {
-                            "command": str(Path(uv_path).resolve()),
-                            "args": [
-                                "run",
-                                "agent-scheduler",
-                                "mcp",
-                                "--base-url",
-                                base_url,
-                                "--username",
-                                "zz_chentian",
-                            ],
-                            "cwd": str(project_root),
-                            "env": {"AGENT_SCHEDULER_STATE_ROOT": str(state_root)},
-                        }
-                    }
-                },
-                sort_keys=True,
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
+        run_dir = state_root / "qualification" / run_id
+        invocation = build_submitter_invocation(
+            harness,
+            output_dir=run_dir,
+            project_root=project_root,
+            state_root=state_root,
+            base_url=base_url,
+            username="zz_chentian",
+            uv_path=Path(uv_path).resolve(),
+            tls_certificate=tls_certificate,
+            executable=executable,
+            run_id=run_id,
         )
-        schema = json.dumps(
-            QualificationResult.model_json_schema(), sort_keys=True, separators=(",", ":")
-        )
-        allowed = ",".join(
-            f"mcp__submitter__{name}"
-            for name in (
-                "create_proposal",
-                "reply",
-                "confirm_revision",
-                "resume",
-                "cancel",
-                "get_proposal",
-                "get_reviews",
-                "get_task",
-                "cancel_task",
-                "wait_for_task",
-                "wait_for_events",
-                "get_logs",
-            )
-        )
-        command = [
-            executable,
-            "--print",
-            "--no-session-persistence",
-            "--disable-slash-commands",
-            "--setting-sources",
-            "",
-            "--permission-mode",
-            "dontAsk",
-            "--tools",
-            "",
-            "--allowedTools",
-            allowed,
-            "--strict-mcp-config",
-            "--mcp-config",
-            str(mcp_config),
-            "--system-prompt-file",
-            str(project_root / "prompts" / "submitter.md"),
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--json-schema",
-            schema,
-        ]
-        prompt = (
-            f"qualification_run_id={run_id}\n"
-            "Run the four-task qualification. Echo run_id exactly. All created Proposal text MUST "
-            f"include `Qualification Run: {run_id}`. Return BLOCKED_QUALIFICATION if any Task "
-            "fails or does not become terminal within the available deadline."
-        )
-        env = {
-            "HOME": os.environ.get("HOME", "/root"),
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-            "DISABLE_UPDATES": "1",
-            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
-            "SSL_CERT_FILE": str(tls_certificate),
-        }
-        for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
-            value = os.environ.get(name)
-            if value:
-                env[name] = value
-        cli_version = _claude_version(executable, env)
+        command = list(invocation.argv)
+        prompt = invocation.prompt
+        env = invocation.env
+        cli_version = _harness_version(command[0], env)
         last_reason = "Submitter exhausted retry attempts"
         for attempt in range(1, 5):
             attempt_id = invocation_id if attempt == 1 else new_id("harness")
@@ -237,23 +166,17 @@ def run_submitter_agent(
             )
             store.write_immutable("harness", attempt_id, attempt_audit)
             if completed.returncode != 0:
-                last_reason = f"Submitter Claude exited with code {completed.returncode}"
-                retryable = _retryable_submitter_failure(completed.stderr)
-                if retryable and attempt < 4:
-                    continue
-                return _blocked((), last_reason, run_id)
-            try:
-                result = strict_from_json_value(
-                    QualificationResult, _stream_structured_output(completed.stdout)
+                reconstructed = reconstruct_qualification_result(store, run_id)
+                if reconstructed.status == "COMPLETED":
+                    return reconstructed
+                last_reason = (
+                    f"Submitter {harness} exited with code {completed.returncode}: "
+                    f"{reconstructed.reason}"
                 )
-            except (json.JSONDecodeError, TypeError, ValueError) as exc:
-                last_reason = f"Submitter structured output invalid: {type(exc).__name__}"
-                if attempt < 4:
+                if _retryable_submitter_failure(completed.stderr) and attempt < 4:
                     continue
-                return _blocked((), last_reason, run_id)
-            if result.run_id != run_id:
-                return _blocked(result.items, "Submitter returned a different run_id", run_id)
-            return result
+                return _blocked(reconstructed.items, last_reason, run_id)
+            return reconstruct_qualification_result(store, run_id)
         return _blocked((), last_reason, run_id)
     except (
         OSError,
@@ -280,6 +203,7 @@ def verify_qualification(
     *,
     state_root: Path,
     identity: RuntimeIdentity,
+    harness: str = "claude",
     docker: DockerCLI | None = None,
 ) -> QualificationResult:
     """Fail closed unless the complete current-run evidence graph validates."""
@@ -340,11 +264,17 @@ def verify_qualification(
             if item.get("run_id") == result.run_id
             and item.get("role") == "submitter"
             and item.get("exit_code") == 0
+            # Evidence recorded before the field existed came from Claude Code.
+            and item.get("harness", "claude") == harness
         ]
         if len(submitter) != 1:
-            return _blocked(result.items, "current Submitter evidence is incomplete", result.run_id)
+            return _blocked(
+                result.items,
+                f"current {harness} Submitter evidence is incomplete",
+                result.run_id,
+            )
         for item in result.items:
-            failure = _verify_item(item, result.run_id, store, identity, all_harness)
+            failure = _verify_item(item, result.run_id, store, identity, all_harness, harness)
             if failure:
                 return _blocked(result.items, failure, result.run_id)
         leases = _active_leases(store)
@@ -379,11 +309,14 @@ def _verify_item(
     store: EventStore,
     identity: RuntimeIdentity,
     harness_records: list[dict[str, Any]],
+    harness: str,
 ) -> str | None:
     submitter_records = [
         value
         for value in harness_records
-        if value.get("role") == "submitter" and value.get("run_id") == run_id
+        if value.get("role") == "submitter"
+        and value.get("run_id") == run_id
+        and value.get("harness", "claude") == harness
     ]
     if (
         len(submitter_records) != 1
@@ -689,27 +622,7 @@ def _retryable_submitter_failure(stderr: str) -> bool:
     )
 
 
-def _stream_structured_output(stdout: str) -> dict[str, object]:
-    for line in reversed(stdout.splitlines()):
-        if not line.strip():
-            continue
-        envelope = json.loads(line)
-        if not isinstance(envelope, dict):
-            continue
-        value = envelope.get("structured_output")
-        if value is None and envelope.get("type") == "result":
-            value = envelope.get("result")
-        if isinstance(value, str):
-            try:
-                value = json.loads(value)
-            except json.JSONDecodeError:
-                continue
-        if isinstance(value, dict):
-            return value
-    raise ValueError("Claude stream has no structured qualification output")
-
-
-def _claude_version(executable: str, env: dict[str, str]) -> str:
+def _harness_version(executable: str, env: dict[str, str]) -> str:
     result = subprocess.run(
         [executable, "--version"],
         capture_output=True,
@@ -719,7 +632,7 @@ def _claude_version(executable: str, env: dict[str, str]) -> str:
         env=env,
     )
     if result.returncode != 0:
-        raise OSError("Claude Code version check returned nonzero")
+        raise OSError(f"{executable} version check returned nonzero")
     return result.stdout.strip()
 
 
