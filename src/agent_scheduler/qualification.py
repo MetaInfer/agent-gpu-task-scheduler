@@ -8,7 +8,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import httpx
 
@@ -727,3 +727,72 @@ def _blocked(items: tuple[QualificationItem, ...], reason: str, run_id: str) -> 
     return QualificationResult(
         run_id=run_id, status="BLOCKED_QUALIFICATION", items=items, reason=reason
     )
+
+
+_EXPECTED_CARD_COUNTS = (1, 2, 4, 8)
+
+
+def reconstruct_qualification_result(store: EventStore, run_id: str) -> QualificationResult:
+    """Derive the run's outcome from Ground Truth instead of asking the Agent.
+
+    The four harnesses differ most in structured-output support, and the result is
+    only a set of pointers that ``verify_qualification`` re-validates anyway. The
+    ``Qualification Run: <run_id>`` binding is already required by ``_verify_item``,
+    so reuse it as the discovery mechanism rather than adding an output contract
+    that the weakest CLI cannot honour.
+    """
+    marker = f"Qualification Run: {run_id}"
+    revision_to_proposal = {
+        str(value["revision_id"]): str(value["proposal_id"])
+        for value in store.iter_immutable("revisions")
+        if isinstance(value.get("markdown"), str)
+        and marker in value["markdown"]
+        and isinstance(value.get("revision_id"), str)
+        and isinstance(value.get("proposal_id"), str)
+    }
+    compiled = {
+        proposal_id
+        for proposal_id in set(revision_to_proposal.values())
+        if (snapshot := store.read_snapshot("proposals", proposal_id)) is not None
+        and snapshot.get("state") == "COMPILED"
+    }
+    items: list[QualificationItem] = []
+    for value in store.iter_immutable("tasks"):
+        task = strict_from_json_value(Task, value)
+        if task.proposal_id not in compiled or task.revision_id not in revision_to_proposal:
+            continue
+        if len(task.units) != 1:
+            continue
+        card_count = task.units[0].required_gpu_count
+        if card_count not in _EXPECTED_CARD_COUNTS:
+            continue
+        status = _latest_task_status(store, task.task_id)
+        items.append(
+            QualificationItem(
+                card_count=cast(Literal[1, 2, 4, 8], card_count),
+                proposal_id=task.proposal_id,
+                task_id=task.task_id,
+                state=status.state.value if status is not None else "UNKNOWN",
+            )
+        )
+    items.sort(key=lambda item: (item.card_count, item.task_id))
+    found = {item.card_count for item in items}
+    missing = [count for count in _EXPECTED_CARD_COUNTS if count not in found]
+    incomplete = [item.task_id for item in items if item.state != "COMPLETED"]
+    if missing:
+        return _blocked(
+            tuple(items),
+            f"run produced no COMPLETED Task for card counts {missing}",
+            run_id,
+        )
+    if incomplete:
+        return _blocked(
+            tuple(items), f"Tasks did not reach COMPLETED: {incomplete}", run_id
+        )
+    if len(items) != len(_EXPECTED_CARD_COUNTS):
+        return _blocked(
+            tuple(items),
+            f"run produced {len(items)} Tasks for {len(_EXPECTED_CARD_COUNTS)} card counts",
+            run_id,
+        )
+    return QualificationResult(run_id=run_id, status="COMPLETED", items=tuple(items))
