@@ -1,0 +1,151 @@
+"""Test fixture: launch each Agent harness as a Submitter.
+
+This is not a production abstraction. Submitter Agents are outside our control;
+this module exists only so the qualification run can prove the onboarding surface
+actually works from all four harnesses.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+from dataclasses import dataclass
+from pathlib import Path
+
+from agent_scheduler.adapters.onboarding import (
+    HARNESSES,
+    OnboardingError,
+    build_onboarding,
+    write_onboarding,
+)
+
+_EXECUTABLES = {"claude": "claude", "codex": "codex", "pi": "pi", "dsh": "dsh"}
+
+
+@dataclass(frozen=True)
+class SubmitterInvocation:
+    argv: tuple[str, ...]
+    env: dict[str, str]
+    prompt: str
+
+
+def submitter_executable(harness: str) -> str:
+    try:
+        return _EXECUTABLES[harness]
+    except KeyError as exc:
+        raise OnboardingError(f"unknown harness {harness!r}") from exc
+
+
+def build_submitter_invocation(
+    harness: str,
+    *,
+    output_dir: Path,
+    project_root: Path,
+    state_root: Path,
+    base_url: str,
+    username: str,
+    uv_path: Path,
+    tls_certificate: Path,
+    executable: str | None = None,
+    run_id: str,
+) -> SubmitterInvocation:
+    if harness not in HARNESSES:
+        raise OnboardingError(f"unknown harness {harness!r}; expected one of {list(HARNESSES)}")
+    onboarding = build_onboarding(
+        harness,
+        output_dir=output_dir,
+        project_root=project_root,
+        state_root=state_root,
+        base_url=base_url,
+        username=username,
+        uv_path=uv_path,
+    )
+    write_onboarding(onboarding)
+    if harness == "pi":
+        _seed_pi_agent_dir(output_dir)
+    binary = executable or submitter_executable(harness)
+    prompt = _prompt(project_root, run_id)
+    env = _base_environment(tls_certificate)
+    env.update(onboarding.env)
+    if harness == "claude":
+        argv = (
+            binary,
+            "--print",
+            "--no-session-persistence",
+            "--disable-slash-commands",
+            "--setting-sources",
+            "",
+            "--permission-mode",
+            "dontAsk",
+            *onboarding.argv,
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        )
+    elif harness == "codex":
+        argv = (
+            binary,
+            "exec",
+            "--json",
+            "--skip-git-repo-check",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-C",
+            str(project_root),
+            *onboarding.argv,
+        )
+    elif harness == "pi":
+        argv = (binary, "--print", "--mode", "json", *onboarding.argv)
+    else:
+        env["DSH_PERMISSION_MODE"] = "danger-full-access"
+        argv = (binary, "--profile", "headless", *onboarding.argv)
+    return SubmitterInvocation(argv=argv, env=env, prompt=prompt)
+
+
+def _prompt(project_root: Path, run_id: str) -> str:
+    """Fold the system prompt into the body; codex and dsh have no flag for it."""
+    system_prompt = (project_root / "prompts" / "submitter.md").read_text(encoding="utf-8")
+    return (
+        f"{system_prompt.strip()}\n\n"
+        f"qualification_run_id={run_id}\n"
+        "Run the four-task qualification: one Proposal each for 1, 2, 4, and 8 cards. "
+        f"Every Proposal you create MUST include the exact line `Qualification Run: {run_id}`. "
+        "Drive each Task to a terminal state before reporting."
+    )
+
+
+def _base_environment(tls_certificate: Path) -> dict[str, str]:
+    env = {
+        "HOME": os.environ.get("HOME", "/root"),
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "DISABLE_UPDATES": "1",
+        "SSL_CERT_FILE": str(tls_certificate),
+    }
+    for name in (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "DEEPSEEK_API_KEY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+    ):
+        value = os.environ.get(name)
+        if value:
+            env[name] = value
+    return env
+
+
+def _seed_pi_agent_dir(output_dir: Path) -> None:
+    """Copy credentials into the isolated agent dir.
+
+    pi resolves auth.json from PI_CODING_AGENT_DIR, so redirecting that variable for
+    per-run isolation would otherwise drop the provider credentials with it.
+    """
+    source = Path(os.environ.get("HOME", "/root")) / ".pi" / "agent"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("auth.json", "models-store.json"):
+        candidate = source / name
+        if candidate.is_file():
+            shutil.copy2(candidate, output_dir / name)
