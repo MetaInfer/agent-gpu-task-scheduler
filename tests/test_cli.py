@@ -2,7 +2,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from agent_scheduler.adapters.mcp import SubmitterMCPAdapter
+from agent_scheduler_client.mcp import SubmitterMCPAdapter
 from agent_scheduler.cli import main as cli_main
 from agent_scheduler.runtime import init_runtime
 

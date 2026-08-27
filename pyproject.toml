@@ -30,11 +30,15 @@ requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/agent_scheduler"]
+packages = [
+  "src/agent_scheduler",
+  "packages/client/src/agent_scheduler_client",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+pythonpath = ["src", "packages/client/src"]
 markers = [
   "real_claude: requires an explicitly provisioned Claude Code CLI",
   "real_gpu: requires Docker, hy-smi, and an authorized GPU profile",
@@ -49,4 +53,5 @@ line-length = 100
 [tool.mypy]
 python_version = "3.10"
 strict = true
-packages = ["agent_scheduler"]
+packages = ["agent_scheduler", "agent_scheduler_client"]
+mypy_path = ["src", "packages/client/src"]

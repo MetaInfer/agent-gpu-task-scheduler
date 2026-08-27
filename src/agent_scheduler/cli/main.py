@@ -10,9 +10,9 @@ from pathlib import Path
 
 import httpx
 import uvicorn
+from agent_scheduler_client.mcp import SubmitterMCPAdapter
 
 from agent_scheduler.adapters.harness import ClaudeCodeAdapter, FakeHarnessAdapter
-from agent_scheduler.adapters.mcp import SubmitterMCPAdapter
 from agent_scheduler.adapters.onboarding import HARNESSES
 from agent_scheduler.config import Settings
 from agent_scheduler.domain.models import new_id

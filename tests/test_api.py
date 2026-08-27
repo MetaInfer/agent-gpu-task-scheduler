@@ -5,7 +5,7 @@ import httpx
 import pytest
 from conftest import proposal_markdown
 
-from agent_scheduler.adapters.mcp import (
+from agent_scheduler_client.mcp import (
     MCPAdapterError,
     SubmitterMCPAdapter,
     _response_object,

@@ -11,6 +11,8 @@ from typing import Any, TextIO
 
 import httpx
 
+from agent_scheduler_client import __version__
+
 
 class MCPAdapterError(RuntimeError):
     pass
@@ -194,7 +196,7 @@ class SubmitterMCPAdapter:
                     result: dict[str, object] = {
                         "protocolVersion": protocol,
                         "capabilities": {"tools": {"listChanged": False}},
-                        "serverInfo": {"name": "agent-scheduler-submitter", "version": "0.2.0"},
+                        "serverInfo": {"name": "agent-scheduler-submitter", "version": __version__},
                     }
                 elif method == "tools/list":
                     result = {"tools": _TOOLS}
