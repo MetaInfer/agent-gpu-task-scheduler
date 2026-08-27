@@ -4,7 +4,11 @@ import json
 from pathlib import Path
 
 import pytest
-import tomllib
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 
 from agent_scheduler.adapters.onboarding import (
     CANONICAL_SKILL_DIR,
