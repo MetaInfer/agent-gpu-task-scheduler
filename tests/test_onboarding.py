@@ -150,11 +150,12 @@ def test_no_document_still_points_at_the_old_claude_only_filename():
     # necessarily quote the old filename while describing the rename).
     # `docs/superpowers/` holds historical SDD specs and plans: point-in-time records
     # of decisions as they were authored, not living docs expected to track renames.
-    excluded_prefixes = (".venv", ".superpowers", "docs/superpowers")
     stale = []
     for path in PROJECT_ROOT.glob("**/*.md"):
         relative = path.relative_to(PROJECT_ROOT)
-        if any(str(relative).startswith(prefix) for prefix in excluded_prefixes):
+        if relative.parts and relative.parts[0] in {".venv", ".superpowers"}:
+            continue
+        if relative.parts[:2] in {(".claude", "worktrees"), ("docs", "superpowers")}:
             continue
         if "submitting-from-a-claude-session" in path.read_text(encoding="utf-8"):
             stale.append(str(relative))
