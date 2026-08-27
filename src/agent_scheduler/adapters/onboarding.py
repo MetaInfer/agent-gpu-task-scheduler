@@ -6,24 +6,11 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from agent_scheduler_client.tools import SUBMITTER_TOOLS
+
 CANONICAL_SKILL_DIR = ".agents/skills/submit-gpu-task"
 
 HARNESSES = ("claude", "codex", "pi", "dsh")
-
-SUBMITTER_TOOLS = (
-    "create_proposal",
-    "reply",
-    "confirm_revision",
-    "get_reviews",
-    "resume",
-    "cancel",
-    "get_proposal",
-    "get_task",
-    "cancel_task",
-    "wait_for_task",
-    "wait_for_events",
-    "get_logs",
-)
 
 
 class OnboardingError(ValueError):
@@ -75,11 +62,11 @@ def build_onboarding(
     harness: str,
     *,
     output_dir: Path,
-    project_root: Path,
-    state_root: Path,
+    workspace: Path,
     base_url: str,
     username: str,
-    python_path: Path,
+    client_entrypoint: Path,
+    ca_file: Path,
 ) -> OnboardingConfig:
     """Describe how one harness is pointed at the Submitter MCP server.
 
@@ -89,20 +76,18 @@ def build_onboarding(
     if harness not in HARNESSES:
         raise OnboardingError(f"unknown harness {harness!r}; expected one of {list(HARNESSES)}")
     args = [
-        "-m",
-        "agent_scheduler.cli.main",
-        "mcp",
         "--base-url",
         base_url,
         "--username",
         username,
+        "--ca-file",
+        str(ca_file),
     ]
-    env = {"AGENT_SCHEDULER_STATE_ROOT": str(state_root)}
     server: dict[str, object] = {
-        "command": str(python_path),
+        "command": str(client_entrypoint),
         "args": args,
-        "cwd": str(project_root),
-        "env": env,
+        "cwd": str(workspace),
+        "directTools": list(SUBMITTER_TOOLS),
     }
     if harness == "claude":
         path = output_dir / "mcp.json"
@@ -114,10 +99,9 @@ def build_onboarding(
         )
     if harness == "pi":
         path = output_dir / "mcp.json"
-        promoted = {**server, "directTools": list(SUBMITTER_TOOLS)}
         return OnboardingConfig(
             harness=harness,
-            files={path: _mcp_json(promoted)},
+            files={path: _mcp_json(server)},
             argv=(),
             env={"PI_CODING_AGENT_DIR": str(output_dir)},
         )
@@ -127,23 +111,18 @@ def build_onboarding(
             files={},
             argv=(
                 "-c",
-                f"mcp_servers.submitter.command={python_path}",
+                f"mcp_servers.submitter.command={client_entrypoint}",
                 "-c",
                 f"mcp_servers.submitter.args={json.dumps(args)}",
                 "-c",
-                f'mcp_servers.submitter.cwd="{project_root}"',
-                "-c",
-                (
-                    "mcp_servers.submitter.env="
-                    f'{{AGENT_SCHEDULER_STATE_ROOT="{state_root}"}}'
-                ),
+                f'mcp_servers.submitter.cwd="{workspace}"',
             ),
             env={},
         )
     path = output_dir / "submitter-mcp.patch.yml"
     return OnboardingConfig(
         harness=harness,
-        files={path: _dsh_patch(server, project_root)},
+        files={path: _dsh_patch(server, workspace)},
         argv=("--patch", str(path)),
         env={},
     )
@@ -159,7 +138,7 @@ def _mcp_json(server: dict[str, object]) -> str:
     return json.dumps({"mcpServers": {"submitter": server}}, sort_keys=True, indent=2) + "\n"
 
 
-def _dsh_patch(server: dict[str, object], project_root: Path) -> str:
+def _dsh_patch(server: dict[str, object], workspace: Path) -> str:
     """Render a cordis patch overlay declaring the submitter MCP server and skill root.
 
     Verified against the real ``dsh-mcp-bridge`` package (its own
@@ -182,12 +161,7 @@ def _dsh_patch(server: dict[str, object], project_root: Path) -> str:
     """
     args = server["args"]
     assert isinstance(args, list)
-    env = server["env"]
-    assert isinstance(env, dict)
     rendered_args = ", ".join(_yaml_double_quoted(str(item)) for item in args)
-    rendered_env = "\n".join(
-        f"          {key}: {_yaml_double_quoted(str(value))}" for key, value in env.items()
-    )
     return (
         "# Generated per qualification run. Do not edit; regenerate instead.\n"
         "- insert:\n"
@@ -199,14 +173,12 @@ def _dsh_patch(server: dict[str, object], project_root: Path) -> str:
         f"        command: {_yaml_double_quoted(str(server['command']))}\n"
         f"        args: [{rendered_args}]\n"
         f"        cwd: {_yaml_double_quoted(str(server['cwd']))}\n"
-        "        env:\n"
-        f"{rendered_env}\n"
         "    - id: skill-filesystem-submitter\n"
         "      name: '@deepseek-ai/dsh-skill-filesystem'\n"
         "      config:\n"
         "        providerName: submitter\n"
         "        customSkillDirs:\n"
-        f"          - {_yaml_double_quoted(str(project_root / '.agents' / 'skills'))}\n"
+        f"          - {_yaml_double_quoted(str(workspace / '.agents' / 'skills'))}\n"
     )
 
 

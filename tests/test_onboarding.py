@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+import tomllib
 
 from agent_scheduler.adapters.onboarding import (
     CANONICAL_SKILL_DIR,
@@ -15,6 +16,29 @@ from agent_scheduler.adapters.onboarding import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+_SUBMITTER_TOOLS = {
+    "create_proposal",
+    "reply",
+    "confirm_revision",
+    "get_reviews",
+    "resume",
+    "cancel",
+    "get_proposal",
+    "get_task",
+    "cancel_task",
+    "wait_for_task",
+    "wait_for_events",
+    "get_logs",
+}
+
+_TEMPLATE_TOKENS = {
+    "@@CLIENT_ENTRYPOINT@@",
+    "@@MASTER_URL@@",
+    "@@USERNAME@@",
+    "@@CA_FILE@@",
+    "@@CLIENT_WORKSPACE@@",
+}
 
 
 def test_canonical_skill_has_valid_frontmatter():
@@ -42,11 +66,11 @@ def _build(harness: str, tmp_path: Path):
     return build_onboarding(
         harness,
         output_dir=tmp_path / "run",
-        project_root=PROJECT_ROOT,
-        state_root=Path("/public/share/agent-scheduler-mvp"),
-        base_url="https://127.0.0.1:8443",
-        username="zz_chentian",
-        python_path=Path("/usr/bin/python3"),
+        workspace=tmp_path / "workspace",
+        base_url="https://master.example:8443",
+        username="client_user-1",
+        client_entrypoint=Path("/opt/agent-client/venv/bin/agent-scheduler-submitter"),
+        ca_file=Path("/shared/state/tls/certificate.pem"),
     )
 
 
@@ -61,11 +85,11 @@ def test_every_harness_reaches_the_same_mcp_command(harness: str, tmp_path: Path
             "files": {path.name: content for path, content in config.files.items()},
         }
     )
-    assert "agent_scheduler.cli.main" in rendered
-    assert "/usr/bin/python3" in rendered
-    assert "https://127.0.0.1:8443" in rendered
-    assert "zz_chentian" in rendered
-    assert "/public/share/agent-scheduler-mvp" in rendered
+    assert "agent-scheduler-submitter" in rendered
+    assert "agent_scheduler.cli.main" not in rendered
+    assert "AGENT_SCHEDULER_STATE_ROOT" not in rendered
+    assert "/public/share/fh/agent-gpu-task-scheduler" not in rendered
+    assert "--ca-file" in rendered
 
 
 @pytest.mark.parametrize("harness", HARNESSES)
@@ -84,9 +108,18 @@ def test_claude_config_is_a_valid_strict_mcp_config(tmp_path: Path):
     index = config.argv.index("--mcp-config")
     written = Path(config.argv[index + 1])
     server = json.loads(written.read_text(encoding="utf-8"))["mcpServers"]["submitter"]
-    assert server["command"] == "/usr/bin/python3"
-    assert server["args"][:3] == ["-m", "agent_scheduler.cli.main", "mcp"]
-    assert server["env"]["AGENT_SCHEDULER_STATE_ROOT"] == "/public/share/agent-scheduler-mvp"
+    assert server["command"] == "/opt/agent-client/venv/bin/agent-scheduler-submitter"
+    assert server["args"] == [
+        "--base-url",
+        "https://master.example:8443",
+        "--username",
+        "client_user-1",
+        "--ca-file",
+        "/shared/state/tls/certificate.pem",
+    ]
+    assert server["cwd"] == str(tmp_path / "workspace")
+    assert set(server["directTools"]) == _SUBMITTER_TOOLS
+    assert "env" not in server
 
 
 def test_pi_reuses_the_same_mcp_json_shape_and_promotes_direct_tools(tmp_path: Path):
@@ -94,29 +127,75 @@ def test_pi_reuses_the_same_mcp_json_shape_and_promotes_direct_tools(tmp_path: P
     written = next(path for path in config.files if path.name == "mcp.json")
     server = json.loads(config.files[written])["mcpServers"]["submitter"]
     # Without directTools the 12 tools hide behind pi-mcp-adapter's proxy tool.
-    assert set(server["directTools"]) == {
-        "create_proposal",
-        "reply",
-        "confirm_revision",
-        "get_reviews",
-        "resume",
-        "cancel",
-        "get_proposal",
-        "get_task",
-        "cancel_task",
-        "wait_for_task",
-        "wait_for_events",
-        "get_logs",
-    }
+    assert set(server["directTools"]) == _SUBMITTER_TOOLS
     assert config.env["PI_CODING_AGENT_DIR"] == str(written.parent)
 
 
 def test_codex_config_is_passed_as_flags_and_writes_no_file(tmp_path: Path):
     config = _build("codex", tmp_path)
     assert config.files == {}
-    assert config.argv.count("-c") == 4
+    assert config.argv.count("-c") == 3
     joined = " ".join(config.argv)
-    assert "mcp_servers.submitter.command=/usr/bin/python3" in joined
+    assert (
+        "mcp_servers.submitter.command="
+        "/opt/agent-client/venv/bin/agent-scheduler-submitter" in joined
+    )
+
+
+def test_dsh_patch_uses_the_workspace_skill_root(tmp_path: Path):
+    config = _build("dsh", tmp_path)
+    patch = next(iter(config.files.values()))
+    assert f'          - "{tmp_path / "workspace"}/.agents/skills"' in patch
+    assert "        env:" not in patch
+
+
+def test_client_config_templates_use_only_documented_tokens():
+    paths = (
+        PROJECT_ROOT / "config" / "client" / "mcp.example.json",
+        PROJECT_ROOT / "config" / "client" / "codex-mcp.example.toml",
+        PROJECT_ROOT / "config" / "client" / "dsh-mcp.example.patch.yml",
+    )
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        found = {f"@@{value}@@" for value in text.split("@@")[1::2]}
+        assert found == _TEMPLATE_TOKENS
+        assert "agent_scheduler.cli.main" not in text
+        assert "AGENT_SCHEDULER_STATE_ROOT" not in text
+
+
+def test_json_and_toml_templates_parse_before_rendering():
+    json.loads(
+        (PROJECT_ROOT / "config" / "client" / "mcp.example.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    tomllib.loads(
+        (PROJECT_ROOT / "config" / "client" / "codex-mcp.example.toml").read_text(
+            encoding="utf-8"
+        )
+    )
+
+
+def test_dsh_template_uses_the_real_plugin_directive_shape():
+    lines = (
+        PROJECT_ROOT / "config" / "client" / "dsh-mcp.example.patch.yml"
+    ).read_text(encoding="utf-8").splitlines()
+    expected_lines = (
+        "- insert:",
+        "    - id: mcp-submitter",
+        "      name: '@deepseek-ai/dsh-mcp-client'",
+        "        serverName: submitter",
+        "        transport: stdio",
+        '        command: "@@CLIENT_ENTRYPOINT@@"',
+        '        cwd: "@@CLIENT_WORKSPACE@@"',
+        "    - id: skill-filesystem-submitter",
+        "      name: '@deepseek-ai/dsh-skill-filesystem'",
+        "        providerName: submitter",
+        "        customSkillDirs:",
+        '          - "@@CLIENT_WORKSPACE@@/.agents/skills"',
+    )
+    for line in expected_lines:
+        assert line in lines
 
 
 def test_unknown_harness_is_rejected(tmp_path: Path):

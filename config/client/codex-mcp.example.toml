@@ -1,0 +1,11 @@
+[mcp_servers.submitter]
+command = "@@CLIENT_ENTRYPOINT@@"
+args = [
+  "--base-url",
+  "@@MASTER_URL@@",
+  "--username",
+  "@@USERNAME@@",
+  "--ca-file",
+  "@@CA_FILE@@",
+]
+cwd = "@@CLIENT_WORKSPACE@@"

@@ -1,0 +1,15 @@
+- insert:
+    - id: mcp-submitter
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: submitter
+        transport: stdio
+        command: "@@CLIENT_ENTRYPOINT@@"
+        args: ["--base-url", "@@MASTER_URL@@", "--username", "@@USERNAME@@", "--ca-file", "@@CA_FILE@@"]
+        cwd: "@@CLIENT_WORKSPACE@@"
+    - id: skill-filesystem-submitter
+      name: '@deepseek-ai/dsh-skill-filesystem'
+      config:
+        providerName: submitter
+        customSkillDirs:
+          - "@@CLIENT_WORKSPACE@@/.agents/skills"
