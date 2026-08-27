@@ -393,9 +393,9 @@ Admin不得直接绕过状态机编辑 NFS。每个变更写 actor、reason、re
 
 以下必须全部通过：
 
-- `uv run pytest`；
-- `uv run ruff check .`；
-- `uv run mypy src`；
+- `python3 -m pytest`；
+- `python3 -m ruff check .`；
+- `python3 -m mypy src`；
 - 严格 Schema拒绝 unknown字段/版本/enum；
 - RFC 8785/Ed25519外部 golden vector；
 - 相同冻结输入逐字节确定性；

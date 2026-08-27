@@ -36,8 +36,8 @@ export AGENT_SCHEDULER_HARNESS_MODE=claude
 export AGENT_SCHEDULER_WORKER_MODE=remote
 export ANTHROPIC_AUTH_TOKEN=...        # 或 ANTHROPIC_API_KEY
 
-uv run agent-scheduler serve     # 终端 1
-uv run agent-scheduler worker    # 终端 2
+python3 -m agent_scheduler.cli.main serve     # 终端 1
+python3 -m agent_scheduler.cli.main worker    # 终端 2
 ```
 
 确认：
@@ -63,7 +63,7 @@ Docker、产物校验）全是真的。
 四家最终都指向同一条命令，服务端没有任何 harness 专属分支：
 
 ```
-uv run agent-scheduler mcp --base-url https://127.0.0.1:8443 --username zz_chentian
+python3 -m agent_scheduler.cli.main mcp --base-url https://127.0.0.1:8443 --username zz_chentian
 ```
 
 `AGENT_SCHEDULER_STATE_ROOT` 必须与 Master 一致——Adapter 用
@@ -71,14 +71,15 @@ uv run agent-scheduler mcp --base-url https://127.0.0.1:8443 --username zz_chent
 下面每节的配置内容都以 `build_onboarding()` 的真实输出为准，可以自己核对：
 
 ```bash
-uv run python -c "
+python3 -c "
+import sys
 from pathlib import Path
 from agent_scheduler.adapters.onboarding import build_onboarding
 config = build_onboarding('claude', output_dir=Path('/tmp/demo'),
     project_root=Path('/public/share/fh/agent-gpu-task-scheduler'),
     state_root=Path('/public/share/agent-scheduler-mvp'),
     base_url='https://127.0.0.1:8443', username='zz_chentian',
-    uv_path=Path('/usr/local/bin/uv'))
+    python_path=Path(sys.executable).resolve())
 print(config.argv, config.files)
 "
 ```
@@ -97,7 +98,7 @@ cd /public/share/fh/agent-gpu-task-scheduler
 claude mcp add submitter \
   --scope project \
   --env AGENT_SCHEDULER_STATE_ROOT=/public/share/agent-scheduler-mvp \
-  -- uv run agent-scheduler mcp \
+  -- python3 -m agent_scheduler.cli.main mcp \
        --base-url https://127.0.0.1:8443 \
        --username zz_chentian
 ```
@@ -147,13 +148,13 @@ Codex 用 `-c` 覆盖而非 `codex mcp add`，因为后者会把配置写进
 
 ```bash
 codex exec \
-  -c mcp_servers.submitter.command=/usr/local/bin/uv \
-  -c 'mcp_servers.submitter.args=["run", "agent-scheduler", "mcp", "--base-url", "https://127.0.0.1:8443", "--username", "zz_chentian"]' \
+  -c mcp_servers.submitter.command=/usr/bin/python3 \
+  -c 'mcp_servers.submitter.args=["-m", "agent_scheduler.cli.main", "mcp", "--base-url", "https://127.0.0.1:8443", "--username", "zz_chentian"]' \
   -c 'mcp_servers.submitter.cwd="/public/share/fh/agent-gpu-task-scheduler"' \
   -c 'mcp_servers.submitter.env={AGENT_SCHEDULER_STATE_ROOT="/public/share/agent-scheduler-mvp"}'
 ```
 
-把 `/usr/local/bin/uv` 换成你自己 `uv` 的绝对路径（`command -v uv`）——codex 子进程不一定
+把 `/usr/bin/python3` 换成你自己 `python3` 的绝对路径（`command -v python3`）——codex 子进程不一定
 继承你交互 shell 的 PATH，写绝对路径最保险。四个 `-c` 缺一不可：少了任何一个，
 `mcp_servers.submitter` 要么拿不到可执行文件，要么找不到 state root 对应的证书。
 
@@ -175,8 +176,8 @@ pi install npm:pi-mcp-adapter
 {
   "mcpServers": {
     "submitter": {
-      "command": "/usr/local/bin/uv",
-      "args": ["run", "agent-scheduler", "mcp",
+      "command": "/usr/bin/python3",
+      "args": ["-m", "agent_scheduler.cli.main", "mcp",
                 "--base-url", "https://127.0.0.1:8443",
                 "--username", "zz_chentian"],
       "cwd": "/public/share/fh/agent-gpu-task-scheduler",
@@ -194,10 +195,14 @@ pi install npm:pi-mcp-adapter
 把这份内容写进仓库根的 `.mcp.json`（Claude ​Code 会忽略它不认识的 `directTools` 字段，
 两家可以共用一份文件）。
 
-pi 默认 provider 是 `google`，如果你的凭据不是这一家，必须显式指定，否则会话直接拒绝启动：
+pi 本身可能有默认 provider，但本项目的 T2/T3 fixture 不依赖这个隐藏默认值：
+`AGENT_SCHEDULER_PI_PROVIDER` 和 `AGENT_SCHEDULER_PI_MODEL` 都是必填，缺任意一个或两个都没设
+都会在启动前得到 `OnboardingError`。fixture 会把它们转换成显式 argv：
 
 ```bash
-pi --provider <your-provider> --model <your-model>
+export AGENT_SCHEDULER_PI_PROVIDER=<your-provider>
+export AGENT_SCHEDULER_PI_MODEL=<your-model>
+pi --provider "$AGENT_SCHEDULER_PI_PROVIDER" --model "$AGENT_SCHEDULER_PI_MODEL"
 ```
 
 ### dsh
@@ -219,8 +224,8 @@ dsh plugin --profile headless add dsh-mcp-bridge
       config:
         serverName: submitter
         transport: stdio
-        command: "/usr/local/bin/uv"
-        args: ["run", "agent-scheduler", "mcp", "--base-url", "https://127.0.0.1:8443", "--username", "zz_chentian"]
+        command: "/usr/bin/python3"
+        args: ["-m", "agent_scheduler.cli.main", "mcp", "--base-url", "https://127.0.0.1:8443", "--username", "zz_chentian"]
         cwd: "/public/share/fh/agent-gpu-task-scheduler"
         env:
           AGENT_SCHEDULER_STATE_ROOT: "/public/share/agent-scheduler-mvp"
@@ -337,7 +342,7 @@ export AGENT_SCHEDULER_STATE_ROOT=/public/share/agent-scheduler-mvp
 printf '%s\n%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
-| uv run agent-scheduler mcp --base-url https://127.0.0.1:8443 --username zz_chentian
+| python3 -m agent_scheduler.cli.main mcp --base-url https://127.0.0.1:8443 --username zz_chentian
 ```
 
 能列出 12 个工具就说明 Adapter、TLS、控制面这条链是通的，问题只可能在 Agent 侧配置。
@@ -364,10 +369,10 @@ printf '%s\n%s\n' \
 MCP Adapter 进程只读取 `<state-root>/tls/certificate.pem`（非机密材料，用于验证 Master 的
 TLS），**从不读取 Worker API Key 或 Ed25519 私钥**。这意味着它不需要 root——只要运行它的
 OS 账号是 state-root 属组的成员就够了，这也正好吻合最初的设计：Submitter 本就该是低权限的
-`zz_chentian`，而不是 root。这一条对四家 Agent 一视同仁：谁来跑 `agent-scheduler mcp` 都是
+`zz_chentian`，而不是 root。这一条对四家 Agent 一视同仁：谁来跑 `python3 -m agent_scheduler.cli.main mcp` 都是
 同一个低权限进程，权限模型不因换了哪家 Agent 而改变。
 
-在验证用的主机上，`uv` 托管的 Python 解释器安装在 `/root` 下，而 `/root` 本身对非 root 账号
+在验证用的主机上，Python 解释器安装在 `/root` 下，而 `/root` 本身对非 root 账号
 不可遍历——这是该主机的一个独立限制，与本节描述的权限修复无关。如果你的部署里解释器不在
 `/root` 下，这条限制不适用。
 

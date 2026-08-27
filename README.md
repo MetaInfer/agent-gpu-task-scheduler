@@ -11,7 +11,7 @@
 - 真实任务使用版本化 launcher和 SHA-256，分别完成1、2、4、8卡 ROCm all-reduce与GEMM数值校验。
 - NFS Ground Truth默认位于 `/public/share/agent-scheduler-mvp`。
 
-**代码与 Fake 门禁通过不代表真实资格完成。** 只有 `agent-scheduler qualify` 验证完整证据包后才能宣称 Goal完成；外部前置不足时结果为 `BLOCKED_QUALIFICATION`。
+**代码与 Fake 门禁通过不代表真实资格完成。** 只有 `python3 -m agent_scheduler.cli.main qualify` 验证完整证据包后才能宣称 Goal完成；外部前置不足时结果为 `BLOCKED_QUALIFICATION`。
 
 ## 文档
 
@@ -24,10 +24,10 @@
 ## 本地门禁
 
 ```bash
-uv sync --extra test
-uv run pytest
-uv run ruff check .
-uv run mypy src
+python3 -m pip install -e '.[test]'
+python3 -m pytest
+python3 -m ruff check .
+python3 -m mypy src
 ```
 
 真实测试必须显式 opt-in，分三层，成本依次上升：
@@ -36,14 +36,14 @@ uv run mypy src
 # T1：先确认 shell 没有 RUN_REAL_*；严格零成本命令见 docs/testing-the-submitter.md
 
 # T2：单个 Agent 真实连通性检查——建一个 Proposal 就停，不跑 GPU
-RUN_REAL_CLAUDE=1 uv run pytest tests/test_real_onboarding.py -m real_claude
-RUN_REAL_CODEX=1  uv run pytest tests/test_real_onboarding.py -m real_codex
-RUN_REAL_PI=1     uv run pytest tests/test_real_onboarding.py -m real_pi
-RUN_REAL_DSH=1    uv run pytest tests/test_real_onboarding.py -m real_dsh
+RUN_REAL_CLAUDE=1 python3 -m pytest tests/test_real_onboarding.py -m real_claude
+RUN_REAL_CODEX=1  python3 -m pytest tests/test_real_onboarding.py -m real_codex
+RUN_REAL_PI=1     python3 -m pytest tests/test_real_onboarding.py -m real_pi
+RUN_REAL_DSH=1    python3 -m pytest tests/test_real_onboarding.py -m real_dsh
 
 # T3：单个 Agent 完整 1/2/4/8 卡资格闭环——真实 GPU，复用容器严格串行，一次只跑一个
 RUN_REAL_GPU=1 RUN_FULL_QUALIFICATION=1 RUN_REAL_CLAUDE=1 \
-  uv run pytest tests/test_real_qualification.py -m 'real_claude and real_gpu'
+  python3 -m pytest tests/test_real_qualification.py -m 'real_claude and real_gpu'
 ```
 
 T2 需要 Master 已用 `AGENT_SCHEDULER_HARNESS_MODE=fake` 启动（见下）；T3 需要
@@ -56,7 +56,7 @@ Submitter harness 无关）且 Worker 已连接。四个 harness 的一次性安
 一次性创建 Worker Key、Ed25519 keypair和 loopback TLS证书：
 
 ```bash
-uv run agent-scheduler init-runtime \
+python3 -m agent_scheduler.cli.main init-runtime \
   --state-root /public/share/agent-scheduler-mvp
 ```
 
@@ -76,21 +76,21 @@ export AGENT_SCHEDULER_WORKER_MODE=remote
 终端 1：loopback HTTPS/WSS Master。
 
 ```bash
-uv run agent-scheduler serve
+python3 -m agent_scheduler.cli.main serve
 ```
 
 终端 2：root Worker，主动建立 WSS并每10秒上报真实 `hy-smi`。
 
 ```bash
-uv run agent-scheduler worker
+python3 -m agent_scheduler.cli.main worker
 ```
 
 终端 3：真实 Submitter 通过本地 MCP Adapter 一次提交四个 Proposal，并验证持久证据。
 默认是 Claude ​Code；`--harness` 可选 `codex`/`pi`/`dsh`，四者殊途同归到同一条
-`agent-scheduler mcp` 命令，Processor/Reviewer 始终跑 Claude，与 `--harness` 无关：
+`python3 -m agent_scheduler.cli.main mcp` 命令，Processor/Reviewer 始终跑 Claude，与 `--harness` 无关：
 
 ```bash
-uv run agent-scheduler qualify [--harness claude|codex|pi|dsh]
+python3 -m agent_scheduler.cli.main qualify [--harness claude|codex|pi|dsh]
 ```
 
 浏览器观察页为 `https://127.0.0.1:8443/`。开发证书是自签名 loopback证书；远程访问使用 SSH tunnel。
@@ -98,11 +98,11 @@ uv run agent-scheduler qualify [--harness claude|codex|pi|dsh]
 ## Admin
 
 ```bash
-uv run agent-scheduler tick --actor admin --reason 'manual scheduler pass'
-uv run agent-scheduler drain --actor admin --reason maintenance
-uv run agent-scheduler compile-retry --proposal-id PROP --actor admin --reason fixed-validator
-uv run agent-scheduler reconcile --execution-id EXEC --actor admin --reason verified-stopped
-uv run agent-scheduler reload-users --users zz_chentian --actor admin --reason policy-update
+python3 -m agent_scheduler.cli.main tick --actor admin --reason 'manual scheduler pass'
+python3 -m agent_scheduler.cli.main drain --actor admin --reason maintenance
+python3 -m agent_scheduler.cli.main compile-retry --proposal-id PROP --actor admin --reason fixed-validator
+python3 -m agent_scheduler.cli.main reconcile --execution-id EXEC --actor admin --reason verified-stopped
+python3 -m agent_scheduler.cli.main reload-users --users zz_chentian --actor admin --reason policy-update
 ```
 
 所有状态变更走 loopback管理面并写审计；没有单 GPU强制释放命令。
@@ -112,5 +112,5 @@ uv run agent-scheduler reload-users --users zz_chentian --actor admin --reason p
 MVP 不实现真实认证、多租户隔离、镜像 pull、动态依赖安装、业务自动重试、数据库、HA、崩溃自动恢复、真实多 Worker/gang或性能 SLO。Master/Worker/root容器属于可信管理域；目标 Submitter OS身份是 `zz_chentian`，0.2.0 首版资格允许 root Claude Code。
 
 非 root 的 Submitter 账号能读取 loopback TLS 证书（见 `docs/usage.md` §3），但如果部署主机
-把 `uv`/Python 解释器装在只有 root 能进的目录下（例如 `/root`），命令本身仍会失败——这是
+把 Python 解释器装在只有 root 能进的目录下（例如 `/root`），命令本身仍会失败——这是
 主机配置问题，不是本项目代码的权限模型问题，需要单独把解释器装到 Submitter 账号可达的路径。

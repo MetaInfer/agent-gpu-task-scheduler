@@ -79,7 +79,7 @@ def build_onboarding(
     state_root: Path,
     base_url: str,
     username: str,
-    uv_path: Path,
+    python_path: Path,
 ) -> OnboardingConfig:
     """Describe how one harness is pointed at the Submitter MCP server.
 
@@ -89,8 +89,8 @@ def build_onboarding(
     if harness not in HARNESSES:
         raise OnboardingError(f"unknown harness {harness!r}; expected one of {list(HARNESSES)}")
     args = [
-        "run",
-        "agent-scheduler",
+        "-m",
+        "agent_scheduler.cli.main",
         "mcp",
         "--base-url",
         base_url,
@@ -99,7 +99,7 @@ def build_onboarding(
     ]
     env = {"AGENT_SCHEDULER_STATE_ROOT": str(state_root)}
     server: dict[str, object] = {
-        "command": str(uv_path),
+        "command": str(python_path),
         "args": args,
         "cwd": str(project_root),
         "env": env,
@@ -127,7 +127,7 @@ def build_onboarding(
             files={},
             argv=(
                 "-c",
-                f"mcp_servers.submitter.command={uv_path}",
+                f"mcp_servers.submitter.command={python_path}",
                 "-c",
                 f"mcp_servers.submitter.args={json.dumps(args)}",
                 "-c",

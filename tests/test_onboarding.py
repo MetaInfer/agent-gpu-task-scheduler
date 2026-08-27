@@ -46,7 +46,7 @@ def _build(harness: str, tmp_path: Path):
         state_root=Path("/public/share/agent-scheduler-mvp"),
         base_url="https://127.0.0.1:8443",
         username="zz_chentian",
-        uv_path=Path("/usr/local/bin/uv"),
+        python_path=Path("/usr/bin/python3"),
     )
 
 
@@ -61,8 +61,8 @@ def test_every_harness_reaches_the_same_mcp_command(harness: str, tmp_path: Path
             "files": {path.name: content for path, content in config.files.items()},
         }
     )
-    assert "agent-scheduler" in rendered
-    assert "/usr/local/bin/uv" in rendered
+    assert "agent_scheduler.cli.main" in rendered
+    assert "/usr/bin/python3" in rendered
     assert "https://127.0.0.1:8443" in rendered
     assert "zz_chentian" in rendered
     assert "/public/share/agent-scheduler-mvp" in rendered
@@ -84,8 +84,8 @@ def test_claude_config_is_a_valid_strict_mcp_config(tmp_path: Path):
     index = config.argv.index("--mcp-config")
     written = Path(config.argv[index + 1])
     server = json.loads(written.read_text(encoding="utf-8"))["mcpServers"]["submitter"]
-    assert server["command"] == "/usr/local/bin/uv"
-    assert server["args"][:3] == ["run", "agent-scheduler", "mcp"]
+    assert server["command"] == "/usr/bin/python3"
+    assert server["args"][:3] == ["-m", "agent_scheduler.cli.main", "mcp"]
     assert server["env"]["AGENT_SCHEDULER_STATE_ROOT"] == "/public/share/agent-scheduler-mvp"
 
 
@@ -116,12 +116,22 @@ def test_codex_config_is_passed_as_flags_and_writes_no_file(tmp_path: Path):
     assert config.files == {}
     assert config.argv.count("-c") == 4
     joined = " ".join(config.argv)
-    assert "mcp_servers.submitter.command=/usr/local/bin/uv" in joined
+    assert "mcp_servers.submitter.command=/usr/bin/python3" in joined
 
 
 def test_unknown_harness_is_rejected(tmp_path: Path):
     with pytest.raises(OnboardingError):
         _build("gemini", tmp_path)
+
+
+def test_example_mcp_config_uses_the_python_module_entrypoint():
+    config = json.loads(
+        (PROJECT_ROOT / "config" / "submitter-mcp.example.json").read_text(encoding="utf-8")
+    )
+    server = config["mcpServers"]["submitter"]
+
+    assert server["command"] == "python3"
+    assert server["args"][:3] == ["-m", "agent_scheduler.cli.main", "mcp"]
 
 
 def test_onboarding_doc_covers_every_harness():

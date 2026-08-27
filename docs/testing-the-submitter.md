@@ -20,12 +20,12 @@
 # 显式清除历史 shell 里可能残留的 opt-in，再用 marker 双重排除所有真实测试。
 env -u RUN_REAL_CLAUDE -u RUN_REAL_CODEX -u RUN_REAL_PI -u RUN_REAL_DSH \
     -u RUN_REAL_GPU -u RUN_FULL_QUALIFICATION \
-  uv run pytest \
+  python3 -m pytest \
   -m 'not real_claude and not real_codex and not real_pi and not real_dsh and not real_gpu'
-uv run ruff check . && uv run mypy src
+python3 -m ruff check . && python3 -m mypy src
 ```
 
-不要把裸 `uv run pytest` 当成永远零成本：真实测试靠环境变量 opt-in；如果当前 shell 残留
+不要把裸 `python3 -m pytest` 当成永远零成本：真实测试靠环境变量 opt-in；如果当前 shell 残留
 `RUN_REAL_*`，默认收集也可能启动计费调用。上面的命令同时清环境变量和排 marker，才是
 可靠的 T1。
 
@@ -41,12 +41,14 @@ export AGENT_SCHEDULER_STATE_ROOT=/public/share/agent-scheduler-mvp
 export AGENT_SCHEDULER_PROFILE=qualification
 export AGENT_SCHEDULER_HARNESS_MODE=fake
 export AGENT_SCHEDULER_WORKER_MODE=remote
-uv run agent-scheduler serve
+python3 -m agent_scheduler.cli.main serve
 ```
 
 T2 使用独立的 `submitter-connectivity.md` prompt，只允许调用一次 `create_proposal`；不会确认修订、
-编译 Task 或调度 GPU，因此 **Worker 不需要启动**。测试从 Ground Truth 验证三件事：恰好一个
-带当前 run marker 的 Proposal、其状态仍是 `AWAITING_CONFIRMATION`、没有任何绑定 Task。
+编译 Task 或调度 GPU，因此 **Worker 不需要启动**。测试在调用前后分别快照全部 Proposal/Task ID，
+然后从 Ground Truth 验证：Proposal 全量差集恰好一个、Task 全量差集为空、新 Proposal 带当前
+run marker 且仍是 `AWAITING_CONFIRMATION`，其当前 Facts 的 `required_gpu_count` 恰好为 1。
+用全量差集而不只按 marker 搜索，能抓住 Agent 偷建的无 marker 额外 Proposal/Task。
 `curl -sk https://127.0.0.1:8443/health` 能返回成功即可；`workers` 可以是 `0`。
 
 ### T3 前置：Master 用 claude harness 起
@@ -60,12 +62,18 @@ export AGENT_SCHEDULER_STATE_ROOT=/public/share/agent-scheduler-mvp
 export AGENT_SCHEDULER_PROFILE=qualification
 export AGENT_SCHEDULER_HARNESS_MODE=claude
 export AGENT_SCHEDULER_WORKER_MODE=remote
-uv run agent-scheduler serve     # 终端 1，root
-uv run agent-scheduler worker    # 终端 2，root
+python3 -m agent_scheduler.cli.main serve     # 终端 1，root
+python3 -m agent_scheduler.cli.main worker    # 终端 2，root
 ```
 
 确认 `curl -sk https://127.0.0.1:8443/health` 的 `workers` 为 `1`、`integrity` 为 `valid`
 后再进行 T3。
+
+每次 T3 只有**一次** Submitter 子进程调用和一份对应 audit，驱动层不自动重试。即使 stderr
+看起来像限流、临时不可用或 timeout，也不会再启动第二个付费 Agent，更不会重复创建 GPU 工作。
+超时会先落 audit 再返回 `BLOCKED_QUALIFICATION`；非零退出会从 Ground Truth 重建已产生的
+items 供诊断，但即使证据图看起来完整也仍然是 `BLOCKED_QUALIFICATION`。是否重跑由人工根据
+本轮 audit 和 Ground Truth 决定，不由 fixture 猜测。
 
 ### 已知的跨 harness 限制
 
@@ -73,7 +81,7 @@ uv run agent-scheduler worker    # 终端 2，root
 自身环境里是否有 `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`——这条检查是 Master 的
 Processor/Reviewer 需要真实 Claude 凭据留下的，与 `--harness` 无关，**目前对全部四个
 harness 一视同仁**。也就是说：即便 `--harness codex` 时 Submitter 本身用的是
-`OPENAI_API_KEY`，运行 `agent-scheduler qualify --harness codex` 的终端仍然需要设好
+`OPENAI_API_KEY`，运行 `python3 -m agent_scheduler.cli.main qualify --harness codex` 的终端仍然需要设好
 Anthropic 凭据，否则会在还没读 `--harness` 之前就返回
 `BLOCKED_QUALIFICATION`，理由写着"required for real Claude roles"——这个理由在
 非 claude harness 下依然准确（Master 那头真的需要），只是措辞容易让人误以为是
@@ -81,6 +89,13 @@ Submitter 自己需要。同样，`tests/test_real_qualification.py` 里驱动 T
 `load_runtime()`，这个函数需要读 `secrets/`（root-only，`0600`）——跑 T3 目前仍需要
 能读到这些身份文件的账号，与本项目其余部分「Submitter 应该是非 root 的 `zz_chentian`」
 的方向不完全一致，是已知的、尚未收敛的差距。
+
+父进程可能同时持有 Master 内部 Claude 角色和被测 Submitter 的多家凭据，但 fixture 不把它们
+整包转交给子进程：Claude ​Code 只收到 `ANTHROPIC_*`，Codex CLI 只收到 `OPENAI_*`，dsh
+只收到 `DEEPSEEK_API_KEY`；pi 只收到 `AGENT_SCHEDULER_PI_PROVIDER` 明确选择的
+`anthropic`/`openai`/`deepseek` 对应凭据族。`HOME`、`PATH`、`DISABLE_UPDATES`、
+`SSL_CERT_FILE` 和代理变量是四家共用的最小运行环境。两个 `AGENT_SCHEDULER_PI_*` 选择器只由
+父进程消费并转换成 argv，不转发给子进程，构建 invocation 也不会修改父进程环境。
 
 ## Claude ​Code
 
@@ -96,14 +111,14 @@ claude --print --no-session-persistence --setting-sources "" "Only reply: OK"
 **T2：**
 
 ```bash
-RUN_REAL_CLAUDE=1 uv run pytest tests/test_real_onboarding.py -m real_claude -v
+RUN_REAL_CLAUDE=1 python3 -m pytest tests/test_real_onboarding.py -m real_claude -v
 ```
 
 **T3：**
 
 ```bash
 RUN_REAL_GPU=1 RUN_FULL_QUALIFICATION=1 RUN_REAL_CLAUDE=1 \
-  uv run pytest \
+  python3 -m pytest \
   'tests/test_real_qualification.py::test_complete_real_qualification[claude-RUN_REAL_CLAUDE]' \
   -v
 ```
@@ -112,8 +127,10 @@ RUN_REAL_GPU=1 RUN_FULL_QUALIFICATION=1 RUN_REAL_CLAUDE=1 \
 `COMPLETED` 的真实证据，可以直接对照那次的产物结构。
 
 **已知点：** 非交互调用用 `--print --no-session-persistence --disable-slash-commands
---setting-sources "" --permission-mode dontAsk`，不需要任何危险 bypass flag——Claude ​Code
-的 `dontAsk` 权限模式本身就是为非交互场景设计的。
+--setting-sources "" --permission-mode dontAsk --tools ""`，并用一个 `--allowedTools` 参数精确
+放行 `SUBMITTER_TOOLS` 定义的 12 个 `mcp__submitter__<tool>` 名称；没有 shell、文件或其他 MCP
+工具。它不需要危险 bypass flag——Claude ​Code 的 `dontAsk` 权限模式本身就是为非交互场景
+设计的。
 
 ## Codex CLI
 
@@ -135,14 +152,14 @@ codex exec --json "Only reply: OK"
 **T2：**
 
 ```bash
-RUN_REAL_CODEX=1 uv run pytest tests/test_real_onboarding.py -m real_codex -v
+RUN_REAL_CODEX=1 python3 -m pytest tests/test_real_onboarding.py -m real_codex -v
 ```
 
 **T3：**
 
 ```bash
 RUN_REAL_GPU=1 RUN_FULL_QUALIFICATION=1 RUN_REAL_CODEX=1 \
-  uv run pytest \
+  python3 -m pytest \
   'tests/test_real_qualification.py::test_complete_real_qualification[codex-RUN_REAL_CODEX]' \
   -v
 ```
@@ -166,7 +183,7 @@ pi install npm:pi-mcp-adapter
 
 **凭据与模型：** pi 默认 provider 是 `google`；T2/T3 不能依赖这个隐藏默认值。本项目读取
 `AGENT_SCHEDULER_PI_PROVIDER` 和 `AGENT_SCHEDULER_PI_MODEL`，并在自动 invocation 中转换成
-pi 的 `--provider`/`--model` 参数。两者必须同时设置：
+pi 的 `--provider`/`--model` 参数。两者都是必填，不能依赖 pi 默认值：
 
 ```bash
 pi --list-models anthropic
@@ -176,20 +193,20 @@ pi --provider "$AGENT_SCHEDULER_PI_PROVIDER" --model "$AGENT_SCHEDULER_PI_MODEL"
   --print --no-session "Only reply: OK"
 ```
 
-把占位符替换成 `--list-models` 实际列出的完整模型 ID。只设 provider 或只设 model 时，
-测试夹具会在启动 pi 前直接报 `OnboardingError`，不会悄悄回退到默认 provider。
+把占位符替换成 `--list-models` 实际列出的完整模型 ID。缺任意一个、或两个都没设时，
+测试夹具都会在启动 pi 前直接报 `OnboardingError`，不会悄悄回退到默认 provider。
 
 **T2：**
 
 ```bash
-RUN_REAL_PI=1 uv run pytest tests/test_real_onboarding.py -m real_pi -v
+RUN_REAL_PI=1 python3 -m pytest tests/test_real_onboarding.py -m real_pi -v
 ```
 
 **T3：**
 
 ```bash
 RUN_REAL_GPU=1 RUN_FULL_QUALIFICATION=1 RUN_REAL_PI=1 \
-  uv run pytest \
+  python3 -m pytest \
   'tests/test_real_qualification.py::test_complete_real_qualification[pi-RUN_REAL_PI]' \
   -v
 ```
@@ -227,14 +244,14 @@ dsh --profile headless "Only reply: OK"
 **T2：**
 
 ```bash
-RUN_REAL_DSH=1 uv run pytest tests/test_real_onboarding.py -m real_dsh -v
+RUN_REAL_DSH=1 python3 -m pytest tests/test_real_onboarding.py -m real_dsh -v
 ```
 
 **T3：**
 
 ```bash
 RUN_REAL_GPU=1 RUN_FULL_QUALIFICATION=1 RUN_REAL_DSH=1 \
-  uv run pytest \
+  python3 -m pytest \
   'tests/test_real_qualification.py::test_complete_real_qualification[dsh-RUN_REAL_DSH]' \
   -v
 ```
@@ -244,6 +261,8 @@ RUN_REAL_GPU=1 RUN_FULL_QUALIFICATION=1 RUN_REAL_DSH=1 \
 返回。本项目生成的调用会显式设置 `DSH_PERMISSION_MODE=danger-full-access`
 （`src/agent_scheduler/adapters/submitter.py` 里 `else:` 分支，即 dsh 分支），把
 `approval` 变成 `never`，只影响这一次 dsh 调用的环境变量，不改 `$DSH_HOME` 下任何持久配置。
+另外，dsh headless 不读取 stdin；它把最后一个位置参数解析为 task，所以 fixture 会把完整 prompt
+放在 `dsh --profile headless --patch <file> <prompt>` 的最后，而不是只写进子进程 stdin。
 
 ## 排障顺序
 
@@ -254,8 +273,8 @@ RUN_REAL_GPU=1 RUN_FULL_QUALIFICATION=1 RUN_REAL_DSH=1 \
 2. **该 harness 能不能脱离本项目独立跑通一句话**（上面每节给的探测命令）——认证问题
    与本项目接入代码无关，修好这一步再往下。
 3. **T2 本身**——如果前两步都通，T2 失败说明是 `build_onboarding()`/
-   `build_submitter_invocation()` 生成的配置有问题，读 `_created_proposal_for` 失败时
-   打印的 `stdout`/`stderr` 尾部，那里有该 Agent 实际收到的报错。
+   `build_submitter_invocation()` 生成的配置有问题。看 assertion diagnostic 里的完整
+   Proposal/Task delta 及 `stdout`/`stderr` 尾部，那里会同时说明多建、漏建或 Agent 侧报错。
 4. **T3**——T2 通过之后才有意义去跑，T2 没通过就跑 T3 只是在更贵的地方复现同一个问题。
 
 ## 记录结果

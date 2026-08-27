@@ -7,15 +7,21 @@ so these cost a few tokens and no GPU time.
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import httpx
 import pytest
 
 from agent_scheduler.adapters.submitter import build_submitter_invocation
-from agent_scheduler.domain.models import new_id
+from agent_scheduler.domain.models import (
+    Proposal,
+    ProposalFacts,
+    Revision,
+    new_id,
+    strict_from_json_value,
+)
 from agent_scheduler.runtime import load_tls_certificate
 from agent_scheduler.storage import EventStore
 
@@ -32,8 +38,7 @@ def _run_submitter(harness: str, tmp_path: Path, run_id: str) -> subprocess.Comp
         f"{BASE_URL}/health", verify=str(tls_certificate), timeout=10
     )
     response.raise_for_status()
-    uv_path = shutil.which("uv")
-    assert uv_path is not None, "uv is required to launch the MCP adapter"
+    python_path = Path(sys.executable).resolve()
     invocation = build_submitter_invocation(
         harness,
         prompt_kind="connectivity",
@@ -42,7 +47,7 @@ def _run_submitter(harness: str, tmp_path: Path, run_id: str) -> subprocess.Comp
         state_root=state_root,
         base_url=BASE_URL,
         username="zz_chentian",
-        uv_path=Path(uv_path).resolve(),
+        python_path=python_path,
         tls_certificate=tls_certificate,
         run_id=run_id,
     )
@@ -56,17 +61,6 @@ def _run_submitter(harness: str, tmp_path: Path, run_id: str) -> subprocess.Comp
         cwd=PROJECT_ROOT,
         env=invocation.env,
     )
-
-
-def _proposal_ids_for(state_root: Path, run_id: str) -> set[str]:
-    marker = f"Qualification Run: {run_id}"
-    return {
-        str(value["proposal_id"])
-        for value in EventStore(state_root).iter_immutable("revisions")
-        if isinstance(value.get("proposal_id"), str)
-        and isinstance(value.get("markdown"), str)
-        and marker in value["markdown"]
-    }
 
 
 @pytest.mark.parametrize(
@@ -87,24 +81,59 @@ def test_harness_creates_a_proposal_through_its_own_onboarding(
         os.environ.get("AGENT_SCHEDULER_STATE_ROOT", "/public/share/agent-scheduler-mvp")
     )
     run_id = new_id("t_two")
+    store = EventStore(state_root)
+    proposal_ids_before = {
+        str(value["proposal_id"])
+        for value in store.iter_snapshots("proposals")
+        if isinstance(value.get("proposal_id"), str)
+    }
+    task_ids_before = {
+        str(value["task_id"])
+        for value in store.iter_immutable("tasks")
+        if isinstance(value.get("task_id"), str)
+    }
 
     completed = _run_submitter(harness, tmp_path, run_id)
 
-    # Ground Truth, not CLI output, proves that connectivity mode stayed create-only.
-    store = EventStore(state_root)
-    proposal_ids = _proposal_ids_for(state_root, run_id)
-    diagnostic = (
-        f"{harness} did not create exactly one Proposal bound to {run_id}: "
-        f"{sorted(proposal_ids)}\nexit={completed.returncode}\n"
-        f"stdout={completed.stdout[-4000:]}\nstderr={completed.stderr[-4000:]}"
-    )
-    assert len(proposal_ids) == 1, diagnostic
-    proposal_id = next(iter(proposal_ids))
-    proposal = store.read_snapshot("proposals", proposal_id)
-    assert proposal is not None and proposal.get("state") == "AWAITING_CONFIRMATION", diagnostic
-    tasks = [
-        value
+    # Compare the complete Ground Truth deltas so unmarked extras cannot hide behind
+    # the run marker. T2 permits exactly one Proposal and no Task of any kind.
+    proposal_ids_after = {
+        str(value["proposal_id"])
+        for value in store.iter_snapshots("proposals")
+        if isinstance(value.get("proposal_id"), str)
+    }
+    task_ids_after = {
+        str(value["task_id"])
         for value in store.iter_immutable("tasks")
-        if value.get("proposal_id") == proposal_id
-    ]
-    assert tasks == [], diagnostic
+        if isinstance(value.get("task_id"), str)
+    }
+    proposal_delta = proposal_ids_after - proposal_ids_before
+    task_delta = task_ids_after - task_ids_before
+    diagnostic = (
+        f"{harness} violated T2's one-Proposal/create-only contract for {run_id}: "
+        f"proposal_delta={sorted(proposal_delta)}, task_delta={sorted(task_delta)}\n"
+        f"exit={completed.returncode}\nstdout={completed.stdout[-4000:]}\n"
+        f"stderr={completed.stderr[-4000:]}"
+    )
+    assert len(proposal_delta) == 1, diagnostic
+    assert task_delta == set(), diagnostic
+
+    proposal_id = next(iter(proposal_delta))
+    proposal_data = store.read_snapshot("proposals", proposal_id)
+    assert proposal_data is not None, diagnostic
+    proposal = strict_from_json_value(Proposal, proposal_data)
+    assert proposal.state.value == "AWAITING_CONFIRMATION", diagnostic
+    assert proposal.current_revision_id is not None, diagnostic
+    assert proposal.current_facts_id is not None, diagnostic
+    revision = strict_from_json_value(
+        Revision,
+        store.read_immutable("revisions", proposal.current_revision_id),
+    )
+    facts = strict_from_json_value(
+        ProposalFacts,
+        store.read_immutable("facts", proposal.current_facts_id),
+    )
+    assert f"Qualification Run: {run_id}" in revision.markdown, diagnostic
+    assert revision.proposal_id == proposal_id, diagnostic
+    assert facts.revision_id == revision.revision_id, diagnostic
+    assert facts.required_gpu_count == 1, diagnostic

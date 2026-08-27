@@ -1,9 +1,11 @@
 import subprocess
+import sys
 from pathlib import Path
 
 from conftest import proposal_markdown, signed_task
 
 from agent_scheduler import qualification
+from agent_scheduler.adapters.submitter import SubmitterInvocation
 from agent_scheduler.domain.models import (
     Revision,
     TaskState,
@@ -47,7 +49,11 @@ def test_local_gates_exclude_and_strip_every_real_test_opt_in(
 
     assert failure is None
     pytest_command, child_env = calls[0]
-    marker_expression = pytest_command[pytest_command.index("-m") + 1]
+    assert pytest_command[:3] == [sys.executable, "-m", "pytest"]
+    assert calls[1][0][:4] == [sys.executable, "-m", "ruff", "check"]
+    assert calls[2][0][:4] == [sys.executable, "-m", "mypy", "src"]
+    marker_index = pytest_command.index("-m", 3)
+    marker_expression = pytest_command[marker_index + 1]
     for marker in ("real_claude", "real_codex", "real_pi", "real_dsh", "real_gpu"):
         assert f"not {marker}" in marker_expression
     for name in real_env_names:
@@ -67,6 +73,159 @@ def test_missing_credentials_are_a_structured_block(monkeypatch, tmp_path: Path)
     assert "ANTHROPIC_API_KEY" in (result.reason or "")
     assert "ANTHROPIC_AUTH_TOKEN" in (result.reason or "")
     assert result.run_id.startswith("qual_")
+
+
+def _stub_submitter_launch(monkeypatch, process_result) -> list[list[str]]:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-master-role-key")
+    monkeypatch.setattr(qualification, "_run_local_gates", lambda *args: None)
+    monkeypatch.setattr(
+        qualification,
+        "_master_profile",
+        lambda *args: {
+            "qualification": True,
+            "harness_mode": "claude",
+            "worker_mode": "remote",
+        },
+    )
+    monkeypatch.setattr(qualification, "_harness_version", lambda *args: "fake 1.0")
+    monkeypatch.setattr(
+        qualification,
+        "build_submitter_invocation",
+        lambda *args, **kwargs: SubmitterInvocation(
+            argv=("fake-submitter", "run"),
+            env={"PATH": "/usr/bin:/bin"},
+            prompt="fake prompt",
+        ),
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(list(command))
+        if isinstance(process_result, BaseException):
+            raise process_result
+        return process_result
+
+    monkeypatch.setattr(qualification.subprocess, "run", fake_run)
+    return calls
+
+
+def test_submitter_timeout_is_a_single_audited_attempt(monkeypatch, tmp_path: Path):
+    calls = _stub_submitter_launch(
+        monkeypatch,
+        subprocess.TimeoutExpired(cmd=["fake-submitter", "run"], timeout=7),
+    )
+    state_root = tmp_path / "state"
+
+    result = run_submitter_agent(
+        project_root=tmp_path,
+        state_root=state_root,
+        base_url="https://127.0.0.1:8443",
+        tls_certificate=tmp_path / "certificate.pem",
+        timeout_seconds=7,
+        harness="codex",
+    )
+
+    assert calls == [["fake-submitter", "run"]]
+    assert result.status == "BLOCKED_QUALIFICATION"
+    assert "timed out" in (result.reason or "")
+    audits = list(EventStore(state_root).iter_immutable("harness"))
+    assert len(audits) == 1
+    assert audits[0]["error"] == "submitter_timeout"
+
+
+def test_retryable_nonzero_exit_is_not_retried_or_treated_as_success(
+    monkeypatch, tmp_path: Path
+):
+    calls = _stub_submitter_launch(
+        monkeypatch,
+        subprocess.CompletedProcess(
+            ["fake-submitter", "run"],
+            75,
+            stdout="",
+            stderr="429 rate limit: temporarily unavailable",
+        ),
+    )
+    completed_items = tuple(
+        QualificationItem(
+            card_count=cards,
+            proposal_id=f"prop_completed_{cards}",
+            task_id=f"task_completed_{cards}",
+            state="COMPLETED",
+        )
+        for cards in (1, 2, 4, 8)
+    )
+
+    def fake_reconstruct(store, run_id):
+        return QualificationResult(
+            run_id=run_id,
+            status="COMPLETED",
+            items=completed_items,
+        )
+
+    monkeypatch.setattr(qualification, "reconstruct_qualification_result", fake_reconstruct)
+    state_root = tmp_path / "state"
+
+    result = run_submitter_agent(
+        project_root=tmp_path,
+        state_root=state_root,
+        base_url="https://127.0.0.1:8443",
+        tls_certificate=tmp_path / "certificate.pem",
+        harness="codex",
+    )
+
+    assert calls == [["fake-submitter", "run"]]
+    assert result.status == "BLOCKED_QUALIFICATION"
+    assert result.items == completed_items
+    assert "exited with code 75" in (result.reason or "")
+    audits = list(EventStore(state_root).iter_immutable("harness"))
+    assert len(audits) == 1
+    assert audits[0]["exit_code"] == 75
+
+
+def test_zero_exit_returns_the_single_ground_truth_reconstruction(monkeypatch, tmp_path: Path):
+    calls = _stub_submitter_launch(
+        monkeypatch,
+        subprocess.CompletedProcess(
+            ["fake-submitter", "run"],
+            0,
+            stdout="Agent prose is not an ID contract",
+            stderr="",
+        ),
+    )
+    expected_item = QualificationItem(
+        card_count=1,
+        proposal_id="prop_reconstructed",
+        task_id="task_reconstructed",
+        state="COMPLETED",
+    )
+    reconstructed_run_ids: list[str] = []
+
+    def fake_reconstruct(store, run_id):
+        reconstructed_run_ids.append(run_id)
+        return QualificationResult(
+            run_id=run_id,
+            status="COMPLETED",
+            items=(expected_item,),
+        )
+
+    monkeypatch.setattr(qualification, "reconstruct_qualification_result", fake_reconstruct)
+    state_root = tmp_path / "state"
+
+    result = run_submitter_agent(
+        project_root=tmp_path,
+        state_root=state_root,
+        base_url="https://127.0.0.1:8443",
+        tls_certificate=tmp_path / "certificate.pem",
+        harness="codex",
+    )
+
+    assert calls == [["fake-submitter", "run"]]
+    assert reconstructed_run_ids == [result.run_id]
+    assert result.status == "COMPLETED"
+    assert result.items == (expected_item,)
+    audits = list(EventStore(state_root).iter_immutable("harness"))
+    assert len(audits) == 1
+    assert audits[0]["exit_code"] == 0
 
 
 def test_unbound_historical_result_cannot_pass(runtime_identity):
@@ -238,9 +397,9 @@ def _seed_run_preconditions(
             "passed": True,
             "timestamp": utc_now().isoformat(),
             "results": [
-                {"argv": ["uv", "run", "pytest", "-q"], "exit_code": 0},
-                {"argv": ["uv", "run", "ruff", "check", "."], "exit_code": 0},
-                {"argv": ["uv", "run", "mypy", "src"], "exit_code": 0},
+                {"argv": [sys.executable, "-m", "pytest", "-q"], "exit_code": 0},
+                {"argv": [sys.executable, "-m", "ruff", "check", "."], "exit_code": 0},
+                {"argv": [sys.executable, "-m", "mypy", "src"], "exit_code": 0},
             ],
         },
     )
@@ -261,7 +420,7 @@ def _seed_run_preconditions(
         "role": "submitter",
         "exit_code": 0,
         "started_at": utc_now().isoformat(),
-        "stdout": " ".join(f"{item.proposal_id} {item.task_id}" for item in items),
+        "stdout": "",
     }
     if harness is not None:
         record["harness"] = harness
@@ -293,7 +452,9 @@ def test_verification_rejects_submitter_evidence_from_another_harness(runtime_id
     assert "pi Submitter evidence is incomplete" in rejected.reason
 
 
-def test_verification_accepts_submitter_evidence_from_the_named_harness(runtime_identity):
+def test_verification_accepts_empty_stdout_from_the_named_submitter_harness(
+    runtime_identity,
+):
     from agent_scheduler.qualification import verify_qualification
 
     root, identity = runtime_identity
@@ -307,7 +468,7 @@ def test_verification_accepts_submitter_evidence_from_the_named_harness(runtime_
     # later check, which is what proves the harness binding itself was accepted.
     assert verified.status == "BLOCKED_QUALIFICATION"
     assert verified.reason is not None
-    assert "Submitter evidence is incomplete" not in verified.reason
+    assert "Submitter evidence" not in verified.reason
 
 
 def test_legacy_submitter_evidence_without_a_harness_field_counts_as_claude(
@@ -324,4 +485,4 @@ def test_legacy_submitter_evidence_without_a_harness_field_counts_as_claude(
     )
 
     assert verified.reason is not None
-    assert "Submitter evidence is incomplete" not in verified.reason
+    assert "Submitter evidence" not in verified.reason

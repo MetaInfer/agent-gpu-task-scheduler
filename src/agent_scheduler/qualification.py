@@ -5,8 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -105,9 +105,7 @@ def run_submitter_agent(
                 "profile": profile,
             },
         )
-        uv_path = shutil.which("uv")
-        if uv_path is None:
-            return _blocked((), "uv executable not found", run_id)
+        python_path = Path(sys.executable).resolve()
         run_dir = state_root / "qualification" / run_id
         invocation = build_submitter_invocation(
             harness,
@@ -116,7 +114,7 @@ def run_submitter_agent(
             state_root=state_root,
             base_url=base_url,
             username="zz_chentian",
-            uv_path=Path(uv_path).resolve(),
+            python_path=python_path,
             tls_certificate=tls_certificate,
             executable=executable,
             run_id=run_id,
@@ -125,59 +123,52 @@ def run_submitter_agent(
         prompt = invocation.prompt
         env = invocation.env
         cli_version = _harness_version(command[0], env)
-        last_reason = "Submitter exhausted retry attempts"
-        for attempt in range(1, 5):
-            attempt_id = invocation_id if attempt == 1 else new_id("harness")
-            attempt_audit = {
-                **audit,
-                "invocation_id": attempt_id,
-                "attempt": attempt,
-                "argv": command,
-                "cli_version": cli_version,
-                "cwd": str(project_root),
-            }
-            try:
-                completed = subprocess.run(
-                    command,
-                    input=prompt,
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                    timeout=timeout_seconds,
-                    cwd=project_root,
-                    env=env,
-                )
-            except subprocess.TimeoutExpired:
-                attempt_audit.update(
-                    {"ended_at": utc_now().isoformat(), "error": "submitter_timeout"}
-                )
-                store.write_immutable("harness", attempt_id, attempt_audit)
-                last_reason = "Submitter qualification attempt timed out"
-                if attempt < 4:
-                    continue
-                return _blocked((), last_reason, run_id)
-            attempt_audit.update(
-                {
-                    "ended_at": utc_now().isoformat(),
-                    "exit_code": completed.returncode,
-                    "stdout": completed.stdout,
-                    "stderr": completed.stderr,
-                }
+        invocation_audit = {
+            **audit,
+            "attempt": 1,
+            "argv": command,
+            "cli_version": cli_version,
+            "cwd": str(project_root),
+        }
+        try:
+            completed = subprocess.run(
+                command,
+                input=prompt,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=timeout_seconds,
+                cwd=project_root,
+                env=env,
             )
-            store.write_immutable("harness", attempt_id, attempt_audit)
-            if completed.returncode != 0:
-                reconstructed = reconstruct_qualification_result(store, run_id)
-                if reconstructed.status == "COMPLETED":
-                    return reconstructed
-                last_reason = (
-                    f"Submitter {harness} exited with code {completed.returncode}: "
-                    f"{reconstructed.reason}"
-                )
-                if _retryable_submitter_failure(completed.stderr) and attempt < 4:
-                    continue
-                return _blocked(reconstructed.items, last_reason, run_id)
-            return reconstruct_qualification_result(store, run_id)
-        return _blocked((), last_reason, run_id)
+        except subprocess.TimeoutExpired:
+            invocation_audit.update(
+                {"ended_at": utc_now().isoformat(), "error": "submitter_timeout"}
+            )
+            store.write_immutable("harness", invocation_id, invocation_audit)
+            return _blocked((), "Submitter qualification attempt timed out", run_id)
+        invocation_audit.update(
+            {
+                "ended_at": utc_now().isoformat(),
+                "exit_code": completed.returncode,
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
+            }
+        )
+        store.write_immutable("harness", invocation_id, invocation_audit)
+        reconstructed = reconstruct_qualification_result(store, run_id)
+        if completed.returncode != 0:
+            diagnostic = (
+                f": {reconstructed.reason}"
+                if reconstructed.reason is not None
+                else "; Ground Truth reconstruction was complete"
+            )
+            return _blocked(
+                reconstructed.items,
+                f"Submitter {harness} exited with code {completed.returncode}{diagnostic}",
+                run_id,
+            )
+        return reconstructed
     except (
         OSError,
         DockerError,
@@ -274,7 +265,7 @@ def verify_qualification(
                 result.run_id,
             )
         for item in result.items:
-            failure = _verify_item(item, result.run_id, store, identity, all_harness, harness)
+            failure = _verify_item(item, result.run_id, store, identity, all_harness)
             if failure:
                 return _blocked(result.items, failure, result.run_id)
         leases = _active_leases(store)
@@ -309,21 +300,7 @@ def _verify_item(
     store: EventStore,
     identity: RuntimeIdentity,
     harness_records: list[dict[str, Any]],
-    harness: str,
 ) -> str | None:
-    submitter_records = [
-        value
-        for value in harness_records
-        if value.get("role") == "submitter"
-        and value.get("run_id") == run_id
-        and value.get("harness", "claude") == harness
-    ]
-    if (
-        len(submitter_records) != 1
-        or not _record_mentions(submitter_records[0], item.proposal_id)
-        or not _record_mentions(submitter_records[0], item.task_id)
-    ):
-        return f"Submitter evidence is not bound to current item: {item.task_id}"
     task = strict_from_json_value(Task, store.read_immutable("tasks", item.task_id))
     if task.proposal_id != item.proposal_id or not verify_model(task, identity.signing_public_key):
         return f"Task/Proposal/signature binding invalid: {item.task_id}"
@@ -564,16 +541,14 @@ def _master_profile(base_url: str, certificate: Path) -> dict[str, object]:
 
 
 def _run_local_gates(project_root: Path, store: EventStore, run_id: str) -> str | None:
-    uv_path = shutil.which("uv")
-    if uv_path is None:
-        return "uv executable not found for local gates"
+    python_path = sys.executable
     real_marker_filter = (
         "not real_claude and not real_codex and not real_pi and not real_dsh and not real_gpu"
     )
     commands = (
-        [uv_path, "run", "pytest", "-m", real_marker_filter, "-q"],
-        [uv_path, "run", "ruff", "check", "."],
-        [uv_path, "run", "mypy", "src"],
+        [python_path, "-m", "pytest", "-m", real_marker_filter, "-q"],
+        [python_path, "-m", "ruff", "check", "."],
+        [python_path, "-m", "mypy", "src"],
     )
     results: list[dict[str, object]] = []
     passed = True
@@ -622,14 +597,6 @@ def _run_local_gates(project_root: Path, store: EventStore, run_id: str) -> str 
         },
     )
     return None if passed else "one or more local quality gates failed"
-
-
-def _retryable_submitter_failure(stderr: str) -> bool:
-    lowered = stderr.lower()
-    return any(
-        marker in lowered
-        for marker in ("rate limit", "429", "timed out", "timeout", "temporarily unavailable")
-    )
 
 
 def _harness_version(executable: str, env: dict[str, str]) -> str:

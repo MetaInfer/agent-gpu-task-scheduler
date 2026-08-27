@@ -13,9 +13,9 @@
 
 | 进程 | 命令 | 身份 | 职责 |
 | --- | --- | --- | --- |
-| Master | `agent-scheduler serve` | root | REST 控制面、WSS 服务端、调度器、观察界面 |
-| Worker | `agent-scheduler worker` | root | 主动外连 WSS、采集 `hy-smi`、管理容器生命周期 |
-| MCP Adapter | `agent-scheduler mcp` | Submitter | stdio JSON-RPC，把 Agent 工具调用翻译成 REST |
+| Master | `python3 -m agent_scheduler.cli.main serve` | root | REST 控制面、WSS 服务端、调度器、观察界面 |
+| Worker | `python3 -m agent_scheduler.cli.main worker` | root | 主动外连 WSS、采集 `hy-smi`、管理容器生命周期 |
+| MCP Adapter | `python3 -m agent_scheduler.cli.main mcp` | Submitter | stdio JSON-RPC，把 Agent 工具调用翻译成 REST |
 | Submitter Agent | 由 `qualify` 拉起，或人工 | `zz_chentian` | 写 Proposal、应对评审、轮询 Task |
 
 Master 内部还会以子进程方式调用 Claude 扮演两个角色：
@@ -47,18 +47,18 @@ MCP Adapter ──REST──► Master ──► Processor(Claude) ──► Fac
 
 ## 2. 安装
 
-要求 Python `>=3.10`（开发环境 3.12）、`uv`、可用的 `docker` 与 `hy-smi`。
+要求 Python `>=3.10`（开发环境 3.12）、可用的 `pip`、`docker` 与 `hy-smi`。
 
 ```bash
-uv sync --extra test
+python3 -m pip install -e '.[test]'
 ```
 
 本地门禁：
 
 ```bash
-uv run pytest
-uv run ruff check .
-uv run mypy src
+python3 -m pytest
+python3 -m ruff check .
+python3 -m mypy src
 ```
 
 涉及真实计费或真实硬件的测试必须显式 opt-in，分三层，成本依次上升：
@@ -67,14 +67,14 @@ uv run mypy src
 # T1：先确认 shell 没有 RUN_REAL_*；严格零成本命令见 testing-the-submitter.md
 
 # T2：单个 Agent 真实连通性检查——建一个 Proposal 就停，Master 用 fake harness 即可，不碰 GPU
-RUN_REAL_CLAUDE=1 uv run pytest tests/test_real_onboarding.py -m real_claude
-RUN_REAL_CODEX=1  uv run pytest tests/test_real_onboarding.py -m real_codex
-RUN_REAL_PI=1     uv run pytest tests/test_real_onboarding.py -m real_pi
-RUN_REAL_DSH=1    uv run pytest tests/test_real_onboarding.py -m real_dsh
+RUN_REAL_CLAUDE=1 python3 -m pytest tests/test_real_onboarding.py -m real_claude
+RUN_REAL_CODEX=1  python3 -m pytest tests/test_real_onboarding.py -m real_codex
+RUN_REAL_PI=1     python3 -m pytest tests/test_real_onboarding.py -m real_pi
+RUN_REAL_DSH=1    python3 -m pytest tests/test_real_onboarding.py -m real_dsh
 
 # T3：单个 Agent 完整 1/2/4/8 卡资格闭环——真实 GPU，复用容器严格串行，一次只跑一个
 RUN_REAL_GPU=1 RUN_FULL_QUALIFICATION=1 RUN_REAL_CODEX=1 \
-  uv run pytest tests/test_real_qualification.py -m 'real_codex and real_gpu'
+  python3 -m pytest tests/test_real_qualification.py -m 'real_codex and real_gpu'
 ```
 
 四个 Agent（Claude ​Code、Codex CLI、pi、dsh）都能跑 T2/T3；四家的一次性安装前置
@@ -86,7 +86,7 @@ RUN_REAL_GPU=1 RUN_FULL_QUALIFICATION=1 RUN_REAL_CODEX=1 \
 ## 3. 一次性初始化
 
 ```bash
-uv run agent-scheduler init-runtime --state-root /public/share/agent-scheduler-mvp
+python3 -m agent_scheduler.cli.main init-runtime --state-root /public/share/agent-scheduler-mvp
 ```
 
 在 `<state-root>/secrets/`（目录 `0700`，文件 `0600`，仅 root 可读）生成五项：
@@ -105,7 +105,7 @@ uv run agent-scheduler init-runtime --state-root /public/share/agent-scheduler-m
 | `certificate.pem` | loopback 自签证书——公开材料，用于客户端验证 Master，不用于认证调用方 |
 
 证书刻意放在 `secrets/` 之外：它是非机密材料，只要 OS 账号属于 state-root 的属组就能读到，
-不需要 root。这正是 `agent-scheduler mcp` 命令能以非 root 的 Submitter 账号运行的原因——
+不需要 root。这正是 `python3 -m agent_scheduler.cli.main mcp` 命令能以非 root 的 Submitter 账号运行的原因——
 它只需要这一个文件，从不读取另外五项。
 
 ### 升级已有部署
@@ -197,13 +197,13 @@ export ANTHROPIC_AUTH_TOKEN=...        # 或 ANTHROPIC_API_KEY
 终端 1 — Master：
 
 ```bash
-uv run agent-scheduler serve [--host 127.0.0.1] [--port 8443]
+python3 -m agent_scheduler.cli.main serve [--host 127.0.0.1] [--port 8443]
 ```
 
 终端 2 — Worker（主动外连，每 10 秒上报真实 `hy-smi`）：
 
 ```bash
-uv run agent-scheduler worker [--uri wss://127.0.0.1:8443/api/v1/worker/ws]
+python3 -m agent_scheduler.cli.main worker [--uri wss://127.0.0.1:8443/api/v1/worker/ws]
 ```
 
 ### 确认启动成功
@@ -234,8 +234,8 @@ curl -sk https://127.0.0.1:8443/health
 {
   "mcpServers": {
     "submitter": {
-      "command": "uv",
-      "args": ["run", "agent-scheduler", "mcp",
+      "command": "python3",
+      "args": ["-m", "agent_scheduler.cli.main", "mcp",
                "--base-url", "https://127.0.0.1:8443",
                "--username", "zz_chentian"]
     }
@@ -244,7 +244,7 @@ curl -sk https://127.0.0.1:8443/health
 ```
 
 > 非 root 的 Submitter 账号能读到 `<state-root>/tls/certificate.pem` 不代表这条命令在当前
-> 主机上一定能跑起来——如果 `uv` 或项目的 Python 解释器本身装在只有 root 能进的目录下
+> 主机上一定能跑起来——如果项目的 Python 解释器本身装在只有 root 能进的目录下
 > （例如 `/root`），非 root 账号会在执行这条命令本身时失败，而不是在读证书时失败。这是
 > 独立于本文档权限修复的主机配置问题，参见
 > [从 Agent 会话提交 · 安全提醒](submitting-from-an-agent-session.md#安全提醒)。
@@ -295,7 +295,7 @@ curl -sk $BASE/api/v1/tasks/$TASK
 ### 6.3 一键资格闭环
 
 ```bash
-uv run agent-scheduler qualify [--base-url https://127.0.0.1:8443] [--timeout N] \
+python3 -m agent_scheduler.cli.main qualify [--base-url https://127.0.0.1:8443] [--timeout N] \
   [--harness claude|codex|pi|dsh]
 ```
 
@@ -448,11 +448,11 @@ MCP Adapter 会把 `error_code` 与 `message` 原样透传给 Agent，不会只�
 全部走 loopback 管理面并写审计，必须给 `--actor` 与 `--reason`：
 
 ```bash
-uv run agent-scheduler tick    --actor admin --reason 'manual scheduler pass'
-uv run agent-scheduler drain   --actor admin --reason maintenance
-uv run agent-scheduler compile-retry --proposal-id PROP  --actor admin --reason fixed-validator
-uv run agent-scheduler reconcile     --execution-id EXEC --actor admin --reason verified-stopped
-uv run agent-scheduler reload-users  --users zz_chentian --actor admin --reason policy-update
+python3 -m agent_scheduler.cli.main tick    --actor admin --reason 'manual scheduler pass'
+python3 -m agent_scheduler.cli.main drain   --actor admin --reason maintenance
+python3 -m agent_scheduler.cli.main compile-retry --proposal-id PROP  --actor admin --reason fixed-validator
+python3 -m agent_scheduler.cli.main reconcile     --execution-id EXEC --actor admin --reason verified-stopped
+python3 -m agent_scheduler.cli.main reload-users  --users zz_chentian --actor admin --reason policy-update
 ```
 
 - `drain` 之后新提交返回 `503`，在途 Task 继续跑完。
@@ -463,7 +463,7 @@ uv run agent-scheduler reload-users  --users zz_chentian --actor admin --reason 
 ### 检视 Ground Truth
 
 ```bash
-uv run agent-scheduler inspect --state-root /public/share/agent-scheduler-mvp \
+python3 -m agent_scheduler.cli.main inspect --state-root /public/share/agent-scheduler-mvp \
   --kind {events|immutable|snapshot|leases} \
   [--object-type TYPE] [--object-id ID]
 ```
@@ -498,7 +498,7 @@ uv run agent-scheduler inspect --state-root /public/share/agent-scheduler-mvp \
 ## 11. 资格验证
 
 ```bash
-uv run agent-scheduler qualify [--harness claude|codex|pi|dsh]
+python3 -m agent_scheduler.cli.main qualify [--harness claude|codex|pi|dsh]
 ```
 
 流程：跑本地门禁并留证 → 检查 `/health` profile → 生成该 harness 的接入配置 → 拉起真实

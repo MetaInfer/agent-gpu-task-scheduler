@@ -15,6 +15,7 @@ from typing import Literal
 
 from agent_scheduler.adapters.onboarding import (
     HARNESSES,
+    SUBMITTER_TOOLS,
     OnboardingError,
     build_onboarding,
     write_onboarding,
@@ -46,7 +47,7 @@ def build_submitter_invocation(
     state_root: Path,
     base_url: str,
     username: str,
-    uv_path: Path,
+    python_path: Path,
     tls_certificate: Path,
     executable: str | None = None,
     run_id: str,
@@ -60,16 +61,21 @@ def build_submitter_invocation(
         state_root=state_root,
         base_url=base_url,
         username=username,
-        uv_path=uv_path,
+        python_path=python_path,
     )
     write_onboarding(onboarding)
+    pi_model_arguments: tuple[str, ...] = ()
+    pi_provider: str | None = None
     if harness == "pi":
+        pi_model_arguments = _pi_model_arguments()
+        pi_provider = pi_model_arguments[1]
         _seed_pi_agent_dir(output_dir)
     binary = executable or submitter_executable(harness)
     prompt = _prompt(project_root, run_id, prompt_kind)
-    env = _base_environment(tls_certificate)
+    env = _base_environment(tls_certificate, harness=harness, pi_provider=pi_provider)
     env.update(onboarding.env)
     if harness == "claude":
+        allowed_tools = ",".join(f"mcp__submitter__{tool}" for tool in SUBMITTER_TOOLS)
         argv = (
             binary,
             "--print",
@@ -79,6 +85,10 @@ def build_submitter_invocation(
             "",
             "--permission-mode",
             "dontAsk",
+            "--tools",
+            "",
+            "--allowedTools",
+            allowed_tools,
             *onboarding.argv,
             "--output-format",
             "stream-json",
@@ -99,7 +109,7 @@ def build_submitter_invocation(
         adapter = _pi_source_agent_dir() / "npm" / "node_modules" / "pi-mcp-adapter" / "index.ts"
         argv = (
             binary,
-            *_pi_model_arguments(),
+            *pi_model_arguments,
             "--extension",
             str(adapter),
             "--print",
@@ -109,7 +119,7 @@ def build_submitter_invocation(
         )
     else:
         env["DSH_PERMISSION_MODE"] = "danger-full-access"
-        argv = (binary, "--profile", "headless", *onboarding.argv)
+        argv = (binary, "--profile", "headless", *onboarding.argv, prompt)
     return SubmitterInvocation(argv=argv, env=env, prompt=prompt)
 
 
@@ -141,24 +151,32 @@ def _prompt(
     )
 
 
-def _base_environment(tls_certificate: Path) -> dict[str, str]:
+_PROVIDER_ENV = {
+    "anthropic": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"),
+    "openai": ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
+    "deepseek": ("DEEPSEEK_API_KEY",),
+}
+
+
+def _base_environment(
+    tls_certificate: Path,
+    *,
+    harness: str,
+    pi_provider: str | None,
+) -> dict[str, str]:
     env = {
         "HOME": os.environ.get("HOME", "/root"),
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "DISABLE_UPDATES": "1",
         "SSL_CERT_FILE": str(tls_certificate),
     }
-    for name in (
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "ANTHROPIC_BASE_URL",
-        "OPENAI_API_KEY",
-        "OPENAI_BASE_URL",
-        "DEEPSEEK_API_KEY",
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "NO_PROXY",
-    ):
+    provider = {
+        "claude": "anthropic",
+        "codex": "openai",
+        "pi": pi_provider,
+        "dsh": "deepseek",
+    }[harness]
+    for name in (*_PROVIDER_ENV.get(provider or "", ()), "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"):
         value = os.environ.get(name)
         if value:
             env[name] = value
@@ -168,11 +186,11 @@ def _base_environment(tls_certificate: Path) -> dict[str, str]:
 def _pi_model_arguments() -> tuple[str, ...]:
     provider = os.environ.get("AGENT_SCHEDULER_PI_PROVIDER")
     model = os.environ.get("AGENT_SCHEDULER_PI_MODEL")
-    if bool(provider) != bool(model):
+    if not provider or not model:
         raise OnboardingError(
-            "AGENT_SCHEDULER_PI_PROVIDER and AGENT_SCHEDULER_PI_MODEL must be set together"
+            "AGENT_SCHEDULER_PI_PROVIDER and AGENT_SCHEDULER_PI_MODEL must both be set"
         )
-    return ("--provider", provider, "--model", model) if provider and model else ()
+    return ("--provider", provider, "--model", model)
 
 
 def _pi_source_agent_dir() -> Path:

@@ -1,3 +1,5 @@
+import subprocess
+import sys
 from pathlib import Path
 
 from agent_scheduler.adapters.mcp import SubmitterMCPAdapter
@@ -39,6 +41,20 @@ def test_mcp_command_never_calls_load_runtime(tmp_path: Path, monkeypatch):
     assert exit_code == 0
     assert started["called"]
     assert started["verify"] == str(root / "tls" / "certificate.pem")
+
+
+def test_python_module_entrypoint_reaches_cli_help():
+    completed = subprocess.run(
+        [sys.executable, "-m", "agent_scheduler.cli.main", "--help"],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0
+    assert "agent-scheduler" in completed.stdout
+    assert "qualify" in completed.stdout
 
 
 def test_qualify_accepts_a_harness_flag():

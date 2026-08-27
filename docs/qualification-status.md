@@ -8,8 +8,8 @@
 
 ## Result
 
-`uv run agent-scheduler qualify` drove a real Claude Submitter through the local MCP
-adapter against the loopback control plane, and all four current-run Tasks reached
+The qualification runner drove a real Claude Submitter through the local MCP adapter
+against the loopback control plane, and all four current-run Tasks reached
 `COMPLETED`:
 
 | Cards | Proposal | Task | State |

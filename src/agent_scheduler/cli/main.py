@@ -219,3 +219,7 @@ def _run_admin(args: argparse.Namespace) -> int:
     response.raise_for_status()
     print(json.dumps(response.json(), indent=2))
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
