@@ -24,6 +24,7 @@ test = [
 
 [project.scripts]
 agent-scheduler = "agent_scheduler.cli.main:main"
+agent-scheduler-submitter = "agent_scheduler_client.cli:main"
 
 [build-system]
 requires = ["hatchling>=1.25"]

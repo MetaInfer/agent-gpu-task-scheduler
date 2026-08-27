@@ -10,7 +10,7 @@ from pathlib import Path
 
 import httpx
 import uvicorn
-from agent_scheduler_client.mcp import SubmitterMCPAdapter
+from agent_scheduler_client.cli import run_mcp
 
 from agent_scheduler.adapters.harness import ClaudeCodeAdapter, FakeHarnessAdapter
 from agent_scheduler.adapters.onboarding import HARNESSES
@@ -130,13 +130,11 @@ def main(argv: list[str] | None = None) -> int:
         if not args.username:
             raise SystemExit("mcp requires --username or AGENT_SCHEDULER_USERNAME")
         settings = Settings.from_env()
-        tls_certificate = load_tls_certificate(settings.state_root)
-        adapter = SubmitterMCPAdapter(args.base_url, args.username, verify=str(tls_certificate))
-        try:
-            adapter.run_stdio()
-        finally:
-            adapter.close()
-        return 0
+        return run_mcp(
+            base_url=args.base_url,
+            username=args.username,
+            ca_file=load_tls_certificate(settings.state_root),
+        )
     if args.command == "qualify":
         try:
             settings = Settings.from_env()

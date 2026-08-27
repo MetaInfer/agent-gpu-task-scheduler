@@ -2,7 +2,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-from agent_scheduler_client.mcp import SubmitterMCPAdapter
 from agent_scheduler.cli import main as cli_main
 from agent_scheduler.runtime import init_runtime
 
@@ -29,18 +28,25 @@ def test_mcp_command_never_calls_load_runtime(tmp_path: Path, monkeypatch):
 
     started = {}
 
-    def fake_run_stdio(self):
-        started["called"] = True
-        started["verify"] = self.verify
+    def fake_run_mcp(*, base_url, username, ca_file):
+        started.update(
+            base_url=base_url,
+            username=username,
+            ca_file=ca_file,
+        )
+        return 0
 
-    monkeypatch.setattr(SubmitterMCPAdapter, "run_stdio", fake_run_stdio)
+    monkeypatch.setattr(cli_main, "run_mcp", fake_run_mcp)
 
     exit_code = cli_main.main(
         ["mcp", "--base-url", "https://127.0.0.1:8443", "--username", "zz_chentian"]
     )
     assert exit_code == 0
-    assert started["called"]
-    assert started["verify"] == str(root / "tls" / "certificate.pem")
+    assert started == {
+        "base_url": "https://127.0.0.1:8443",
+        "username": "zz_chentian",
+        "ca_file": root / "tls" / "certificate.pem",
+    }
 
 
 def test_python_module_entrypoint_reaches_cli_help():
