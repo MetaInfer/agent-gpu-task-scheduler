@@ -5,13 +5,18 @@ description: Submit a GPU task to the Agent GPU Task Scheduler through the submi
 
 # Submitting a GPU task
 
-Drive one Proposal from creation to a terminal Task state using **only** the
-`mcp__submitter__*` tools. REST is the authority; never edit Ground Truth files directly.
+Drive one Proposal from creation to a terminal Task state using only the configured
+`submitter` MCP tools. Harnesses may display prefixes differently; select tools by their
+semantic names (`create_proposal`, `reply`, `confirm_revision`, and the read/wait tools).
+REST is the authority; never edit Ground Truth files directly.
 
 ## Before you start
 
-Confirm the Master is up. If any tool call fails to connect, stop and tell the user to start
-`agent-scheduler serve` and `agent-scheduler worker` — do not retry in a loop.
+Read the configured submitter username from the `create_proposal` tool description and use
+that exact value in `## Identity`; never guess or reuse a historical username. If a tool call
+cannot connect, stop, report the error, ask the client operator to check the issued endpoint,
+CA, and MCP config, and contact the service provider. Do not start Master or Worker and do not
+retry connectivity in a loop.
 
 ## Idempotency keys
 

@@ -3,6 +3,10 @@
 Fill every section. Exact order, no renaming, no `TBD`. Replace `<N>` with 1, 2, 4, or 8 and
 `<proposal-id>` literally — the Processor substitutes the real ID.
 
+Read `<submitter-username>` (the configured submitter username) from the configured
+`create_proposal` tool description and replace it exactly; do not submit the angle-bracket token
+literally.
+
 This template is derived from a Proposal that actually passed the independent Reviewer. The
 common cause of `REQUEST_CHANGES` is leaving the container write path and the host verification
 path looking like two different files, so **Inputs and Mounts** states the bind explicitly.
@@ -13,7 +17,7 @@ path looking like two different files, so **Inputs and Mounts** states the bind 
 # Proposal
 
 ## Identity
-Submitter username: `zz_chentian`.
+Submitter username: `<submitter-username>`.
 This Proposal requests <N> GPUs.
 
 ## Objective
