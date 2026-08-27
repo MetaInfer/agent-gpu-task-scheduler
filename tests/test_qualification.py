@@ -51,7 +51,13 @@ def test_local_gates_exclude_and_strip_every_real_test_opt_in(
     pytest_command, child_env = calls[0]
     assert pytest_command[:3] == [sys.executable, "-m", "pytest"]
     assert calls[1][0][:4] == [sys.executable, "-m", "ruff", "check"]
-    assert calls[2][0][:4] == [sys.executable, "-m", "mypy", "src"]
+    assert calls[2][0] == [
+        sys.executable,
+        "-m",
+        "mypy",
+        "src",
+        "packages/client/src",
+    ]
     marker_index = pytest_command.index("-m", 3)
     marker_expression = pytest_command[marker_index + 1]
     for marker in ("real_claude", "real_codex", "real_pi", "real_dsh", "real_gpu"):
@@ -75,7 +81,7 @@ def test_missing_credentials_are_a_structured_block(monkeypatch, tmp_path: Path)
     assert result.run_id.startswith("qual_")
 
 
-def _stub_submitter_launch(monkeypatch, process_result) -> list[list[str]]:
+def _stub_submitter_launch(monkeypatch, tmp_path: Path, process_result) -> list[list[str]]:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-master-role-key")
     monkeypatch.setattr(qualification, "_run_local_gates", lambda *args: None)
     monkeypatch.setattr(
@@ -95,12 +101,14 @@ def _stub_submitter_launch(monkeypatch, process_result) -> list[list[str]]:
             argv=("fake-submitter", "run"),
             env={"PATH": "/usr/bin:/bin"},
             prompt="fake prompt",
+            cwd=tmp_path / "client-workspace",
         ),
     )
     calls: list[list[str]] = []
 
     def fake_run(command, **kwargs):
         calls.append(list(command))
+        assert kwargs["cwd"] == tmp_path / "client-workspace"
         if isinstance(process_result, BaseException):
             raise process_result
         return process_result
@@ -112,6 +120,7 @@ def _stub_submitter_launch(monkeypatch, process_result) -> list[list[str]]:
 def test_submitter_timeout_is_a_single_audited_attempt(monkeypatch, tmp_path: Path):
     calls = _stub_submitter_launch(
         monkeypatch,
+        tmp_path,
         subprocess.TimeoutExpired(cmd=["fake-submitter", "run"], timeout=7),
     )
     state_root = tmp_path / "state"
@@ -138,6 +147,7 @@ def test_retryable_nonzero_exit_is_not_retried_or_treated_as_success(
 ):
     calls = _stub_submitter_launch(
         monkeypatch,
+        tmp_path,
         subprocess.CompletedProcess(
             ["fake-submitter", "run"],
             75,
@@ -185,6 +195,7 @@ def test_retryable_nonzero_exit_is_not_retried_or_treated_as_success(
 def test_zero_exit_returns_the_single_ground_truth_reconstruction(monkeypatch, tmp_path: Path):
     calls = _stub_submitter_launch(
         monkeypatch,
+        tmp_path,
         subprocess.CompletedProcess(
             ["fake-submitter", "run"],
             0,

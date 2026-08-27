@@ -13,11 +13,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from agent_scheduler_client.tools import SUBMITTER_TOOLS
+
 from agent_scheduler.adapters.onboarding import (
     HARNESSES,
-    SUBMITTER_TOOLS,
     OnboardingError,
     build_onboarding,
+    prepare_client_workspace,
     write_onboarding,
 )
 
@@ -29,6 +31,7 @@ class SubmitterInvocation:
     argv: tuple[str, ...]
     env: dict[str, str]
     prompt: str
+    cwd: Path
 
 
 def submitter_executable(harness: str) -> str:
@@ -44,35 +47,37 @@ def build_submitter_invocation(
     prompt_kind: Literal["qualification", "connectivity"] = "qualification",
     output_dir: Path,
     project_root: Path,
-    state_root: Path,
+    client_workspace: Path,
     base_url: str,
     username: str,
-    python_path: Path,
-    tls_certificate: Path,
+    client_entrypoint: Path,
+    ca_file: Path,
     executable: str | None = None,
     run_id: str,
 ) -> SubmitterInvocation:
     if harness not in HARNESSES:
         raise OnboardingError(f"unknown harness {harness!r}; expected one of {list(HARNESSES)}")
-    onboarding = build_onboarding(
-        harness,
-        output_dir=output_dir,
-        project_root=project_root,
-        state_root=state_root,
-        base_url=base_url,
-        username=username,
-        python_path=python_path,
-    )
-    write_onboarding(onboarding)
     pi_model_arguments: tuple[str, ...] = ()
     pi_provider: str | None = None
     if harness == "pi":
         pi_model_arguments = _pi_model_arguments()
         pi_provider = pi_model_arguments[1]
+    prepare_client_workspace(project_root, client_workspace)
+    onboarding = build_onboarding(
+        harness,
+        output_dir=output_dir,
+        workspace=client_workspace,
+        base_url=base_url,
+        username=username,
+        client_entrypoint=client_entrypoint,
+        ca_file=ca_file,
+    )
+    write_onboarding(onboarding)
+    if harness == "pi":
         _seed_pi_agent_dir(output_dir)
     binary = executable or submitter_executable(harness)
     prompt = _prompt(project_root, run_id, prompt_kind)
-    env = _base_environment(tls_certificate, harness=harness, pi_provider=pi_provider)
+    env = _base_environment(ca_file, harness=harness, pi_provider=pi_provider)
     env.update(onboarding.env)
     if harness == "claude":
         allowed_tools = ",".join(f"mcp__submitter__{tool}" for tool in SUBMITTER_TOOLS)
@@ -102,7 +107,7 @@ def build_submitter_invocation(
             "--skip-git-repo-check",
             "--dangerously-bypass-approvals-and-sandbox",
             "-C",
-            str(project_root),
+            str(client_workspace),
             *onboarding.argv,
         )
     elif harness == "pi":
@@ -120,7 +125,7 @@ def build_submitter_invocation(
     else:
         env["DSH_PERMISSION_MODE"] = "danger-full-access"
         argv = (binary, "--profile", "headless", *onboarding.argv, prompt)
-    return SubmitterInvocation(argv=argv, env=env, prompt=prompt)
+    return SubmitterInvocation(argv=argv, env=env, prompt=prompt, cwd=client_workspace)
 
 
 def _prompt(
@@ -159,7 +164,7 @@ _PROVIDER_ENV = {
 
 
 def _base_environment(
-    tls_certificate: Path,
+    ca_file: Path,
     *,
     harness: str,
     pi_provider: str | None,
@@ -168,7 +173,7 @@ def _base_environment(
         "HOME": os.environ.get("HOME", "/root"),
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "DISABLE_UPDATES": "1",
-        "SSL_CERT_FILE": str(tls_certificate),
+        "SSL_CERT_FILE": str(ca_file),
     }
     provider = {
         "claude": "anthropic",

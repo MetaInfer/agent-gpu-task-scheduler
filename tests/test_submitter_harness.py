@@ -35,11 +35,11 @@ def _invoke(harness: str, tmp_path: Path, *, prompt_kind: str = "qualification")
         prompt_kind=prompt_kind,
         output_dir=tmp_path / "run",
         project_root=PROJECT_ROOT,
-        state_root=Path("/public/share/agent-scheduler-mvp"),
+        client_workspace=tmp_path / "client-workspace",
         base_url="https://127.0.0.1:8443",
         username="zz_chentian",
-        python_path=Path("/usr/bin/python3"),
-        tls_certificate=Path("/public/share/agent-scheduler-mvp/tls/certificate.pem"),
+        client_entrypoint=Path("/opt/agent-client/venv/bin/agent-scheduler-submitter"),
+        ca_file=Path("/shared/state/tls/certificate.pem"),
         run_id="qual_abc123",
     )
 
@@ -60,6 +60,27 @@ def test_connectivity_prompt_requests_one_unconfirmed_proposal(tmp_path: Path):
     assert "Do not confirm" in invocation.prompt
     assert "four-task qualification" not in invocation.prompt
     assert "Create four independent Proposals" not in invocation.prompt
+
+
+@pytest.mark.parametrize("harness", HARNESSES)
+def test_invocation_contains_no_server_repository_path(harness: str, tmp_path: Path):
+    invocation = _invoke(harness, tmp_path)
+    rendered = "\n".join(
+        [
+            *invocation.argv,
+            *[f"{key}={value}" for key, value in sorted(invocation.env.items())],
+            invocation.prompt,
+            str(invocation.cwd),
+        ]
+    )
+    assert str(PROJECT_ROOT) not in rendered
+    assert invocation.cwd == tmp_path / "client-workspace"
+    assert (invocation.cwd / ".agents" / "skills" / "submit-gpu-task" / "SKILL.md").is_file()
+    claude_skill = invocation.cwd / ".claude" / "skills" / "submit-gpu-task"
+    assert claude_skill.is_symlink()
+    assert claude_skill.resolve() == (
+        invocation.cwd / ".agents" / "skills" / "submit-gpu-task"
+    ).resolve()
 
 
 @pytest.mark.parametrize("harness", HARNESSES)

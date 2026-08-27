@@ -62,6 +62,7 @@ def run_submitter_agent(
     tls_certificate: Path,
     timeout_seconds: int = 45 * 60,
     executable: str | None = None,
+    client_entrypoint: Path | None = None,
     harness: str = "claude",
 ) -> QualificationResult:
     run_id = new_id("qual")
@@ -105,17 +106,20 @@ def run_submitter_agent(
                 "profile": profile,
             },
         )
-        python_path = Path(sys.executable).resolve()
+        resolved_client_entrypoint = client_entrypoint or Path(sys.executable).with_name(
+            "agent-scheduler-submitter"
+        )
         run_dir = state_root / "qualification" / run_id
+        client_workspace = run_dir / "workspace"
         invocation = build_submitter_invocation(
             harness,
             output_dir=run_dir,
             project_root=project_root,
-            state_root=state_root,
+            client_workspace=client_workspace,
             base_url=base_url,
             username="zz_chentian",
-            python_path=python_path,
-            tls_certificate=tls_certificate,
+            client_entrypoint=resolved_client_entrypoint,
+            ca_file=tls_certificate,
             executable=executable,
             run_id=run_id,
         )
@@ -128,7 +132,7 @@ def run_submitter_agent(
             "attempt": 1,
             "argv": command,
             "cli_version": cli_version,
-            "cwd": str(project_root),
+            "cwd": str(invocation.cwd),
         }
         try:
             completed = subprocess.run(
@@ -138,7 +142,7 @@ def run_submitter_agent(
                 capture_output=True,
                 check=False,
                 timeout=timeout_seconds,
-                cwd=project_root,
+                cwd=invocation.cwd,
                 env=env,
             )
         except subprocess.TimeoutExpired:
@@ -548,7 +552,7 @@ def _run_local_gates(project_root: Path, store: EventStore, run_id: str) -> str 
     commands = (
         [python_path, "-m", "pytest", "-m", real_marker_filter, "-q"],
         [python_path, "-m", "ruff", "check", "."],
-        [python_path, "-m", "mypy", "src"],
+        [python_path, "-m", "mypy", "src", "packages/client/src"],
     )
     results: list[dict[str, object]] = []
     passed = True

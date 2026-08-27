@@ -38,17 +38,18 @@ def _run_submitter(harness: str, tmp_path: Path, run_id: str) -> subprocess.Comp
         f"{BASE_URL}/health", verify=str(tls_certificate), timeout=10
     )
     response.raise_for_status()
-    python_path = Path(sys.executable).resolve()
+    client_entrypoint = Path(sys.executable).with_name("agent-scheduler-submitter")
+    client_workspace = tmp_path / "client-workspace"
     invocation = build_submitter_invocation(
         harness,
         prompt_kind="connectivity",
         output_dir=tmp_path / "run",
         project_root=PROJECT_ROOT,
-        state_root=state_root,
+        client_workspace=client_workspace,
         base_url=BASE_URL,
         username="zz_chentian",
-        python_path=python_path,
-        tls_certificate=tls_certificate,
+        client_entrypoint=client_entrypoint,
+        ca_file=tls_certificate,
         run_id=run_id,
     )
     return subprocess.run(
@@ -58,7 +59,7 @@ def _run_submitter(harness: str, tmp_path: Path, run_id: str) -> subprocess.Comp
         capture_output=True,
         check=False,
         timeout=15 * 60,
-        cwd=PROJECT_ROOT,
+        cwd=invocation.cwd,
         env=invocation.env,
     )
 

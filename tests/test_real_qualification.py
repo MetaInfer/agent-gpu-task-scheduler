@@ -1,4 +1,5 @@
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -78,6 +79,7 @@ def test_complete_real_qualification(harness: str, marker_env: str):
         state_root=root,
         base_url="https://127.0.0.1:8443",
         tls_certificate=identity.tls_certificate,
+        client_entrypoint=Path(sys.executable).with_name("agent-scheduler-submitter"),
         harness=harness,
     )
     verified = verify_qualification(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -126,6 +127,23 @@ def build_onboarding(
         argv=("--patch", str(path)),
         env={},
     )
+
+
+def prepare_client_workspace(project_root: Path, workspace: Path) -> Path:
+    source = project_root / CANONICAL_SKILL_DIR
+    if not (source / "SKILL.md").is_file():
+        raise OnboardingError(f"canonical Submitter skill is missing: {source}")
+    canonical = workspace / ".agents" / "skills" / "submit-gpu-task"
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    if canonical.exists() or canonical.is_symlink():
+        raise OnboardingError(f"client skill destination already exists: {canonical}")
+    shutil.copytree(source, canonical)
+    claude_root = workspace / ".claude" / "skills"
+    claude_root.mkdir(parents=True, exist_ok=True)
+    (claude_root / "submit-gpu-task").symlink_to(
+        Path("../../.agents/skills/submit-gpu-task")
+    )
+    return canonical
 
 
 def write_onboarding(config: OnboardingConfig) -> None:
