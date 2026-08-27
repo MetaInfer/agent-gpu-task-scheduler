@@ -4,15 +4,23 @@ from pathlib import Path
 
 import pytest
 
-from agent_scheduler.adapters.onboarding import HARNESSES
+from agent_scheduler.adapters.onboarding import HARNESSES, OnboardingError
 from agent_scheduler.adapters.submitter import build_submitter_invocation
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _invoke(harness: str, tmp_path: Path):
+@pytest.fixture(autouse=True)
+def isolate_pi_agent_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "pi-source-agent"
+    source.mkdir()
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(source))
+
+
+def _invoke(harness: str, tmp_path: Path, *, prompt_kind: str = "qualification"):
     return build_submitter_invocation(
         harness,
+        prompt_kind=prompt_kind,
         output_dir=tmp_path / "run",
         project_root=PROJECT_ROOT,
         state_root=Path("/public/share/agent-scheduler-mvp"),
@@ -31,6 +39,15 @@ def test_prompt_carries_the_system_prompt_and_the_run_binding(harness: str, tmp_
     submitter_prompt = (PROJECT_ROOT / "prompts" / "submitter.md").read_text(encoding="utf-8")
     assert submitter_prompt.strip() in invocation.prompt
     assert "Qualification Run: qual_abc123" in invocation.prompt
+
+
+def test_connectivity_prompt_requests_one_unconfirmed_proposal(tmp_path: Path):
+    invocation = _invoke("claude", tmp_path, prompt_kind="connectivity")
+
+    assert "Create exactly ONE 1-card Proposal" in invocation.prompt
+    assert "Do not confirm" in invocation.prompt
+    assert "four-task qualification" not in invocation.prompt
+    assert "Create four independent Proposals" not in invocation.prompt
 
 
 @pytest.mark.parametrize("harness", HARNESSES)
@@ -68,17 +85,61 @@ def test_pi_runs_non_interactively(tmp_path: Path):
     assert "--print" in invocation.argv
 
 
+def test_pi_invocation_passes_explicit_provider_and_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("AGENT_SCHEDULER_PI_PROVIDER", "anthropic")
+    monkeypatch.setenv("AGENT_SCHEDULER_PI_MODEL", "claude-example")
+
+    invocation = _invoke("pi", tmp_path)
+
+    provider_index = invocation.argv.index("--provider")
+    model_index = invocation.argv.index("--model")
+    assert invocation.argv[provider_index + 1] == "anthropic"
+    assert invocation.argv[model_index + 1] == "claude-example"
+
+
+def test_pi_invocation_rejects_partial_provider_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("AGENT_SCHEDULER_PI_PROVIDER", "anthropic")
+    monkeypatch.delenv("AGENT_SCHEDULER_PI_MODEL", raising=False)
+
+    with pytest.raises(OnboardingError, match="must be set together"):
+        _invoke("pi", tmp_path)
+
+
 def test_pi_invocation_carries_credentials_into_the_isolated_agent_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    source = tmp_path / "home" / ".pi" / "agent"
-    source.mkdir(parents=True)
+    source = tmp_path / "credentials-source"
+    source.mkdir()
     (source / "auth.json").write_text('{"providers": {}}', encoding="utf-8")
     (source / "models-store.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(source))
 
     invocation = _invoke("pi", tmp_path)
 
     isolated = Path(invocation.env["PI_CODING_AGENT_DIR"])
     assert (isolated / "auth.json").is_file()
     assert (isolated / "models-store.json").is_file()
+
+
+def test_pi_invocation_preserves_adapter_and_credentials_before_isolating_agent_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "source-agent"
+    source.mkdir(parents=True)
+    (source / "auth.json").write_text('{"providers": {}}', encoding="utf-8")
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(source))
+    monkeypatch.setenv("HOME", str(tmp_path / "different-home"))
+
+    invocation = _invoke("pi", tmp_path)
+
+    extension_index = invocation.argv.index("--extension")
+    assert Path(invocation.argv[extension_index + 1]) == (
+        source / "npm" / "node_modules" / "pi-mcp-adapter" / "index.ts"
+    )
+    isolated = Path(invocation.env["PI_CODING_AGENT_DIR"])
+    assert isolated != source
+    assert (isolated / "auth.json").is_file()

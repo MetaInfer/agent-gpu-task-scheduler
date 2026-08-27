@@ -42,6 +42,18 @@ def test_real_gpu_and_container_preconditions():
     assert inspection.exists and not inspection.running
 
 
+def test_complete_real_qualification_requires_explicit_gpu_opt_in(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setenv("RUN_FULL_QUALIFICATION", "1")
+    monkeypatch.setenv("RUN_REAL_CODEX", "1")
+    monkeypatch.delenv("RUN_REAL_GPU", raising=False)
+    monkeypatch.setenv("AGENT_SCHEDULER_STATE_ROOT", str(tmp_path / "missing"))
+
+    with pytest.raises(pytest.skip.Exception, match="RUN_REAL_GPU"):
+        test_complete_real_qualification("codex", "RUN_REAL_CODEX")
+
+
 @pytest.mark.parametrize(
     ("harness", "marker_env"),
     [
@@ -55,6 +67,8 @@ def test_real_gpu_and_container_preconditions():
 def test_complete_real_qualification(harness: str, marker_env: str):
     if os.environ.get("RUN_FULL_QUALIFICATION") != "1":
         pytest.skip("set RUN_FULL_QUALIFICATION=1 after Master and Worker are running")
+    if os.environ.get("RUN_REAL_GPU") != "1":
+        pytest.skip("set RUN_REAL_GPU=1 for the authorized real GPU qualification")
     if os.environ.get(marker_env) != "1":
         pytest.skip(f"set {marker_env}=1 to qualify the {harness} Submitter")
     root = Path(os.environ.get("AGENT_SCHEDULER_STATE_ROOT", "/public/share/agent-scheduler-mvp"))

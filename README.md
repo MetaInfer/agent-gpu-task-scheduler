@@ -17,6 +17,7 @@
 
 - [使用文档](docs/usage.md) — 安装、配置、启动、提交、运维、排障的完整指南
 - [从 Agent 会话提交](docs/submitting-from-an-agent-session.md) — 给 Claude ​Code/Codex CLI/pi/dsh 会话装 MCP 与 Skill 的详细操作
+- [测试 Submitter](docs/testing-the-submitter.md) — 四个 harness 分章节的 T1/T2/T3 测试与排障指南
 - [系统 Spec](docs/agent-task-scheduler-spec.md) — 架构与设计约束
 - [资格状态](docs/qualification-status.md) — 真实资格证据
 
@@ -32,7 +33,7 @@ uv run mypy src
 真实测试必须显式 opt-in，分三层，成本依次上升：
 
 ```bash
-# T1（默认门禁的一部分，见上）：结构/生成逻辑正确性，零成本，不发真实请求
+# T1：先确认 shell 没有 RUN_REAL_*；严格零成本命令见 docs/testing-the-submitter.md
 
 # T2：单个 Agent 真实连通性检查——建一个 Proposal 就停，不跑 GPU
 RUN_REAL_CLAUDE=1 uv run pytest tests/test_real_onboarding.py -m real_claude
@@ -42,7 +43,7 @@ RUN_REAL_DSH=1    uv run pytest tests/test_real_onboarding.py -m real_dsh
 
 # T3：单个 Agent 完整 1/2/4/8 卡资格闭环——真实 GPU，复用容器严格串行，一次只跑一个
 RUN_REAL_GPU=1 RUN_FULL_QUALIFICATION=1 RUN_REAL_CLAUDE=1 \
-  uv run pytest tests/test_real_qualification.py -m real_claude
+  uv run pytest tests/test_real_qualification.py -m 'real_claude and real_gpu'
 ```
 
 T2 需要 Master 已用 `AGENT_SCHEDULER_HARNESS_MODE=fake` 启动（见下）；T3 需要

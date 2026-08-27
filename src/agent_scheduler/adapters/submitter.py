@@ -11,6 +11,7 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from agent_scheduler.adapters.onboarding import (
     HARNESSES,
@@ -39,6 +40,7 @@ def submitter_executable(harness: str) -> str:
 def build_submitter_invocation(
     harness: str,
     *,
+    prompt_kind: Literal["qualification", "connectivity"] = "qualification",
     output_dir: Path,
     project_root: Path,
     state_root: Path,
@@ -64,7 +66,7 @@ def build_submitter_invocation(
     if harness == "pi":
         _seed_pi_agent_dir(output_dir)
     binary = executable or submitter_executable(harness)
-    prompt = _prompt(project_root, run_id)
+    prompt = _prompt(project_root, run_id, prompt_kind)
     env = _base_environment(tls_certificate)
     env.update(onboarding.env)
     if harness == "claude":
@@ -94,22 +96,48 @@ def build_submitter_invocation(
             *onboarding.argv,
         )
     elif harness == "pi":
-        argv = (binary, "--print", "--mode", "json", *onboarding.argv)
+        adapter = _pi_source_agent_dir() / "npm" / "node_modules" / "pi-mcp-adapter" / "index.ts"
+        argv = (
+            binary,
+            *_pi_model_arguments(),
+            "--extension",
+            str(adapter),
+            "--print",
+            "--mode",
+            "json",
+            *onboarding.argv,
+        )
     else:
         env["DSH_PERMISSION_MODE"] = "danger-full-access"
         argv = (binary, "--profile", "headless", *onboarding.argv)
     return SubmitterInvocation(argv=argv, env=env, prompt=prompt)
 
 
-def _prompt(project_root: Path, run_id: str) -> str:
-    """Fold the system prompt into the body; codex and dsh have no flag for it."""
-    system_prompt = (project_root / "prompts" / "submitter.md").read_text(encoding="utf-8")
+def _prompt(
+    project_root: Path,
+    run_id: str,
+    prompt_kind: Literal["qualification", "connectivity"],
+) -> str:
+    """Fold the selected system prompt into the body; codex and dsh have no flag for it."""
+    prompt_name = (
+        "submitter.md" if prompt_kind == "qualification" else "submitter-connectivity.md"
+    )
+    system_prompt = (project_root / "prompts" / prompt_name).read_text(encoding="utf-8")
+    if prompt_kind == "connectivity":
+        task = (
+            "Create exactly ONE 1-card Proposal, then stop after create_proposal returns. "
+            "Do not confirm the revision, submit a reply, or poll for a Task."
+        )
+    else:
+        task = (
+            "Run the four-task qualification: one Proposal each for 1, 2, 4, and 8 cards. "
+            "Drive each Task to a terminal state before reporting."
+        )
     return (
         f"{system_prompt.strip()}\n\n"
         f"qualification_run_id={run_id}\n"
-        "Run the four-task qualification: one Proposal each for 1, 2, 4, and 8 cards. "
-        f"Every Proposal you create MUST include the exact line `Qualification Run: {run_id}`. "
-        "Drive each Task to a terminal state before reporting."
+        f"{task}\n"
+        f"Every Proposal you create MUST include the exact line `Qualification Run: {run_id}`."
     )
 
 
@@ -137,13 +165,28 @@ def _base_environment(tls_certificate: Path) -> dict[str, str]:
     return env
 
 
+def _pi_model_arguments() -> tuple[str, ...]:
+    provider = os.environ.get("AGENT_SCHEDULER_PI_PROVIDER")
+    model = os.environ.get("AGENT_SCHEDULER_PI_MODEL")
+    if bool(provider) != bool(model):
+        raise OnboardingError(
+            "AGENT_SCHEDULER_PI_PROVIDER and AGENT_SCHEDULER_PI_MODEL must be set together"
+        )
+    return ("--provider", provider, "--model", model) if provider and model else ()
+
+
+def _pi_source_agent_dir() -> Path:
+    configured = os.environ.get("PI_CODING_AGENT_DIR")
+    return Path(configured) if configured else Path(os.environ.get("HOME", "/root")) / ".pi" / "agent"
+
+
 def _seed_pi_agent_dir(output_dir: Path) -> None:
     """Copy credentials into the isolated agent dir.
 
     pi resolves auth.json from PI_CODING_AGENT_DIR, so redirecting that variable for
     per-run isolation would otherwise drop the provider credentials with it.
     """
-    source = Path(os.environ.get("HOME", "/root")) / ".pi" / "agent"
+    source = _pi_source_agent_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
     for name in ("auth.json", "models-store.json"):
         candidate = source / name

@@ -36,6 +36,7 @@ def _run_submitter(harness: str, tmp_path: Path, run_id: str) -> subprocess.Comp
     assert uv_path is not None, "uv is required to launch the MCP adapter"
     invocation = build_submitter_invocation(
         harness,
+        prompt_kind="connectivity",
         output_dir=tmp_path / "run",
         project_root=PROJECT_ROOT,
         state_root=state_root,
@@ -45,14 +46,9 @@ def _run_submitter(harness: str, tmp_path: Path, run_id: str) -> subprocess.Comp
         tls_certificate=tls_certificate,
         run_id=run_id,
     )
-    prompt = (
-        f"{invocation.prompt}\n\n"
-        "For this connectivity check, create exactly ONE 1-card Proposal and stop. "
-        "Do not confirm it, do not poll for a Task."
-    )
     return subprocess.run(
         list(invocation.argv),
-        input=prompt,
+        input=invocation.prompt,
         text=True,
         capture_output=True,
         check=False,
@@ -62,12 +58,15 @@ def _run_submitter(harness: str, tmp_path: Path, run_id: str) -> subprocess.Comp
     )
 
 
-def _created_proposal_for(state_root: Path, run_id: str) -> bool:
+def _proposal_ids_for(state_root: Path, run_id: str) -> set[str]:
     marker = f"Qualification Run: {run_id}"
-    return any(
-        isinstance(value.get("markdown"), str) and marker in value["markdown"]
+    return {
+        str(value["proposal_id"])
         for value in EventStore(state_root).iter_immutable("revisions")
-    )
+        if isinstance(value.get("proposal_id"), str)
+        and isinstance(value.get("markdown"), str)
+        and marker in value["markdown"]
+    }
 
 
 @pytest.mark.parametrize(
@@ -91,12 +90,21 @@ def test_harness_creates_a_proposal_through_its_own_onboarding(
 
     completed = _run_submitter(harness, tmp_path, run_id)
 
-    # A created Proposal is the only assertion that holds across all four: pi hides
-    # the 12 tools behind a proxy tool unless directTools is honoured, so asserting
-    # native tool names would report a false failure. Creating a Proposal proves tool
-    # discovery, argument passing, and control-plane connectivity at once.
-    assert _created_proposal_for(state_root, run_id), (
-        f"{harness} created no Proposal bound to {run_id}\n"
-        f"exit={completed.returncode}\nstdout={completed.stdout[-4000:]}\n"
-        f"stderr={completed.stderr[-4000:]}"
+    # Ground Truth, not CLI output, proves that connectivity mode stayed create-only.
+    store = EventStore(state_root)
+    proposal_ids = _proposal_ids_for(state_root, run_id)
+    diagnostic = (
+        f"{harness} did not create exactly one Proposal bound to {run_id}: "
+        f"{sorted(proposal_ids)}\nexit={completed.returncode}\n"
+        f"stdout={completed.stdout[-4000:]}\nstderr={completed.stderr[-4000:]}"
     )
+    assert len(proposal_ids) == 1, diagnostic
+    proposal_id = next(iter(proposal_ids))
+    proposal = store.read_snapshot("proposals", proposal_id)
+    assert proposal is not None and proposal.get("state") == "AWAITING_CONFIRMATION", diagnostic
+    tasks = [
+        value
+        for value in store.iter_immutable("tasks")
+        if value.get("proposal_id") == proposal_id
+    ]
+    assert tasks == [], diagnostic

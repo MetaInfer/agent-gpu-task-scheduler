@@ -567,15 +567,25 @@ def _run_local_gates(project_root: Path, store: EventStore, run_id: str) -> str 
     uv_path = shutil.which("uv")
     if uv_path is None:
         return "uv executable not found for local gates"
+    real_marker_filter = (
+        "not real_claude and not real_codex and not real_pi and not real_dsh and not real_gpu"
+    )
     commands = (
-        [uv_path, "run", "pytest", "-m", "not real_claude and not real_gpu", "-q"],
+        [uv_path, "run", "pytest", "-m", real_marker_filter, "-q"],
         [uv_path, "run", "ruff", "check", "."],
         [uv_path, "run", "mypy", "src"],
     )
     results: list[dict[str, object]] = []
     passed = True
     env = os.environ.copy()
-    for name in ("RUN_REAL_CLAUDE", "RUN_REAL_GPU", "RUN_FULL_QUALIFICATION"):
+    for name in (
+        "RUN_REAL_CLAUDE",
+        "RUN_REAL_CODEX",
+        "RUN_REAL_PI",
+        "RUN_REAL_DSH",
+        "RUN_REAL_GPU",
+        "RUN_FULL_QUALIFICATION",
+    ):
         env.pop(name, None)
     for command in commands:
         try:

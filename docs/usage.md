@@ -2,7 +2,8 @@
 
 适用版本 0.2.0。本文覆盖安装、初始化、配置、启动、提交任务、观察、运维、排障与边界。
 架构与设计约束见 [`agent-task-scheduler-spec.md`](agent-task-scheduler-spec.md)，真实资格证据见
-[`qualification-status.md`](qualification-status.md)。
+[`qualification-status.md`](qualification-status.md)。四个 Submitter harness 的分层测试命令和
+排障顺序见 [`testing-the-submitter.md`](testing-the-submitter.md)。
 
 ---
 
@@ -63,7 +64,7 @@ uv run mypy src
 涉及真实计费或真实硬件的测试必须显式 opt-in，分三层，成本依次上升：
 
 ```bash
-# T1（上面的默认门禁已覆盖）：配置生成/契约逻辑正确性，零成本
+# T1：先确认 shell 没有 RUN_REAL_*；严格零成本命令见 testing-the-submitter.md
 
 # T2：单个 Agent 真实连通性检查——建一个 Proposal 就停，Master 用 fake harness 即可，不碰 GPU
 RUN_REAL_CLAUDE=1 uv run pytest tests/test_real_onboarding.py -m real_claude
@@ -73,7 +74,7 @@ RUN_REAL_DSH=1    uv run pytest tests/test_real_onboarding.py -m real_dsh
 
 # T3：单个 Agent 完整 1/2/4/8 卡资格闭环——真实 GPU，复用容器严格串行，一次只跑一个
 RUN_REAL_GPU=1 RUN_FULL_QUALIFICATION=1 RUN_REAL_CODEX=1 \
-  uv run pytest tests/test_real_qualification.py -m real_codex
+  uv run pytest tests/test_real_qualification.py -m 'real_codex and real_gpu'
 ```
 
 四个 Agent（Claude ​Code、Codex CLI、pi、dsh）都能跑 T2/T3；四家的一次性安装前置

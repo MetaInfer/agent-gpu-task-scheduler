@@ -379,5 +379,6 @@ OS 账号是 state-root 属组的成员就够了，这也正好吻合最初的�
 ## 相关文档
 
 - [使用文档](usage.md) — 完整的安装、配置、REST/MCP 参考、运维与排障
+- [测试 Submitter](testing-the-submitter.md) — Claude ​Code/Codex CLI/pi/dsh 分章节的 T1/T2/T3 验证方法
 - [系统 Spec](agent-task-scheduler-spec.md) — 架构与设计约束
 - `.agents/skills/submit-gpu-task/reference/proposal-template.md` — 真实通过评审的 Proposal 模板

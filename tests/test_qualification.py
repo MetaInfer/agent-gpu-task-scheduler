@@ -1,7 +1,9 @@
+import subprocess
 from pathlib import Path
 
 from conftest import proposal_markdown, signed_task
 
+from agent_scheduler import qualification
 from agent_scheduler.domain.models import (
     Revision,
     TaskState,
@@ -16,6 +18,40 @@ from agent_scheduler.qualification import (
     verify_qualification,
 )
 from agent_scheduler.storage import EventStore
+
+
+def test_local_gates_exclude_and_strip_every_real_test_opt_in(
+    monkeypatch, tmp_path: Path
+):
+    real_env_names = (
+        "RUN_REAL_CLAUDE",
+        "RUN_REAL_CODEX",
+        "RUN_REAL_PI",
+        "RUN_REAL_DSH",
+        "RUN_REAL_GPU",
+        "RUN_FULL_QUALIFICATION",
+    )
+    for name in real_env_names:
+        monkeypatch.setenv(name, "1")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs["env"]))
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(qualification.subprocess, "run", fake_run)
+
+    failure = qualification._run_local_gates(
+        tmp_path, EventStore(tmp_path / "state"), "qual_local_gate"
+    )
+
+    assert failure is None
+    pytest_command, child_env = calls[0]
+    marker_expression = pytest_command[pytest_command.index("-m") + 1]
+    for marker in ("real_claude", "real_codex", "real_pi", "real_dsh", "real_gpu"):
+        assert f"not {marker}" in marker_expression
+    for name in real_env_names:
+        assert name not in child_env
 
 
 def test_missing_credentials_are_a_structured_block(monkeypatch, tmp_path: Path):
