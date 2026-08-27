@@ -1,5 +1,8 @@
 # 从一个 Agent 会话提交 Proposal
 
+> **读者范围：服务提供方内部部署与端到端联调。** 如果你只运行 Agent Client、没有服务端
+> 源码访问权限，请使用 [纯客户端接入文档](submitting-from-an-agent-client.md)。
+
 回答一个具体问题：手上有一个 Agent 会话——Claude ​Code、Codex CLI、pi 或 dsh 之一——
 怎么让它给调度器发 Proposal？四家的答案形状相同，细节不同，本文档逐一给出。
 

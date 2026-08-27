@@ -217,15 +217,20 @@ def test_example_mcp_config_uses_the_python_module_entrypoint():
     assert server["args"][:3] == ["-m", "agent_scheduler.cli.main", "mcp"]
 
 
-def test_onboarding_doc_covers_every_harness():
-    doc = (PROJECT_ROOT / "docs" / "submitting-from-an-agent-session.md").read_text(
-        encoding="utf-8"
+def test_onboarding_docs_cover_every_harness():
+    paths = (
+        PROJECT_ROOT / "docs" / "submitting-from-an-agent-client.md",
+        PROJECT_ROOT / "docs" / "submitting-from-an-agent-session.md",
     )
-    for harness in HARNESSES:
-        assert harness in doc.lower(), f"onboarding doc does not mention {harness}"
-    # The one-time installs are the接入方's responsibility and must be stated.
-    assert "pi install npm:pi-mcp-adapter" in doc
-    assert "dsh plugin" in doc and "dsh-mcp-bridge" in doc
+    for path in paths:
+        doc = path.read_text(encoding="utf-8")
+        for harness in HARNESSES:
+            assert harness in doc.lower(), f"{path.name} does not mention {harness}"
+
+    provider_doc = paths[1].read_text(encoding="utf-8")
+    # Provider-side qualification keeps its historical one-time install commands.
+    assert "pi install npm:pi-mcp-adapter" in provider_doc
+    assert "dsh plugin" in provider_doc and "dsh-mcp-bridge" in provider_doc
 
 
 def test_no_document_still_points_at_the_old_claude_only_filename():

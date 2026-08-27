@@ -16,7 +16,8 @@
 ## 文档
 
 - [使用文档](docs/usage.md) — 安装、配置、启动、提交、运维、排障的完整指南
-- [从 Agent 会话提交](docs/submitting-from-an-agent-session.md) — 给 Claude ​Code/Codex CLI/pi/dsh 会话装 MCP 与 Skill 的详细操作
+- [Agent Client 接入](docs/submitting-from-an-agent-client.md) — 不接触服务端源码，只安装 Client Kit、MCP 与 skill
+- [服务方内部 Agent 联调](docs/submitting-from-an-agent-session.md) — 启动 Master/Worker 并验证四种 harness
 - [测试 Submitter](docs/testing-the-submitter.md) — 四个 harness 分章节的 T1/T2/T3 测试与排障指南
 - [系统 Spec](docs/agent-task-scheduler-spec.md) — 架构与设计约束
 - [资格状态](docs/qualification-status.md) — 真实资格证据
@@ -48,8 +49,9 @@ RUN_REAL_GPU=1 RUN_FULL_QUALIFICATION=1 RUN_REAL_CLAUDE=1 \
 
 T2 需要 Master 已用 `AGENT_SCHEDULER_HARNESS_MODE=fake` 启动（见下）；T3 需要
 `AGENT_SCHEDULER_HARNESS_MODE=claude`（Processor/Reviewer 始终是 Claude，与被测试的
-Submitter harness 无关）且 Worker 已连接。四个 harness 的一次性安装前置见
-[从 Agent 会话提交](docs/submitting-from-an-agent-session.md)。
+Submitter harness 无关）且 Worker 已连接。服务方执行这些测试所需的四个 harness 前置见
+[服务方内部 Agent 联调](docs/submitting-from-an-agent-session.md)；只运行 Client Kit 的操作者请见
+[Agent Client 接入](docs/submitting-from-an-agent-client.md)。
 
 ## 初始化
 
