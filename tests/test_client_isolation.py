@@ -9,6 +9,7 @@ import threading
 import time
 import venv
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import cast
 
@@ -28,65 +29,90 @@ proposal_markdown = cast(
 
 
 @pytest.fixture
-def live_master(
-    runtime_identity: tuple[Path, RuntimeIdentity],
-) -> Iterator[tuple[str, Path, Path]]:
-    root, identity = runtime_identity
-    settings = Settings(
-        state_root=root,
-        harness_mode="fake",
-        worker_mode="fake",
-        qualification_profile=False,
-        vram_threshold=2.0,
-        allowed_users=frozenset({"zz_chentian"}),
-        auto_schedule=False,
-    )
-    app = create_app(settings, identity)
-    listener = socket.socket()
-    listener.bind(("127.0.0.1", 0))
-    listener.listen()
-    port = int(listener.getsockname()[1])
-    server = uvicorn.Server(
-        uvicorn.Config(
-            app,
-            host="127.0.0.1",
-            port=port,
-            ssl_certfile=str(identity.tls_certificate),
-            ssl_keyfile=str(identity.tls_private_key),
-            log_level="error",
-        )
-    )
-    thread = threading.Thread(
-        target=lambda: server.run(sockets=[listener]),
-        daemon=True,
-    )
-    thread.start()
-    deadline = time.monotonic() + 10
-    while not server.started and thread.is_alive() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    if not server.started:
-        server.should_exit = True
-        thread.join(timeout=5)
-        raise RuntimeError("test Master did not start")
-    try:
-        yield f"https://127.0.0.1:{port}", identity.tls_certificate, root
-    finally:
-        server.should_exit = True
-        thread.join(timeout=10)
-        listener.close()
-        assert not thread.is_alive()
-
-
-def test_built_client_creates_proposal_from_empty_workspace(
-    tmp_path: Path,
-    live_master: tuple[str, Path, Path],
-) -> None:
+def release_wheel() -> Path:
     configured = os.environ.get("AGENT_SCHEDULER_CLIENT_WHEEL")
     if not configured:
         pytest.skip("set AGENT_SCHEDULER_CLIENT_WHEEL to a built client wheel")
     wheel = Path(configured)
     assert wheel.is_file()
+    return wheel
 
+
+@contextmanager
+def _serve_live_master(
+    root: Path,
+    identity: RuntimeIdentity,
+) -> Iterator[tuple[str, Path, Path]]:
+    listener: socket.socket | None = None
+    server: uvicorn.Server | None = None
+    thread: threading.Thread | None = None
+    try:
+        settings = Settings(
+            state_root=root,
+            harness_mode="fake",
+            worker_mode="fake",
+            qualification_profile=False,
+            vram_threshold=2.0,
+            allowed_users=frozenset({"zz_chentian"}),
+            auto_schedule=False,
+        )
+        app = create_app(settings, identity)
+        listener = socket.socket()
+        running_listener = listener
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = int(listener.getsockname()[1])
+        server = uvicorn.Server(
+            uvicorn.Config(
+                app,
+                host="127.0.0.1",
+                port=port,
+                ssl_certfile=str(identity.tls_certificate),
+                ssl_keyfile=str(identity.tls_private_key),
+                log_level="error",
+            )
+        )
+        running_server = server
+        thread = threading.Thread(
+            target=lambda: running_server.run(sockets=[running_listener]),
+            daemon=True,
+        )
+        thread.start()
+        deadline = time.monotonic() + 10
+        while not server.started and thread.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not server.started:
+            raise RuntimeError("test Master did not start")
+        yield f"https://127.0.0.1:{port}", identity.tls_certificate, root
+    finally:
+        try:
+            if server is not None:
+                server.should_exit = True
+            if thread is not None:
+                thread.join(timeout=10)
+        finally:
+            if listener is not None:
+                listener.close()
+        if thread is not None:
+            assert not thread.is_alive(), "test Master thread did not stop"
+
+
+@pytest.fixture
+def live_master(
+    release_wheel: Path,
+    runtime_identity: tuple[Path, RuntimeIdentity],
+) -> Iterator[tuple[str, Path, Path]]:
+    assert release_wheel.is_file()
+    root, identity = runtime_identity
+    with _serve_live_master(root, identity) as master:
+        yield master
+
+
+def test_built_client_creates_proposal_from_empty_workspace(
+    tmp_path: Path,
+    release_wheel: Path,
+    live_master: tuple[str, Path, Path],
+) -> None:
     venv_dir = tmp_path / "venv"
     venv.EnvBuilder(with_pip=True).create(venv_dir)
     python = venv_dir / "bin" / "python3"
@@ -98,7 +124,7 @@ def test_built_client_creates_proposal_from_empty_workspace(
             "install",
             "--no-index",
             "--no-deps",
-            str(wheel),
+            str(release_wheel),
         ],
         check=True,
         capture_output=True,
@@ -189,3 +215,76 @@ def test_built_client_creates_proposal_from_empty_workspace(
     assert isinstance(proposal_id, str)
     assert proposal_id.startswith("prop_")
     assert EventStore(root).read_snapshot("proposals", proposal_id) is not None
+
+
+@pytest.mark.parametrize(
+    ("thread_stays_alive", "expected_error"),
+    [
+        (False, "test Master did not start"),
+        (True, "test Master thread did not stop"),
+    ],
+    ids=("cleanup-succeeds", "cleanup-fails"),
+)
+def test_live_master_startup_failure_always_cleans_up(
+    runtime_identity: tuple[Path, RuntimeIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    thread_stays_alive: bool,
+    expected_error: str,
+) -> None:
+    class FakeListener:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def bind(self, address: tuple[str, int]) -> None:
+            assert address == ("127.0.0.1", 0)
+
+        def listen(self) -> None:
+            pass
+
+        def getsockname(self) -> tuple[str, int]:
+            return "127.0.0.1", 43210
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeServer:
+        def __init__(self) -> None:
+            self.started = False
+            self.should_exit = False
+
+    class FakeThread:
+        def __init__(self) -> None:
+            self.join_timeouts: list[float | None] = []
+
+        def start(self) -> None:
+            pass
+
+        def is_alive(self) -> bool:
+            return bool(self.join_timeouts) and thread_stays_alive
+
+        def join(self, timeout: float | None = None) -> None:
+            self.join_timeouts.append(timeout)
+
+    listener = FakeListener()
+    server = FakeServer()
+    thread = FakeThread()
+    monkeypatch.setattr(socket, "socket", lambda: listener)
+    monkeypatch.setattr(uvicorn, "Server", lambda _config: server)
+    monkeypatch.setattr(
+        threading,
+        "Thread",
+        lambda *, target, daemon: thread,
+    )
+
+    root, identity = runtime_identity
+    expected_type: type[BaseException] = AssertionError if thread_stays_alive else RuntimeError
+    with (
+        pytest.raises(expected_type, match=expected_error),
+        _serve_live_master(root, identity),
+    ):
+        pytest.fail("startup failure must not yield")
+
+    assert server.should_exit is True
+    assert thread.join_timeouts == [10]
+    assert listener.closed is True
+    assert thread.is_alive() is thread_stays_alive
