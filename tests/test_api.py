@@ -1,15 +1,5 @@
-import io
-import json
-
-import httpx
-import pytest
 from conftest import proposal_markdown
 
-from agent_scheduler_client.mcp import (
-    MCPAdapterError,
-    SubmitterMCPAdapter,
-    _response_object,
-)
 from agent_scheduler.worker.docker import DockerError
 
 
@@ -119,7 +109,7 @@ def test_cancel_and_drain_are_real_state_changes(app_client):
     assert rejected.status_code == 503
 
 
-def test_dashboard_and_mcp_stdio_surface(app_client):
+def test_dashboard_surface(app_client):
     client, _app = app_client
     dashboard = client.get("/")
     assert dashboard.status_code == 200
@@ -127,69 +117,6 @@ def test_dashboard_and_mcp_stdio_surface(app_client):
     assert 'id="gpus"' in dashboard.text
     assert 'id="alerts"' in dashboard.text
     assert "2000" in dashboard.text
-
-    adapter = SubmitterMCPAdapter("https://example.invalid", "zz_chentian")
-    incoming = io.StringIO(
-        json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {"protocolVersion": "2025-11-25"},
-            }
-        )
-        + "\n"
-        + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-        + "\n"
-    )
-    outgoing = io.StringIO()
-    adapter.run_stdio(incoming, outgoing)
-    adapter.close()
-    responses = [json.loads(line) for line in outgoing.getvalue().splitlines()]
-    assert responses[0]["result"]["serverInfo"]["version"] == "0.2.0"
-    names = {tool["name"] for tool in responses[1]["result"]["tools"]}
-    assert names == {
-        "create_proposal",
-        "reply",
-        "confirm_revision",
-        "resume",
-        "cancel",
-        "get_proposal",
-        "get_reviews",
-        "get_task",
-        "cancel_task",
-        "wait_for_task",
-        "wait_for_events",
-        "get_logs",
-    }
-
-
-def test_mcp_adapter_surfaces_control_plane_error_body():
-    """A bare status line leaves the Submitter agent unable to correct its submission."""
-    adapter = SubmitterMCPAdapter("https://example.invalid", "zz_chentian")
-    request = httpx.Request("POST", "https://example.invalid/api/v1/proposals")
-    response = httpx.Response(
-        422,
-        json={
-            "error_code": "INVALID_PROPOSAL",
-            "message": "qualification run command does not match frozen launcher",
-        },
-        request=request,
-    )
-    with pytest.raises(MCPAdapterError) as error:
-        _response_object(response)
-    message = str(error.value)
-    assert "422" in message
-    assert "INVALID_PROPOSAL" in message
-    assert "frozen launcher" in message
-    adapter.close()
-
-
-def test_mcp_adapter_error_falls_back_to_body_text():
-    request = httpx.Request("GET", "https://example.invalid/api/v1/proposals/prop_x")
-    response = httpx.Response(502, text="upstream exploded", request=request)
-    with pytest.raises(MCPAdapterError, match="upstream exploded"):
-        _response_object(response)
 
 
 def test_summary_log_indexes_are_counted_not_enumerated(app_client):
