@@ -103,7 +103,8 @@ export CLIENT_ENTRYPOINT='/opt/agent-client/venv/bin/agent-scheduler-submitter'
 再运行下面的 renderer。它只替换允许的五个名称，并拒绝任何未解析 token：
 
 ```bash
-python3 - "$SOURCE_TEMPLATE" "$RENDERED_CONFIG" <<'PY'
+render_client_config() {
+  python3 - "$SOURCE_TEMPLATE" "$RENDERED_CONFIG" <<'PY'
 import os
 import sys
 from pathlib import Path
@@ -129,47 +130,40 @@ if marker in text:
 destination.parent.mkdir(parents=True, exist_ok=True)
 destination.write_text(text, encoding="utf-8")
 PY
+}
 ```
 
 渲染结果应留在本次 workspace 内，不要覆盖 Kit 中经过 hash 校验的源模板。
 
 ## 步骤 5 · 选择一个 Agent harness
 
-以下四个分支只执行一个。每个分支都从 Client Kit 的 `config/` 目录读取对应模板，
-并且不修改用户级全局配置。
+以下四个配置分支只执行一个。每个分支都设置 `HARNESS`、从 Client Kit 的 `config/` 目录
+选择模板，并调用步骤 4 定义的 renderer。**本步骤不启动 harness**；所有预检通过后才在
+步骤 6 从 `CLIENT_WORKSPACE` 启动所选进程。
 
 ### Claude Code
 
-共享 JSON 模板包含 stdio MCP 参数和 12 个 `directTools` 名称。设置路径、运行步骤 4 的
-renderer，然后用严格的一次性配置启动：
+共享 JSON 模板包含 stdio MCP 参数和 12 个 `directTools` 名称。Claude Code 启动时会使用
+严格的一次性配置，不读取其他 MCP 配置：
 
 ```bash
+export HARNESS='claude'
 export SOURCE_TEMPLATE='/opt/agent-client/kit/config/mcp.example.json'
 export RENDERED_CONFIG="$CLIENT_WORKSPACE/.client-config/claude-mcp.json"
-
-# 运行步骤 4 的 renderer 后：
-claude --strict-mcp-config --mcp-config "$RENDERED_CONFIG"
+render_client_config
 ```
-
-`--strict-mcp-config` 保证本次会话只使用明确传入的 MCP 配置。
 
 ### Codex CLI
 
-TOML 模板是本次连接参数的可读参考。设置路径并运行步骤 4 的 renderer；启动时把已渲染
-TOML 中相同的 `command`、`args`、`cwd` 三项作为每进程 `-c` 覆盖传入：
+TOML 模板是本次连接参数的可读参考。后续启动命令会把其中相同的 `command`、`args`、`cwd`
+作为每进程覆盖传入；不运行任何会写入用户级全局配置的 MCP 添加命令：
 
 ```bash
+export HARNESS='codex'
 export SOURCE_TEMPLATE='/opt/agent-client/kit/config/codex-mcp.example.toml'
 export RENDERED_CONFIG="$CLIENT_WORKSPACE/.client-config/codex-mcp.toml"
-
-# 运行步骤 4 的 renderer，核对渲染后的 TOML，然后：
-codex \
-  -c "mcp_servers.submitter.command=\"$CLIENT_ENTRYPOINT\"" \
-  -c "mcp_servers.submitter.args=[\"--base-url\", \"$MASTER_URL\", \"--username\", \"$USERNAME\", \"--ca-file\", \"$CA_FILE\"]" \
-  -c "mcp_servers.submitter.cwd=\"$CLIENT_WORKSPACE\""
+render_client_config
 ```
-
-这里故意不使用会写入全局配置的 MCP 添加命令；每次进程都显式携带三项覆盖。
 
 ### pi
 
@@ -178,38 +172,39 @@ Client Kit 隐式分发。pi 使用与 Claude Code 相同的 JSON 模板，其�
 MCP 工具直接暴露给 Agent：
 
 ```bash
+export HARNESS='pi'
 export SOURCE_TEMPLATE='/opt/agent-client/kit/config/mcp.example.json'
 export RENDERED_CONFIG="$CLIENT_WORKSPACE/.client-config/pi-mcp.json"
-
-# 运行步骤 4 的 renderer 后：
-pi --mcp-config "$RENDERED_CONFIG"
+render_client_config
 ```
 
 ### dsh
 
 `dsh-mcp-bridge` 所需的 MCP client 与 skill-filesystem 外部插件必须已经包含在客户端镜像中，
 或由客户从批准的软件源预先安装；Client Kit 只提供配置模板。YAML 模板是一份 overlay，
-同时声明 submitter MCP 和
-`$CLIENT_WORKSPACE/.agents/skills` skill 根：
+同时声明 submitter MCP 和 `$CLIENT_WORKSPACE/.agents/skills` skill 根：
 
 ```bash
+export HARNESS='dsh'
 export SOURCE_TEMPLATE='/opt/agent-client/kit/config/dsh-mcp.example.patch.yml'
 export RENDERED_CONFIG="$CLIENT_WORKSPACE/.client-config/dsh-mcp.patch.yml"
-
-# 运行步骤 4 的 renderer 后：
-dsh --profile headless --patch "$RENDERED_CONFIG"
+render_client_config
 ```
 
-只传这一份 `--patch` overlay，避免 MCP 与 skill 指向不同 workspace。
+后续 dsh 只传这一份 `--patch` overlay，避免 MCP 与 skill 指向不同 workspace。
 
 ## 步骤 6 · 分层预检
 
-先按以下顺序验证 artifact、entrypoint、CA 和 HTTPS；任何一步失败都不要继续触发任务：
+先回到 Kit 根目录，按顺序验证 artifact、客户端文件与 HTTPS。任何一步失败都不要启动
+harness 或触发任务：
 
 ```bash
+cd /opt/agent-client/kit
 sha256sum -c SHA256SUMS
 test -x "$CLIENT_ENTRYPOINT"
 test -r "$CA_FILE"
+test -r "$CLIENT_WORKSPACE/.agents/skills/submit-gpu-task/SKILL.md"
+test -r "$RENDERED_CONFIG"
 curl --cacert "$CA_FILE" "$MASTER_URL/health"
 ```
 
@@ -234,8 +229,62 @@ cancel_task  wait_for_task  wait_for_events  get_logs
 ```
 
 本地 `initialize` 和 `tools/list` 由 Adapter 直接回答，**不会访问 REST**；它们通过只能证明
-entrypoint 与工具契约可用，不能替代前面的 HTTPS health 检查。最后在选定 harness 中确认
-`submitter` MCP 已连接，并确认 `submit-gpu-task` skill 可见。
+entrypoint 与工具契约可用，不能替代前面的 HTTPS health 检查。
+
+启动前再检查所选 harness 的可执行文件。Claude Code 还必须保留步骤 3 创建的项目内 symlink；
+pi 与 dsh 的外部插件前置仍由客户端镜像负责：
+
+```bash
+case "$HARNESS" in
+  claude)
+    command -v claude >/dev/null
+    test -L "$CLIENT_WORKSPACE/.claude/skills/submit-gpu-task"
+    ;;
+  codex)
+    command -v codex >/dev/null
+    ;;
+  pi)
+    command -v pi >/dev/null
+    ;;
+  dsh)
+    command -v dsh >/dev/null
+    ;;
+  *)
+    printf 'unsupported harness: %s\n' "$HARNESS" >&2
+    exit 2
+    ;;
+esac
+```
+
+以上预检全部通过后，先把 **harness 进程本身** 的工作目录切到 `CLIENT_WORKSPACE`，再只启动
+步骤 5 选定的一个分支：
+
+```bash
+cd "$CLIENT_WORKSPACE"
+
+case "$HARNESS" in
+  claude)
+    claude --strict-mcp-config --mcp-config "$RENDERED_CONFIG"
+    ;;
+  codex)
+    codex \
+      -c "mcp_servers.submitter.command=\"$CLIENT_ENTRYPOINT\"" \
+      -c "mcp_servers.submitter.args=[\"--base-url\", \"$MASTER_URL\", \"--username\", \"$USERNAME\", \"--ca-file\", \"$CA_FILE\"]" \
+      -c "mcp_servers.submitter.cwd=\"$CLIENT_WORKSPACE\""
+    ;;
+  pi)
+    pi --mcp-config "$RENDERED_CONFIG"
+    ;;
+  dsh)
+    dsh --profile headless --patch "$RENDERED_CONFIG"
+    ;;
+esac
+```
+
+`cd` 让 Claude Code、Codex CLI 与 pi 从项目根发现 `.agents/skills`（Claude Code 跟随其
+`.claude/skills` symlink）；Codex 的 MCP `cwd` 只设置 Adapter 子进程目录，不能替代 harness
+进程的项目目录。dsh 仍从同一 overlay 取得 MCP 与绝对 skill 根。进入会话后确认 `submitter`
+MCP 已连接且 `submit-gpu-task` skill 可见，再继续步骤 7。
 
 ## 步骤 7 · 触发任务
 
