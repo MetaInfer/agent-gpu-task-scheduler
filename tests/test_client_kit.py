@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_scheduler import client_kit as client_kit_module
 from agent_scheduler.client_kit import KitBuildInputs, build_client_kit
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -217,6 +218,31 @@ def test_existing_output_is_rejected_without_modification(
     assert marker.read_text(encoding="utf-8") == "keep"
 
 
+def test_dangling_output_symlink_is_rejected_without_removal(
+    fake_client_wheel: Path,
+    fake_dependency_wheelhouse: Path,
+    tmp_path: Path,
+) -> None:
+    missing_target = tmp_path / "missing-target"
+    output = tmp_path / "dangling-output"
+    output.symlink_to(missing_target, target_is_directory=True)
+
+    with pytest.raises(FileExistsError):
+        build_client_kit(
+            _inputs(
+                project_root=PROJECT_ROOT,
+                client_wheel=fake_client_wheel,
+                dependency_wheelhouse=fake_dependency_wheelhouse,
+                output_dir=output,
+            ),
+            smoke_install=False,
+        )
+
+    assert output.is_symlink()
+    assert output.readlink() == missing_target
+    assert not missing_target.exists()
+
+
 @pytest.mark.parametrize(
     "member",
     [
@@ -274,6 +300,58 @@ def test_client_wheel_rejects_symlink_member(
         )
 
 
+@pytest.mark.parametrize(
+    "file_type",
+    [stat.S_IFIFO, stat.S_IFCHR, stat.S_IFBLK, stat.S_IFSOCK],
+    ids=["fifo", "character-device", "block-device", "socket"],
+)
+def test_client_wheel_rejects_non_regular_external_modes(
+    file_type: int,
+    fake_client_wheel: Path,
+    fake_dependency_wheelhouse: Path,
+    tmp_path: Path,
+) -> None:
+    special = zipfile.ZipInfo("agent_scheduler_client/special")
+    special.create_system = 3
+    special.external_attr = (file_type | 0o644) << 16
+    with zipfile.ZipFile(fake_client_wheel, "a") as archive:
+        archive.writestr(special, "")
+
+    with pytest.raises(ValueError, match="regular file or directory"):
+        build_client_kit(
+            _inputs(
+                project_root=PROJECT_ROOT,
+                client_wheel=fake_client_wheel,
+                dependency_wheelhouse=fake_dependency_wheelhouse,
+                output_dir=tmp_path / "kit",
+            ),
+            smoke_install=False,
+        )
+
+
+def test_client_wheel_filename_requires_whl_suffix(
+    fake_dependency_wheelhouse: Path,
+    tmp_path: Path,
+) -> None:
+    wheel = _write_wheel(
+        tmp_path / "agent_gpu_task_scheduler_client-0.2.0-py3-none-any.zip",
+        "agent-gpu-task-scheduler-client",
+        "agent_scheduler_client",
+        "0.2.0",
+    )
+
+    with pytest.raises(ValueError, match=r"\.whl"):
+        build_client_kit(
+            _inputs(
+                project_root=PROJECT_ROOT,
+                client_wheel=wheel,
+                dependency_wheelhouse=fake_dependency_wheelhouse,
+                output_dir=tmp_path / "kit",
+            ),
+            smoke_install=False,
+        )
+
+
 def test_client_wheel_rejects_server_package(
     fake_client_wheel: Path,
     fake_dependency_wheelhouse: Path,
@@ -306,6 +384,62 @@ def test_client_wheel_requires_client_package(
     )
 
     with pytest.raises(ValueError, match="agent_scheduler_client"):
+        build_client_kit(
+            _inputs(
+                project_root=PROJECT_ROOT,
+                client_wheel=wheel,
+                dependency_wheelhouse=fake_dependency_wheelhouse,
+                output_dir=tmp_path / "kit",
+            ),
+            smoke_install=False,
+        )
+
+
+def test_client_wheel_rejects_distribution_mismatch(
+    fake_dependency_wheelhouse: Path,
+    tmp_path: Path,
+) -> None:
+    wheel = _write_wheel(
+        tmp_path / "agent_gpu_task_scheduler_client-0.2.0-py3-none-any.whl",
+        "different-client",
+        "agent_scheduler_client",
+        "0.2.0",
+    )
+
+    with pytest.raises(ValueError, match="distribution"):
+        build_client_kit(
+            _inputs(
+                project_root=PROJECT_ROOT,
+                client_wheel=wheel,
+                dependency_wheelhouse=fake_dependency_wheelhouse,
+                output_dir=tmp_path / "kit",
+            ),
+            smoke_install=False,
+        )
+
+
+def test_client_wheel_rejects_duplicate_distribution_metadata(
+    fake_dependency_wheelhouse: Path,
+    tmp_path: Path,
+) -> None:
+    wheel = tmp_path / "agent_gpu_task_scheduler_client-0.2.0-py3-none-any.whl"
+    dist_info = "agent_gpu_task_scheduler_client-0.2.0.dist-info"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("agent_scheduler_client/__init__.py", "")
+        archive.writestr(
+            f"{dist_info}/METADATA",
+            (
+                "Metadata-Version: 2.3\n"
+                "Name: agent-gpu-task-scheduler-client\n"
+                "Name: shadow-distribution\n"
+                "Version: 0.2.0\n"
+                "Requires-Python: >=3.10\n"
+            ),
+        )
+        archive.writestr(f"{dist_info}/WHEEL", "Wheel-Version: 1.0\n")
+        archive.writestr(f"{dist_info}/RECORD", "")
+
+    with pytest.raises(ValueError, match="exactly one Name"):
         build_client_kit(
             _inputs(
                 project_root=PROJECT_ROOT,
@@ -386,6 +520,36 @@ def test_dependency_wheelhouse_rejects_server_distribution_metadata(
             ),
             smoke_install=False,
         )
+
+
+def test_dependency_wheelhouse_rejects_wheel_symlink(
+    fake_client_wheel: Path,
+    fake_dependency_wheelhouse: Path,
+    tmp_path: Path,
+) -> None:
+    dependency = _write_wheel(
+        tmp_path / "linked-dependency-1.0-py3-none-any.whl",
+        "linked-dependency",
+        "linked_dependency",
+        "1.0",
+    )
+    linked_wheel = fake_dependency_wheelhouse / dependency.name
+    linked_wheel.symlink_to(dependency)
+    output = tmp_path / "kit"
+
+    with pytest.raises(ValueError, match="regular file"):
+        build_client_kit(
+            _inputs(
+                project_root=PROJECT_ROOT,
+                client_wheel=fake_client_wheel,
+                dependency_wheelhouse=fake_dependency_wheelhouse,
+                output_dir=output,
+            ),
+            smoke_install=False,
+        )
+
+    assert linked_wheel.is_symlink()
+    assert not output.exists()
 
 
 @pytest.mark.parametrize("kind", ["symlink", "fifo"])
@@ -472,6 +636,53 @@ def test_client_doc_rejects_unexpected_or_duplicate_release_tokens(
     assert not output.exists()
 
 
+def test_client_doc_requires_plain_kit_version_token(
+    public_project_root: Path,
+    fake_client_wheel: Path,
+    fake_dependency_wheelhouse: Path,
+    tmp_path: Path,
+) -> None:
+    doc = public_project_root / "docs" / "submitting-from-an-agent-client.md"
+    doc.write_text(
+        doc.read_text(encoding="utf-8").replace("@@KIT_VERSION@@", "0.2.0"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="exactly one @@KIT_VERSION@@"):
+        build_client_kit(
+            _inputs(
+                project_root=public_project_root,
+                client_wheel=fake_client_wheel,
+                dependency_wheelhouse=fake_dependency_wheelhouse,
+                output_dir=tmp_path / "kit",
+            ),
+            smoke_install=False,
+        )
+
+
+@pytest.mark.parametrize("token", ["@@SERVER-SECRET@@", "@@TOKEN1@@", "@@lowercase@@"])
+def test_client_doc_rejects_every_unresolved_token_shape(
+    token: str,
+    public_project_root: Path,
+    fake_client_wheel: Path,
+    fake_dependency_wheelhouse: Path,
+    tmp_path: Path,
+) -> None:
+    doc = public_project_root / "docs" / "submitting-from-an-agent-client.md"
+    doc.write_text(f"{doc.read_text(encoding='utf-8')}\n{token}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unexpected release tokens"):
+        build_client_kit(
+            _inputs(
+                project_root=public_project_root,
+                client_wheel=fake_client_wheel,
+                dependency_wheelhouse=fake_dependency_wheelhouse,
+                output_dir=tmp_path / "kit",
+            ),
+            smoke_install=False,
+        )
+
+
 @pytest.mark.parametrize("replacement", ["literal-username", "@@UNEXPECTED@@"])
 def test_config_templates_require_exact_token_allowlist(
     replacement: str,
@@ -499,6 +710,32 @@ def test_config_templates_require_exact_token_allowlist(
         )
 
     assert not output.exists()
+
+
+@pytest.mark.parametrize("token", ["@@SERVER-SECRET@@", "@@TOKEN1@@", "@@lowercase@@"])
+def test_config_templates_reject_every_unresolved_token_shape(
+    token: str,
+    public_project_root: Path,
+    fake_client_wheel: Path,
+    fake_dependency_wheelhouse: Path,
+    tmp_path: Path,
+) -> None:
+    template = public_project_root / "config" / "client" / "mcp.example.json"
+    template.write_text(
+        f"{template.read_text(encoding='utf-8')}\n{token}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="template tokens"):
+        build_client_kit(
+            _inputs(
+                project_root=public_project_root,
+                client_wheel=fake_client_wheel,
+                dependency_wheelhouse=fake_dependency_wheelhouse,
+                output_dir=tmp_path / "kit",
+            ),
+            smoke_install=False,
+        )
 
 
 def test_duplicate_wheel_filename_with_different_bytes_is_rejected(
@@ -576,6 +813,80 @@ def test_smoke_failure_removes_only_new_output(
     assert not output.exists()
 
 
+def test_base_exception_during_smoke_removes_new_output(
+    fake_client_wheel: Path,
+    fake_dependency_wheelhouse: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SmokeAbort(BaseException):
+        pass
+
+    def abort_smoke(*_args: object) -> None:
+        raise SmokeAbort
+
+    output = tmp_path / "kit"
+    monkeypatch.setattr("agent_scheduler.client_kit._smoke_install", abort_smoke)
+
+    with pytest.raises(SmokeAbort):
+        build_client_kit(
+            _inputs(
+                project_root=PROJECT_ROOT,
+                client_wheel=fake_client_wheel,
+                dependency_wheelhouse=fake_dependency_wheelhouse,
+                output_dir=output,
+            )
+        )
+
+    assert not output.exists()
+
+
+def test_smoke_install_subprocess_contract_uses_empty_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "kit"
+    wheels = root / "wheels"
+    wheels.mkdir(parents=True)
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_create(_builder: object, _destination: Path) -> None:
+        return None
+
+    def fake_run(
+        command: list[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        workspace = kwargs.get("cwd")
+        assert isinstance(workspace, Path)
+        assert workspace != root
+        assert workspace.is_dir()
+        assert list(workspace.iterdir()) == []
+        environment = kwargs.get("env")
+        assert isinstance(environment, dict)
+        assert "PYTHONPATH" not in environment
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setenv("PYTHONPATH", "/private/provider/source")
+    monkeypatch.setattr(client_kit_module.venv.EnvBuilder, "create", fake_create)
+    monkeypatch.setattr(client_kit_module.subprocess, "run", fake_run)
+
+    client_kit_module._smoke_install(root, "0.2.0")
+
+    assert len(calls) == 3
+    workspaces = {call_kwargs["cwd"] for _command, call_kwargs in calls}
+    assert len(workspaces) == 1
+    for _command, call_kwargs in calls:
+        assert call_kwargs["check"] is True
+        assert call_kwargs["capture_output"] is True
+        assert call_kwargs["text"] is True
+    install_command = calls[0][0]
+    assert install_command[5:7] == ["--find-links", str(wheels.resolve())]
+    assert calls[1][0][-1] == "--help"
+    assert "find_spec('agent_scheduler') is None" in calls[2][0][-1]
+
+
 def _script_environment() -> dict[str, str]:
     environment = os.environ.copy()
     python_paths = [str(PROJECT_ROOT / "src"), str(PROJECT_ROOT / "packages" / "client" / "src")]
@@ -643,9 +954,11 @@ def test_cli_builds_and_smoke_installs_kit_offline(tmp_path: Path) -> None:
     [
         (["claude=1", "codex=1", "pi=1"], "exactly four"),
         (["claude=1", "claude=2", "codex=1", "pi=1"], "duplicate harness name: claude"),
+        (["claude=1", "codex=1", "pi=1", "dsh"], "NAME=VERSION"),
+        (["claude=1", "codex=1", "pi=1", "dsh=1", "other=1"], "exactly four"),
     ],
 )
-def test_cli_rejects_wrong_count_and_duplicate_harness_versions(
+def test_cli_rejects_invalid_harness_versions(
     versions: list[str],
     message: str,
     tmp_path: Path,

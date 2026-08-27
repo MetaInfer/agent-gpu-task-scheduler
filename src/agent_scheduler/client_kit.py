@@ -30,7 +30,7 @@ _CONFIG_TOKENS = {
     "@@CA_FILE@@",
     "@@CLIENT_WORKSPACE@@",
 }
-_TOKEN = re.compile(r"@@[A-Z_]+@@")
+_TOKEN = re.compile(r"@@[^@\r\n]+@@")
 _CLIENT_DISTRIBUTION = "agent-gpu-task-scheduler-client"
 _CLIENT_PACKAGE = "agent_scheduler_client"
 _SERVER_PACKAGE = "agent_scheduler"
@@ -79,14 +79,22 @@ def _wheel_member_parts(name: str) -> tuple[str, ...]:
 
 
 def _inspect_wheel(path: Path) -> tuple[zipfile.ZipFile, list[tuple[zipfile.ZipInfo, tuple[str, ...]]]]:
+    if path.suffix != ".whl":
+        raise ValueError(f"wheel archive filename must end in .whl: {path}")
     _require_regular_file(path, "wheel")
     try:
         archive = zipfile.ZipFile(path)
         members: list[tuple[zipfile.ZipInfo, tuple[str, ...]]] = []
         for info in archive.infolist():
             parts = _wheel_member_parts(info.filename)
-            if stat.S_ISLNK(info.external_attr >> 16):
+            mode = info.external_attr >> 16
+            file_type = stat.S_IFMT(mode)
+            if stat.S_ISLNK(mode):
                 raise ValueError(f"wheel contains a symlink member: {info.filename}")
+            if file_type not in {0, stat.S_IFREG, stat.S_IFDIR}:
+                raise ValueError(
+                    f"wheel member is not a regular file or directory: {info.filename}"
+                )
             if parts and parts[0] == _SERVER_PACKAGE:
                 raise ValueError(f"wheel contains the server package: {path}")
             members.append((info, parts))
@@ -245,10 +253,14 @@ def _write_sha256s(root: Path) -> None:
 
 
 def _smoke_install(root: Path, version: str) -> None:
+    wheelhouse = (root / "wheels").resolve(strict=True)
     child_environment = os.environ.copy()
     child_environment.pop("PYTHONPATH", None)
     with tempfile.TemporaryDirectory(prefix="agent-client-kit-smoke-") as temporary_directory:
-        virtual_environment = Path(temporary_directory) / "venv"
+        temporary_root = Path(temporary_directory)
+        virtual_environment = temporary_root / "venv"
+        workspace = temporary_root / "workspace"
+        workspace.mkdir()
         venv.EnvBuilder(with_pip=True).create(virtual_environment)
         if os.name == "nt":
             venv_python = virtual_environment / "Scripts" / "python.exe"
@@ -265,7 +277,7 @@ def _smoke_install(root: Path, version: str) -> None:
                 "install",
                 "--no-index",
                 "--find-links",
-                str(root / "wheels"),
+                str(wheelhouse),
                 f"{_CLIENT_DISTRIBUTION}=={version}",
             ],
             [str(submitter), "--help"],
@@ -285,6 +297,7 @@ def _smoke_install(root: Path, version: str) -> None:
                 capture_output=True,
                 text=True,
                 env=child_environment,
+                cwd=workspace,
             )
 
 
