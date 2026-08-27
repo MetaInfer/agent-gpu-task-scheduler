@@ -20,6 +20,7 @@ REQUIRED = (
     "--no-index",
     "--find-links",
     "sha256sum -c SHA256SUMS",
+    "python3 verify_client_kit.py .",
     "submit-gpu-task",
     "--ca-file",
     "Claude Code",
@@ -64,7 +65,7 @@ PREFLIGHT_COMMANDS = (
     "sha256sum -c SHA256SUMS",
     'test -x "$CLIENT_ENTRYPOINT"',
     'test -r "$CA_FILE"',
-    'curl --cacert "$CA_FILE" "$MASTER_URL/health"',
+    'curl --fail-with-body --cacert "$CA_FILE" "$MASTER_URL/health"',
 )
 
 ARTIFACT_FILE_CHECKS = (
@@ -132,9 +133,7 @@ def _assert_launch_contract(text: str) -> None:
 
     preflight_positions = tuple(step_6.index(command) for command in PREFLIGHT_COMMANDS)
     assert preflight_positions == tuple(sorted(preflight_positions))
-    file_check_positions = tuple(
-        step_6.index(command) for command in ARTIFACT_FILE_CHECKS
-    )
+    file_check_positions = tuple(step_6.index(command) for command in ARTIFACT_FILE_CHECKS)
     assert (
         preflight_positions[2]
         < file_check_positions[0]
@@ -184,6 +183,15 @@ def test_client_doc_uses_direct_python3_and_rejects_insecure_tls_commands():
     _assert_no_insecure_tls(text)
 
 
+def test_client_doc_requires_harness_authentication_and_safe_renderer_values() -> None:
+    text = _client_text()
+    assert "harness 自身" in text
+    assert "认证" in text
+    assert "不要发送" in text or "不得暴露" in text
+    assert "quote, backslash, or control" in text
+    assert "ord(character) < 32" in text
+
+
 def test_provider_doc_points_client_readers_to_the_client_doc():
     text = (PROJECT_ROOT / "docs" / "submitting-from-an-agent-session.md").read_text(
         encoding="utf-8"
@@ -193,10 +201,10 @@ def test_provider_doc_points_client_readers_to_the_client_doc():
 
 
 def test_internal_submitter_test_doc_describes_source_isolation():
-    text = (PROJECT_ROOT / "docs" / "testing-the-submitter.md").read_text(
-        encoding="utf-8"
-    )
+    text = (PROJECT_ROOT / "docs" / "testing-the-submitter.md").read_text(encoding="utf-8")
     assert "agent-scheduler-submitter" in text
     assert "client workspace" in text
     assert "不挂载服务端仓库" in text
     assert "python3 -m mypy src packages/client/src" in text
+    assert "AGENT_SCHEDULER_CLIENT_KIT" in text
+    assert "manifest" in text

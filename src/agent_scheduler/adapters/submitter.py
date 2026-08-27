@@ -47,6 +47,8 @@ def build_submitter_invocation(
     prompt_kind: Literal["qualification", "connectivity"] = "qualification",
     output_dir: Path,
     project_root: Path,
+    skill_source: Path,
+    config_source: Path,
     client_workspace: Path,
     base_url: str,
     username: str,
@@ -62,7 +64,6 @@ def build_submitter_invocation(
     if harness == "pi":
         pi_model_arguments = _pi_model_arguments()
         pi_provider = pi_model_arguments[1]
-    prepare_client_workspace(project_root, client_workspace)
     onboarding = build_onboarding(
         harness,
         output_dir=output_dir,
@@ -71,7 +72,9 @@ def build_submitter_invocation(
         username=username,
         client_entrypoint=client_entrypoint,
         ca_file=ca_file,
+        config_source=config_source,
     )
+    prepare_client_workspace(skill_source, client_workspace)
     write_onboarding(onboarding)
     if harness == "pi":
         _seed_pi_agent_dir(output_dir)
@@ -134,9 +137,7 @@ def _prompt(
     prompt_kind: Literal["qualification", "connectivity"],
 ) -> str:
     """Fold the selected system prompt into the body; codex and dsh have no flag for it."""
-    prompt_name = (
-        "submitter.md" if prompt_kind == "qualification" else "submitter-connectivity.md"
-    )
+    prompt_name = "submitter.md" if prompt_kind == "qualification" else "submitter-connectivity.md"
     system_prompt = (project_root / "prompts" / prompt_name).read_text(encoding="utf-8")
     if prompt_kind == "connectivity":
         task = (
@@ -200,7 +201,9 @@ def _pi_model_arguments() -> tuple[str, ...]:
 
 def _pi_source_agent_dir() -> Path:
     configured = os.environ.get("PI_CODING_AGENT_DIR")
-    return Path(configured) if configured else Path(os.environ.get("HOME", "/root")) / ".pi" / "agent"
+    return (
+        Path(configured) if configured else Path(os.environ.get("HOME", "/root")) / ".pi" / "agent"
+    )
 
 
 def _seed_pi_agent_dir(output_dir: Path) -> None:

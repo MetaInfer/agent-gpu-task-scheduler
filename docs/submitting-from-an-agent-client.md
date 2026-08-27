@@ -26,7 +26,8 @@
 
 - Python 3.10 或更高版本，并包含 `venv` 和 `pip`；
 - `sha256sum` 与支持 `--cacert` 的 `curl`；
-- 选定的 Agent harness；
+- 选定的 Agent harness，并且该 harness 已通过其自身获准的机制完成模型认证；MCP 配置不负责
+  harness 登录，任何 API key、token 或登录材料都不得写入 Kit、渲染配置、skill 或故障报告；
 - 对 `/opt/agent-client` 和 `CLIENT_WORKSPACE` 的写权限；
 - 对服务方 HTTPS 地址的网络访问，以及对发放 CA 文件的只读访问。
 
@@ -38,11 +39,14 @@ Client wheel 从 Kit 的本地 wheelhouse 离线安装；安装这一步不需�
 
 ```bash
 cd /opt/agent-client/kit
+python3 verify_client_kit.py .
 sha256sum -c SHA256SUMS
 ```
 
-只有全部显示 `OK` 才继续。任何缺失或摘要不一致都表示交付物不完整或已变化；不要修改
-`SHA256SUMS` 来绕过失败，应联系服务方更换 Kit。
+`verify_client_kit.py` 仅使用 Python 标准库；它不仅验证 manifest 与每个 SHA-256，还验证完整普通
+文件集合，拒绝额外文件、缺失文件、symlink 和特殊文件。`sha256sum -c` 是额外的人类可读摘要检查，
+不能替代完整集合验证。只有两项都成功才继续。任何缺失、额外文件或摘要不一致都表示交付物不完整
+或已变化；不要修改 `SHA256SUMS` 来绕过失败，应联系服务方更换 Kit。
 
 ## 步骤 2 · 离线安装 client wheel
 
@@ -100,7 +104,9 @@ export CLIENT_ENTRYPOINT='/opt/agent-client/venv/bin/agent-scheduler-submitter'
 ```
 
 选定步骤 5 的一个 harness 后，先按该分支设置 `SOURCE_TEMPLATE` 和 `RENDERED_CONFIG`，
-再运行下面的 renderer。它只替换允许的五个名称，并拒绝任何未解析 token：
+再运行下面的 renderer。五个 provider value 的允许契约是非空单行值，且不得包含双引号、反斜杠或
+ASCII control character；这让同一动态 marker 能安全写入 JSON、TOML 与 dsh YAML。renderer 只替换
+允许的五个名称，并拒绝不安全值及任何未解析 token：
 
 ```bash
 render_client_config() {
@@ -121,6 +127,19 @@ names = (
 missing = [name for name in names if not os.environ.get(name)]
 if missing:
     raise SystemExit(f"missing required values: {', '.join(missing)}")
+unsafe = [
+    name
+    for name in names
+    if any(
+        character in {'"', "\\"} or ord(character) < 32
+        for character in os.environ[name]
+    )
+]
+if unsafe:
+    raise SystemExit(
+        "provider values must not contain a quote, backslash, or control character: "
+        + ", ".join(unsafe)
+    )
 marker = "@" * 2
 text = source.read_text(encoding="utf-8")
 for name in names:
@@ -200,12 +219,13 @@ harness 或触发任务：
 
 ```bash
 cd /opt/agent-client/kit
+python3 verify_client_kit.py .
 sha256sum -c SHA256SUMS
 test -x "$CLIENT_ENTRYPOINT"
 test -r "$CA_FILE"
 test -r "$CLIENT_WORKSPACE/.agents/skills/submit-gpu-task/SKILL.md"
 test -r "$RENDERED_CONFIG"
-curl --cacert "$CA_FILE" "$MASTER_URL/health"
+curl --fail-with-body --cacert "$CA_FILE" "$MASTER_URL/health"
 ```
 
 然后直接向本地 entrypoint 发送 JSON-RPC `initialize` 和 `tools/list`：
@@ -320,6 +340,7 @@ reference template 内；本文不复制该模板，以免两个版本漂移。
 | entrypoint 不存在或不可执行 | 检查虚拟环境路径和安装输出，然后重新执行离线安装 |
 | skill 未被发现 | 检查 canonical 目录、Claude 相对 symlink，或 dsh overlay 中的 skill 根 |
 | MCP process failed | 核对 entrypoint 绝对路径、参数、workspace 与渲染结果 |
+| Agent harness 未认证 | 通过该 harness 自身获准的登录机制完成认证；不要把凭据写入或发送给 MCP、Kit、skill 或服务方 |
 | CA 文件不可读 | 检查容器内只读挂载路径和文件权限；无法修复时联系服务方 |
 | TLS hostname mismatch | 核对发放的 URL 与 CA 是否属于同一部署，然后联系服务方；不得关闭 TLS 验证 |
 | 连接被拒绝 | 联系服务方确认服务可用性；客户端不执行服务端诊断 |

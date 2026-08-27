@@ -8,13 +8,13 @@ from __future__ import annotations
 
 import os
 import subprocess
-import sys
 from pathlib import Path
 
 import httpx
 import pytest
 
 from agent_scheduler.adapters.submitter import build_submitter_invocation
+from agent_scheduler.client_kit import ClientKitRuntime, prepare_client_kit_runtime
 from agent_scheduler.domain.models import (
     Proposal,
     ProposalFacts,
@@ -29,26 +29,35 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BASE_URL = "https://127.0.0.1:8443"
 
 
+def _release_runtime(tmp_path: Path) -> ClientKitRuntime:
+    configured = os.environ.get("AGENT_SCHEDULER_CLIENT_KIT")
+    if not configured:
+        pytest.skip(
+            "set AGENT_SCHEDULER_CLIENT_KIT to a verified unpacked Kit before a billed harness launch"
+        )
+    return prepare_client_kit_runtime(Path(configured), tmp_path / "client-runtime")
+
+
 def _run_submitter(harness: str, tmp_path: Path, run_id: str) -> subprocess.CompletedProcess[str]:
+    runtime = _release_runtime(tmp_path)
     state_root = Path(
         os.environ.get("AGENT_SCHEDULER_STATE_ROOT", "/public/share/agent-scheduler-mvp")
     )
     tls_certificate = load_tls_certificate(state_root)
-    response = httpx.get(
-        f"{BASE_URL}/health", verify=str(tls_certificate), timeout=10
-    )
+    response = httpx.get(f"{BASE_URL}/health", verify=str(tls_certificate), timeout=10)
     response.raise_for_status()
-    client_entrypoint = Path(sys.executable).with_name("agent-scheduler-submitter")
     client_workspace = tmp_path / "client-workspace"
     invocation = build_submitter_invocation(
         harness,
         prompt_kind="connectivity",
         output_dir=tmp_path / "run",
         project_root=PROJECT_ROOT,
+        skill_source=runtime.skill_source,
+        config_source=runtime.config_source,
         client_workspace=client_workspace,
         base_url=BASE_URL,
         username="zz_chentian",
-        client_entrypoint=client_entrypoint,
+        client_entrypoint=runtime.client_entrypoint,
         ca_file=tls_certificate,
         run_id=run_id,
     )
@@ -62,6 +71,14 @@ def _run_submitter(harness: str, tmp_path: Path, run_id: str) -> subprocess.Comp
         cwd=invocation.cwd,
         env=invocation.env,
     )
+
+
+def test_release_runtime_requires_explicit_kit_before_billed_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("AGENT_SCHEDULER_CLIENT_KIT", raising=False)
+    with pytest.raises(pytest.skip.Exception, match="AGENT_SCHEDULER_CLIENT_KIT"):
+        _release_runtime(tmp_path)
 
 
 @pytest.mark.parametrize(

@@ -7,6 +7,8 @@ from collections.abc import Callable
 
 import httpx
 
+from agent_scheduler_client.tools import validate_tool_arguments
+
 
 class MCPAdapterError(RuntimeError):
     pass
@@ -119,12 +121,25 @@ class SubmitterRESTClient:
             headers=self._headers(),
         )
         _raise_for_status(response)
-        return {
-            "data": response.text,
-            "next_offset": int(response.headers.get("X-Next-Offset", offset)),
-        }
+        raw_next_offset = response.headers.get("X-Next-Offset")
+        try:
+            next_offset = int(raw_next_offset) if raw_next_offset is not None else -1
+        except ValueError:
+            next_offset = -1
+        expected_offset = offset + len(response.content)
+        if next_offset < 0 or next_offset != expected_offset:
+            detail = (
+                "invalid X-Next-Offset header: expected "
+                f"{expected_offset}, received {raw_next_offset!r}"
+            )
+            raise MCPAdapterError(detail[:200])
+        return {"data": response.text, "next_offset": next_offset}
 
     def call_tool(self, name: str, arguments: dict[str, object]) -> dict[str, object]:
+        try:
+            validate_tool_arguments(name, arguments)
+        except (TypeError, ValueError) as exc:
+            raise MCPAdapterError(str(exc)) from exc
         operations: dict[str, Callable[[], dict[str, object]]] = {
             "create_proposal": lambda: self.create_proposal(
                 _string(arguments, "markdown"), _string(arguments, "idempotency_key")

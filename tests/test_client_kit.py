@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -11,6 +12,13 @@ import zipfile
 from pathlib import Path
 
 import pytest
+from agent_scheduler_client import __version__
+from agent_scheduler_client.mcp import SubmitterMCPAdapter
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 
 from agent_scheduler import client_kit as client_kit_module
 from agent_scheduler.client_kit import KitBuildInputs, build_client_kit
@@ -22,6 +30,16 @@ _HARNESSES = {
     "pi": "0.84.3",
     "dsh": "0.1.1-rc.2",
 }
+_DEPENDENCIES = (
+    ("httpx", "0.28.1"),
+    ("httpcore", "1.0.9"),
+    ("anyio", "4.14.2"),
+    ("certifi", "2026.7.22"),
+    ("idna", "3.19"),
+    ("h11", "0.16.0"),
+    ("exceptiongroup", "1.3.1"),
+    ("typing_extensions", "4.16.0"),
+)
 
 
 def _write_wheel(path: Path, distribution: str, package: str, version: str) -> Path:
@@ -56,14 +74,10 @@ def _write_smokeable_client_wheel(path: Path, version: str) -> Path:
             "Requires-Python: >=3.10\n"
         ),
         f"{dist_info}/WHEEL": (
-            "Wheel-Version: 1.0\n"
-            "Generator: test\n"
-            "Root-Is-Purelib: true\n"
-            "Tag: py3-none-any\n"
+            "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
         ),
         f"{dist_info}/entry_points.txt": (
-            "[console_scripts]\n"
-            "agent-scheduler-submitter = agent_scheduler_client.cli:main\n"
+            "[console_scripts]\nagent-scheduler-submitter = agent_scheduler_client.cli:main\n"
         ),
     }
     record = "\n".join([*(f"{name},," for name in members), f"{dist_info}/RECORD,,"])
@@ -88,12 +102,13 @@ def fake_client_wheel(tmp_path: Path) -> Path:
 def fake_dependency_wheelhouse(tmp_path: Path) -> Path:
     wheelhouse = tmp_path / "dependency-wheels"
     wheelhouse.mkdir()
-    _write_wheel(
-        wheelhouse / "httpx-0.28.1-py3-none-any.whl",
-        "httpx",
-        "httpx",
-        "0.28.1",
-    )
+    for distribution, version in _DEPENDENCIES:
+        _write_wheel(
+            wheelhouse / f"{distribution}-{version}-py3-none-any.whl",
+            distribution.replace("_", "-"),
+            distribution,
+            version,
+        )
     return wheelhouse
 
 
@@ -108,11 +123,18 @@ def public_project_root(tmp_path: Path) -> Path:
         "codex-mcp.example.toml",
         "dsh-mcp.example.patch.yml",
     ):
-        shutil.copyfile(PROJECT_ROOT / "config" / "client" / name, root / "config" / "client" / name)
+        shutil.copyfile(
+            PROJECT_ROOT / "config" / "client" / name, root / "config" / "client" / name
+        )
     (root / "docs").mkdir()
     shutil.copyfile(
         PROJECT_ROOT / "docs" / "submitting-from-an-agent-client.md",
         root / "docs" / "submitting-from-an-agent-client.md",
+    )
+    (root / "packages" / "client").mkdir(parents=True)
+    shutil.copyfile(
+        PROJECT_ROOT / "packages" / "client" / "wheelhouse-requirements.txt",
+        root / "packages" / "client" / "wheelhouse-requirements.txt",
     )
     return root
 
@@ -133,6 +155,42 @@ def _inputs(
         kit_version="0.2.0",
         tested_harnesses=dict(_HARNESSES if tested_harnesses is None else tested_harnesses),
     )
+
+
+@pytest.fixture
+def built_kit(
+    public_project_root: Path,
+    fake_client_wheel: Path,
+    fake_dependency_wheelhouse: Path,
+    tmp_path: Path,
+) -> Path:
+    return build_client_kit(
+        _inputs(
+            project_root=public_project_root,
+            client_wheel=fake_client_wheel,
+            dependency_wheelhouse=fake_dependency_wheelhouse,
+            output_dir=tmp_path / "built-kit",
+        ),
+        smoke_install=False,
+    )
+
+
+def test_client_version_is_consistent_across_metadata_mcp_and_manifest(
+    built_kit: Path,
+) -> None:
+    metadata = tomllib.loads(
+        (PROJECT_ROOT / "packages" / "client" / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    adapter = SubmitterMCPAdapter("https://master.example", "client_user-1")
+    incoming = io.StringIO(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}) + "\n")
+    outgoing = io.StringIO()
+    adapter.run_stdio(incoming, outgoing)
+    adapter.close()
+    server_version = json.loads(outgoing.getvalue())["result"]["serverInfo"]["version"]
+    manifest = json.loads((built_kit / "MANIFEST.json").read_text(encoding="utf-8"))
+
+    assert metadata["project"]["version"] == __version__ == server_version
+    assert manifest["kit_version"] == manifest["client"]["version"] == __version__
 
 
 def test_builder_copies_only_allowlisted_client_artifacts(
@@ -173,6 +231,14 @@ def test_builder_copies_only_allowlisted_client_artifacts(
             "wheel": f"wheels/{fake_client_wheel.name}",
             "python_requires": ">=3.10",
         },
+        "dependencies": [
+            {
+                "distribution": distribution.replace("_", "-"),
+                "version": version,
+                "wheel": f"wheels/{distribution}-{version}-py3-none-any.whl",
+            }
+            for distribution, version in _DEPENDENCIES
+        ],
         "master_api": "v1",
         "mcp_server_name": "submitter",
         "tool_count": 12,
@@ -192,6 +258,188 @@ def test_builder_copies_only_allowlisted_client_artifacts(
     for line in checksum_lines:
         digest, relative = line.split("  ", 1)
         assert hashlib.sha256((output / relative).read_bytes()).hexdigest() == digest
+    assert (output / "verify_client_kit.py").is_file()
+    client_kit_module.verify_client_kit(output)
+
+
+@pytest.mark.parametrize("mutation", ["extra", "missing", "tamper", "symlink"])
+def test_complete_verifier_rejects_every_file_set_or_digest_mutation(
+    mutation: str, built_kit: Path
+) -> None:
+    target = built_kit / "config" / "mcp.example.json"
+    if mutation == "extra":
+        (built_kit / "extra.txt").write_text("extra", encoding="ascii")
+    elif mutation == "missing":
+        target.unlink()
+    elif mutation == "tamper":
+        target.write_text("tampered", encoding="ascii")
+    else:
+        (built_kit / "extra-link").symlink_to("MANIFEST.json")
+
+    with pytest.raises(ValueError, match="regular|file set|digest|missing|symlink"):
+        client_kit_module.verify_client_kit(built_kit)
+
+
+def _rewrite_manifest_and_checksum(root: Path, manifest: dict[str, object]) -> None:
+    manifest_path = root / "MANIFEST.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    checksum_path = root / "SHA256SUMS"
+    lines = checksum_path.read_text(encoding="ascii").splitlines()
+    digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    checksum_path.write_text(
+        "\n".join(
+            f"{digest}  MANIFEST.json" if line.endswith("  MANIFEST.json") else line
+            for line in lines
+        )
+        + "\n",
+        encoding="ascii",
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "extra-key",
+        "distribution",
+        "dependency-version",
+        "duplicate-dependency",
+        "tool-count",
+        "wheel-collision",
+        "nested-wheel",
+    ],
+)
+def test_complete_verifier_rejects_invalid_manifest_schema(mutation: str, built_kit: Path) -> None:
+    manifest = json.loads((built_kit / "MANIFEST.json").read_text(encoding="utf-8"))
+    if mutation == "extra-key":
+        manifest["surprise"] = True
+    elif mutation == "distribution":
+        manifest["client"]["distribution"] = "different-client"
+    elif mutation == "dependency-version":
+        manifest["dependencies"][0]["version"] = "999"
+    elif mutation == "duplicate-dependency":
+        manifest["dependencies"][1]["distribution"] = manifest["dependencies"][0]["distribution"]
+    elif mutation == "tool-count":
+        manifest["tool_count"] = 11
+    elif mutation == "wheel-collision":
+        manifest["dependencies"][0]["wheel"] = manifest["client"]["wheel"]
+    else:
+        manifest["client"]["wheel"] = "wheels/nested/client.whl"
+    _rewrite_manifest_and_checksum(built_kit, manifest)
+
+    with pytest.raises(ValueError, match="manifest|wheel|dependency|tool"):
+        client_kit_module.verify_client_kit(built_kit)
+
+
+def test_shipped_stdlib_verifier_rejects_extra_file(built_kit: Path) -> None:
+    (built_kit / "extra.txt").write_text("extra", encoding="ascii")
+    completed = subprocess.run(
+        [sys.executable, "-S", str(built_kit / "verify_client_kit.py"), str(built_kit)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode != 0
+    assert "file set" in completed.stderr
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra", "duplicate"])
+def test_dependency_wheelhouse_must_match_lock_exactly(
+    mutation: str,
+    public_project_root: Path,
+    fake_client_wheel: Path,
+    fake_dependency_wheelhouse: Path,
+    tmp_path: Path,
+) -> None:
+    if mutation == "missing":
+        (fake_dependency_wheelhouse / "h11-0.16.0-py3-none-any.whl").unlink()
+    elif mutation == "extra":
+        _write_wheel(
+            fake_dependency_wheelhouse / "extra-1.0-py3-none-any.whl",
+            "extra",
+            "extra",
+            "1.0",
+        )
+    else:
+        _write_wheel(
+            fake_dependency_wheelhouse / "httpx_duplicate-0.28.1-py3-none-any.whl",
+            "httpx",
+            "httpx_duplicate",
+            "0.28.1",
+        )
+
+    with pytest.raises(ValueError, match="dependency|wheelhouse|duplicate|missing|extra"):
+        build_client_kit(
+            _inputs(
+                project_root=public_project_root,
+                client_wheel=fake_client_wheel,
+                dependency_wheelhouse=fake_dependency_wheelhouse,
+                output_dir=tmp_path / "kit",
+            ),
+            smoke_install=False,
+        )
+
+
+@pytest.mark.parametrize("collision", ["package", "metadata"])
+def test_dependency_wheels_reject_client_code_or_distribution_metadata(
+    collision: str,
+    public_project_root: Path,
+    fake_client_wheel: Path,
+    fake_dependency_wheelhouse: Path,
+    tmp_path: Path,
+) -> None:
+    wheel = fake_dependency_wheelhouse / "httpx-0.28.1-py3-none-any.whl"
+    if collision == "package":
+        with zipfile.ZipFile(wheel, "a") as archive:
+            archive.writestr("agent_scheduler_client/shadow.py", "")
+    else:
+        wheel.unlink()
+        _write_wheel(wheel, "agent-gpu-task-scheduler-client", "httpx", "0.28.1")
+
+    with pytest.raises(ValueError, match="client package|client distribution"):
+        build_client_kit(
+            _inputs(
+                project_root=public_project_root,
+                client_wheel=fake_client_wheel,
+                dependency_wheelhouse=fake_dependency_wheelhouse,
+                output_dir=tmp_path / "kit",
+            ),
+            smoke_install=False,
+        )
+
+
+def test_release_runtime_verifies_and_installs_exact_manifest_wheels_offline(
+    public_project_root: Path,
+    fake_dependency_wheelhouse: Path,
+    tmp_path: Path,
+) -> None:
+    client_wheel = _write_smokeable_client_wheel(
+        tmp_path / "agent_gpu_task_scheduler_client-0.2.0-py3-none-any.whl",
+        "0.2.0",
+    )
+    kit = build_client_kit(
+        _inputs(
+            project_root=public_project_root,
+            client_wheel=client_wheel,
+            dependency_wheelhouse=fake_dependency_wheelhouse,
+            output_dir=tmp_path / "kit",
+        ),
+        smoke_install=False,
+    )
+
+    runtime = client_kit_module.prepare_client_kit_runtime(kit, tmp_path / "runtime")
+
+    assert runtime.kit_root == kit
+    assert runtime.client_entrypoint.is_file()
+    assert runtime.skill_source == kit / "skills" / "submit-gpu-task"
+    assert runtime.config_source == kit / "config"
+    completed = subprocess.run(
+        [str(runtime.client_entrypoint), "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_existing_output_is_rejected_without_modification(
@@ -765,26 +1013,23 @@ def test_duplicate_wheel_filename_with_different_bytes_is_rejected(
     assert not output.exists()
 
 
-def test_duplicate_wheel_filename_with_same_bytes_is_idempotent(
+def test_explicit_client_wheel_must_not_appear_in_dependency_wheelhouse(
     fake_client_wheel: Path,
     fake_dependency_wheelhouse: Path,
     tmp_path: Path,
 ) -> None:
     shutil.copyfile(fake_client_wheel, fake_dependency_wheelhouse / fake_client_wheel.name)
 
-    output = build_client_kit(
-        _inputs(
-            project_root=PROJECT_ROOT,
-            client_wheel=fake_client_wheel,
-            dependency_wheelhouse=fake_dependency_wheelhouse,
-            output_dir=tmp_path / "kit",
-        ),
-        smoke_install=False,
-    )
-
-    assert [path.name for path in (output / "wheels").glob(fake_client_wheel.name)] == [
-        fake_client_wheel.name
-    ]
+    with pytest.raises(ValueError, match="client distribution|dependency wheelhouse"):
+        build_client_kit(
+            _inputs(
+                project_root=PROJECT_ROOT,
+                client_wheel=fake_client_wheel,
+                dependency_wheelhouse=fake_dependency_wheelhouse,
+                output_dir=tmp_path / "kit",
+            ),
+            smoke_install=False,
+        )
 
 
 def test_smoke_failure_removes_only_new_output(
@@ -848,6 +1093,10 @@ def test_smoke_install_subprocess_contract_uses_empty_workspace(
     root = tmp_path / "kit"
     wheels = root / "wheels"
     wheels.mkdir(parents=True)
+    dependency = wheels / "dependency.whl"
+    client = wheels / "client.whl"
+    dependency.write_bytes(b"dependency")
+    client.write_bytes(b"client")
     calls: list[tuple[list[str], dict[str, object]]] = []
 
     def fake_create(_builder: object, _destination: Path) -> None:
@@ -869,6 +1118,15 @@ def test_smoke_install_subprocess_contract_uses_empty_workspace(
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setenv("PYTHONPATH", "/private/provider/source")
+    monkeypatch.setattr(
+        client_kit_module,
+        "verify_client_kit",
+        lambda _root: {
+            "kit_version": "0.2.0",
+            "client": {"wheel": "wheels/client.whl"},
+            "dependencies": [{"wheel": "wheels/dependency.whl"}],
+        },
+    )
     monkeypatch.setattr(client_kit_module.venv.EnvBuilder, "create", fake_create)
     monkeypatch.setattr(client_kit_module.subprocess, "run", fake_run)
 
@@ -882,7 +1140,8 @@ def test_smoke_install_subprocess_contract_uses_empty_workspace(
         assert call_kwargs["capture_output"] is True
         assert call_kwargs["text"] is True
     install_command = calls[0][0]
-    assert install_command[5:7] == ["--find-links", str(wheels.resolve())]
+    assert install_command[4:6] == ["--no-index", "--no-deps"]
+    assert all(argument.startswith(str(wheels.resolve())) for argument in install_command[6:])
     assert calls[1][0][-1] == "--help"
     assert "find_spec('agent_scheduler') is None" in calls[2][0][-1]
 
@@ -921,6 +1180,13 @@ def _script_command(
 def test_cli_builds_and_smoke_installs_kit_offline(tmp_path: Path) -> None:
     wheelhouse = tmp_path / "wheelhouse"
     wheelhouse.mkdir()
+    for distribution, version in _DEPENDENCIES:
+        _write_wheel(
+            wheelhouse / f"{distribution}-{version}-py3-none-any.whl",
+            distribution.replace("_", "-"),
+            distribution,
+            version,
+        )
     client_wheel = _write_smokeable_client_wheel(
         tmp_path / "agent_gpu_task_scheduler_client-0.2.0-py3-none-any.whl",
         "0.2.0",
@@ -986,7 +1252,7 @@ def test_cli_rejects_invalid_harness_versions(
 
 
 def test_wheelhouse_requirements_pin_python_310_transitives() -> None:
-    requirements = (PROJECT_ROOT / "packages" / "client" / "wheelhouse-requirements.txt")
+    requirements = PROJECT_ROOT / "packages" / "client" / "wheelhouse-requirements.txt"
     assert requirements.read_text(encoding="ascii").splitlines() == [
         "httpx==0.28.1",
         "httpcore==1.0.9",

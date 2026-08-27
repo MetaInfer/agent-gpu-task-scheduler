@@ -4,8 +4,14 @@ import os
 from pathlib import Path
 
 import pytest
+from agent_scheduler_client.tools import SUBMITTER_TOOLS
 
-from agent_scheduler.adapters.onboarding import HARNESSES, SUBMITTER_TOOLS, OnboardingError
+from agent_scheduler.adapters import onboarding as onboarding_module
+from agent_scheduler.adapters.onboarding import (
+    HARNESSES,
+    OnboardingError,
+    prepare_client_workspace,
+)
 from agent_scheduler.adapters.submitter import build_submitter_invocation
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +41,8 @@ def _invoke(harness: str, tmp_path: Path, *, prompt_kind: str = "qualification")
         prompt_kind=prompt_kind,
         output_dir=tmp_path / "run",
         project_root=PROJECT_ROOT,
+        skill_source=PROJECT_ROOT / ".agents" / "skills" / "submit-gpu-task",
+        config_source=PROJECT_ROOT / "config" / "client",
         client_workspace=tmp_path / "client-workspace",
         base_url="https://127.0.0.1:8443",
         username="zz_chentian",
@@ -78,17 +86,19 @@ def test_invocation_contains_no_server_repository_path(harness: str, tmp_path: P
     assert (invocation.cwd / ".agents" / "skills" / "submit-gpu-task" / "SKILL.md").is_file()
     claude_skill = invocation.cwd / ".claude" / "skills" / "submit-gpu-task"
     assert claude_skill.is_symlink()
-    assert claude_skill.resolve() == (
-        invocation.cwd / ".agents" / "skills" / "submit-gpu-task"
-    ).resolve()
+    assert (
+        claude_skill.resolve()
+        == (invocation.cwd / ".agents" / "skills" / "submit-gpu-task").resolve()
+    )
 
 
 @pytest.mark.parametrize("harness", HARNESSES)
 def test_invocation_starts_with_the_harness_executable(harness: str, tmp_path: Path):
     invocation = _invoke(harness, tmp_path)
-    assert invocation.argv[0] == {"claude": "claude", "codex": "codex", "pi": "pi", "dsh": "dsh"}[
-        harness
-    ]
+    assert (
+        invocation.argv[0]
+        == {"claude": "claude", "codex": "codex", "pi": "pi", "dsh": "dsh"}[harness]
+    )
 
 
 @pytest.mark.parametrize("harness", HARNESSES)
@@ -286,3 +296,104 @@ def test_child_environment_scopes_credentials_to_the_selected_harness(
     assert "AGENT_SCHEDULER_PI_PROVIDER" not in invocation.env
     assert "AGENT_SCHEDULER_PI_MODEL" not in invocation.env
     assert {name: os.environ.get(name) for name in parent_names} == parent_before
+
+
+def _skill_source(tmp_path: Path) -> Path:
+    source = tmp_path / "source-skill"
+    (source / "reference").mkdir(parents=True)
+    (source / "SKILL.md").write_text(
+        "---\nname: submit-gpu-task\ndescription: test\n---\n", encoding="utf-8"
+    )
+    (source / "reference" / "proposal-template.md").write_text("template", encoding="utf-8")
+    return source
+
+
+def test_prepare_client_workspace_publishes_complete_tree_atomically(tmp_path: Path) -> None:
+    source = _skill_source(tmp_path)
+    workspace = tmp_path / "workspace"
+
+    canonical = prepare_client_workspace(source, workspace)
+
+    assert canonical == workspace / ".agents" / "skills" / "submit-gpu-task"
+    assert (canonical / "reference" / "proposal-template.md").read_text(
+        encoding="utf-8"
+    ) == "template"
+    claude_skill = workspace / ".claude" / "skills" / "submit-gpu-task"
+    assert claude_skill.readlink() == Path("../../.agents/skills/submit-gpu-task")
+    assert not list(tmp_path.glob(".workspace.tmp-*"))
+
+
+@pytest.mark.parametrize("kind", ["missing", "symlink", "fifo"])
+def test_prepare_client_workspace_rejects_invalid_source_before_writes(
+    kind: str, tmp_path: Path
+) -> None:
+    source = tmp_path / "source-skill"
+    if kind != "missing":
+        source = _skill_source(tmp_path)
+        special = source / "special"
+        if kind == "symlink":
+            special.symlink_to("SKILL.md")
+        else:
+            os.mkfifo(special)
+    workspace = tmp_path / "workspace"
+
+    with pytest.raises(OnboardingError, match="source|regular|symlink"):
+        prepare_client_workspace(source, workspace)
+
+    assert not workspace.exists()
+    assert not list(tmp_path.glob(".workspace.tmp-*"))
+
+
+@pytest.mark.parametrize("existing", ["workspace", "canonical", "claude"])
+def test_prepare_client_workspace_never_modifies_existing_destinations(
+    existing: str, tmp_path: Path
+) -> None:
+    source = _skill_source(tmp_path)
+    workspace = tmp_path / "workspace"
+    marker = workspace / "keep.txt"
+    if existing == "workspace":
+        workspace.mkdir()
+    elif existing == "canonical":
+        (workspace / ".agents" / "skills" / "submit-gpu-task").mkdir(parents=True)
+    else:
+        (workspace / ".claude" / "skills" / "submit-gpu-task").mkdir(parents=True)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("keep", encoding="utf-8")
+
+    with pytest.raises(OnboardingError, match="already exists"):
+        prepare_client_workspace(source, workspace)
+
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+
+@pytest.mark.parametrize("failure", ["copy", "symlink", "rename"])
+def test_prepare_client_workspace_cleans_staging_on_injected_failure(
+    failure: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _skill_source(tmp_path)
+    workspace = tmp_path / "workspace"
+
+    if failure == "copy":
+        monkeypatch.setattr(
+            onboarding_module.shutil,
+            "copyfile",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("copy failed")),
+        )
+    elif failure == "symlink":
+        monkeypatch.setattr(
+            onboarding_module,
+            "_create_claude_symlink",
+            lambda *_args: (_ for _ in ()).throw(OSError("symlink failed")),
+        )
+    else:
+        monkeypatch.setattr(
+            onboarding_module.os,
+            "replace",
+            lambda *_args: (_ for _ in ()).throw(OSError("rename failed")),
+        )
+
+    with pytest.raises(OSError, match=f"{failure} failed"):
+        prepare_client_workspace(source, workspace)
+
+    assert not workspace.exists()
+    assert not list(tmp_path.glob(".workspace.tmp-*"))

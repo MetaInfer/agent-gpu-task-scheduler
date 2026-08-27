@@ -36,6 +36,9 @@ python3 -m mypy src packages/client/src
 ```bash
 # T1：先确认 shell 没有 RUN_REAL_*；严格零成本命令见 docs/testing-the-submitter.md
 
+# T2/T3 必须消费重新构建并完整验证的解压 Kit；缺失时在计费 Agent 启动前 skip
+export AGENT_SCHEDULER_CLIENT_KIT=/absolute/path/to/agent-client-kit-0.2.0
+
 # T2：单个 Agent 真实连通性检查——建一个 Proposal 就停，不跑 GPU
 RUN_REAL_CLAUDE=1 python3 -m pytest tests/test_real_onboarding.py -m real_claude
 RUN_REAL_CODEX=1  python3 -m pytest tests/test_real_onboarding.py -m real_codex
@@ -88,10 +91,12 @@ python3 -m agent_scheduler.cli.main worker
 ```
 
 终端 3：真实 Submitter 通过本地 MCP Adapter 一次提交四个 Proposal，并验证持久证据。
-默认是 Claude ​Code；`--harness` 可选 `codex`/`pi`/`dsh`，四者殊途同归到同一条
-`python3 -m agent_scheduler.cli.main mcp` 命令，Processor/Reviewer 始终跑 Claude，与 `--harness` 无关：
+默认是 Claude ​Code；`--harness` 可选 `codex`/`pi`/`dsh`。四者都必须消费同一个重新构建并
+完整验证的 Client Kit，最终启动 Kit 临时 venv 中的 `agent-scheduler-submitter`；
+Processor/Reviewer 始终跑 Claude，与 `--harness` 无关：
 
 ```bash
+export AGENT_SCHEDULER_CLIENT_KIT=/absolute/path/to/agent-client-kit-0.2.0
 python3 -m agent_scheduler.cli.main qualify [--harness claude|codex|pi|dsh]
 ```
 

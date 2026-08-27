@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+from agent_scheduler_client.tools import SUBMITTER_TOOLS
 
 try:
     import tomllib
@@ -20,21 +21,6 @@ from agent_scheduler.adapters.onboarding import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-_SUBMITTER_TOOLS = {
-    "create_proposal",
-    "reply",
-    "confirm_revision",
-    "get_reviews",
-    "resume",
-    "cancel",
-    "get_proposal",
-    "get_task",
-    "cancel_task",
-    "wait_for_task",
-    "wait_for_events",
-    "get_logs",
-}
 
 _TEMPLATE_TOKENS = {
     "@@CLIENT_ENTRYPOINT@@",
@@ -75,6 +61,7 @@ def _build(harness: str, tmp_path: Path):
         username="client_user-1",
         client_entrypoint=Path("/opt/agent-client/venv/bin/agent-scheduler-submitter"),
         ca_file=Path("/shared/state/tls/certificate.pem"),
+        config_source=PROJECT_ROOT / "config" / "client",
     )
 
 
@@ -122,7 +109,8 @@ def test_claude_config_is_a_valid_strict_mcp_config(tmp_path: Path):
         "/shared/state/tls/certificate.pem",
     ]
     assert server["cwd"] == str(tmp_path / "workspace")
-    assert set(server["directTools"]) == _SUBMITTER_TOOLS
+    assert server["directTools"] == list(SUBMITTER_TOOLS)
+    assert len(server["directTools"]) == len(set(server["directTools"]))
     assert "env" not in server
 
 
@@ -131,19 +119,50 @@ def test_pi_reuses_the_same_mcp_json_shape_and_promotes_direct_tools(tmp_path: P
     written = next(path for path in config.files if path.name == "mcp.json")
     server = json.loads(config.files[written])["mcpServers"]["submitter"]
     # Without directTools the 12 tools hide behind pi-mcp-adapter's proxy tool.
-    assert set(server["directTools"]) == _SUBMITTER_TOOLS
+    assert server["directTools"] == list(SUBMITTER_TOOLS)
+    assert len(server["directTools"]) == len(set(server["directTools"]))
     assert config.env["PI_CODING_AGENT_DIR"] == str(written.parent)
 
 
-def test_codex_config_is_passed_as_flags_and_writes_no_file(tmp_path: Path):
+def test_codex_config_is_parsed_from_kit_template_and_passed_as_flags(tmp_path: Path):
     config = _build("codex", tmp_path)
-    assert config.files == {}
     assert config.argv.count("-c") == 3
+    rendered = next(content for path, content in config.files.items() if path.suffix == ".toml")
+    server = tomllib.loads(rendered)["mcp_servers"]["submitter"]
+    assert server == {
+        "command": "/opt/agent-client/venv/bin/agent-scheduler-submitter",
+        "args": [
+            "--base-url",
+            "https://master.example:8443",
+            "--username",
+            "client_user-1",
+            "--ca-file",
+            "/shared/state/tls/certificate.pem",
+        ],
+        "cwd": str(tmp_path / "workspace"),
+    }
     joined = " ".join(config.argv)
     assert (
         "mcp_servers.submitter.command="
         "/opt/agent-client/venv/bin/agent-scheduler-submitter" in joined
     )
+
+
+@pytest.mark.parametrize("bad", ['quote"value', "back\\slash", "line\nfeed", "control\x01"])
+def test_template_renderer_rejects_values_unsafe_in_json_toml_and_yaml(
+    bad: str, tmp_path: Path
+) -> None:
+    with pytest.raises(OnboardingError, match="quote, backslash, or control"):
+        build_onboarding(
+            "claude",
+            output_dir=tmp_path / "run",
+            workspace=tmp_path / "workspace",
+            base_url="https://master.example:8443",
+            username=bad,
+            client_entrypoint=Path("/opt/agent-client/venv/bin/agent-scheduler-submitter"),
+            ca_file=Path("/shared/state/tls/certificate.pem"),
+            config_source=PROJECT_ROOT / "config" / "client",
+        )
 
 
 def test_dsh_patch_uses_the_workspace_skill_root(tmp_path: Path):
@@ -169,37 +188,35 @@ def test_client_config_templates_use_only_documented_tokens():
 
 def test_json_and_toml_templates_parse_before_rendering():
     json.loads(
-        (PROJECT_ROOT / "config" / "client" / "mcp.example.json").read_text(
-            encoding="utf-8"
-        )
+        (PROJECT_ROOT / "config" / "client" / "mcp.example.json").read_text(encoding="utf-8")
     )
     tomllib.loads(
-        (PROJECT_ROOT / "config" / "client" / "codex-mcp.example.toml").read_text(
-            encoding="utf-8"
-        )
+        (PROJECT_ROOT / "config" / "client" / "codex-mcp.example.toml").read_text(encoding="utf-8")
     )
 
 
-def test_dsh_template_uses_the_real_plugin_directive_shape():
-    lines = (
-        PROJECT_ROOT / "config" / "client" / "dsh-mcp.example.patch.yml"
-    ).read_text(encoding="utf-8").splitlines()
-    expected_lines = (
-        "- insert:",
-        "    - id: mcp-submitter",
-        "      name: '@deepseek-ai/dsh-mcp-client'",
-        "        serverName: submitter",
-        "        transport: stdio",
-        '        command: "@@CLIENT_ENTRYPOINT@@"',
-        '        cwd: "@@CLIENT_WORKSPACE@@"',
-        "    - id: skill-filesystem-submitter",
-        "      name: '@deepseek-ai/dsh-skill-filesystem'",
-        "        providerName: submitter",
-        "        customSkillDirs:",
-        '          - "@@CLIENT_WORKSPACE@@/.agents/skills"',
+def test_dsh_template_uses_the_exact_real_plugin_directive_shape():
+    text = (PROJECT_ROOT / "config" / "client" / "dsh-mcp.example.patch.yml").read_text(
+        encoding="utf-8"
     )
-    for line in expected_lines:
-        assert line in lines
+    assert text == (
+        "- insert:\n"
+        "    - id: mcp-submitter\n"
+        "      name: '@deepseek-ai/dsh-mcp-client'\n"
+        "      config:\n"
+        "        serverName: submitter\n"
+        "        transport: stdio\n"
+        '        command: "@@CLIENT_ENTRYPOINT@@"\n'
+        '        args: ["--base-url", "@@MASTER_URL@@", "--username", '
+        '"@@USERNAME@@", "--ca-file", "@@CA_FILE@@"]\n'
+        '        cwd: "@@CLIENT_WORKSPACE@@"\n'
+        "    - id: skill-filesystem-submitter\n"
+        "      name: '@deepseek-ai/dsh-skill-filesystem'\n"
+        "      config:\n"
+        "        providerName: submitter\n"
+        "        customSkillDirs:\n"
+        '          - "@@CLIENT_WORKSPACE@@/.agents/skills"\n'
+    )
 
 
 def test_unknown_harness_is_rejected(tmp_path: Path):

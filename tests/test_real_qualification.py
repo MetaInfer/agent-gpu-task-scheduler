@@ -1,11 +1,11 @@
 import os
-import sys
 from pathlib import Path
 
 import pytest
 from conftest import proposal_markdown
 
 from agent_scheduler.adapters.harness import ClaudeCodeAdapter
+from agent_scheduler.client_kit import prepare_client_kit_runtime
 from agent_scheduler.config import QUALIFICATION_VRAM_CEILING
 from agent_scheduler.domain.models import Revision, new_id, utc_now
 from agent_scheduler.qualification import run_submitter_agent, verify_qualification
@@ -52,7 +52,19 @@ def test_complete_real_qualification_requires_explicit_gpu_opt_in(
     monkeypatch.setenv("AGENT_SCHEDULER_STATE_ROOT", str(tmp_path / "missing"))
 
     with pytest.raises(pytest.skip.Exception, match="RUN_REAL_GPU"):
-        test_complete_real_qualification("codex", "RUN_REAL_CODEX")
+        test_complete_real_qualification("codex", "RUN_REAL_CODEX", tmp_path)
+
+
+def test_complete_real_qualification_requires_explicit_client_kit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("RUN_FULL_QUALIFICATION", "1")
+    monkeypatch.setenv("RUN_REAL_GPU", "1")
+    monkeypatch.setenv("RUN_REAL_CODEX", "1")
+    monkeypatch.delenv("AGENT_SCHEDULER_CLIENT_KIT", raising=False)
+
+    with pytest.raises(pytest.skip.Exception, match="AGENT_SCHEDULER_CLIENT_KIT"):
+        test_complete_real_qualification("codex", "RUN_REAL_CODEX", tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -65,13 +77,19 @@ def test_complete_real_qualification_requires_explicit_gpu_opt_in(
     ],
 )
 @pytest.mark.real_gpu
-def test_complete_real_qualification(harness: str, marker_env: str):
+def test_complete_real_qualification(harness: str, marker_env: str, tmp_path: Path) -> None:
     if os.environ.get("RUN_FULL_QUALIFICATION") != "1":
         pytest.skip("set RUN_FULL_QUALIFICATION=1 after Master and Worker are running")
     if os.environ.get("RUN_REAL_GPU") != "1":
         pytest.skip("set RUN_REAL_GPU=1 for the authorized real GPU qualification")
     if os.environ.get(marker_env) != "1":
         pytest.skip(f"set {marker_env}=1 to qualify the {harness} Submitter")
+    configured_kit = os.environ.get("AGENT_SCHEDULER_CLIENT_KIT")
+    if not configured_kit:
+        pytest.skip(
+            "set AGENT_SCHEDULER_CLIENT_KIT to a verified unpacked Kit before a billed harness launch"
+        )
+    runtime = prepare_client_kit_runtime(Path(configured_kit), tmp_path / "client-runtime")
     root = Path(os.environ.get("AGENT_SCHEDULER_STATE_ROOT", "/public/share/agent-scheduler-mvp"))
     identity = load_runtime(root)
     result = run_submitter_agent(
@@ -79,10 +97,10 @@ def test_complete_real_qualification(harness: str, marker_env: str):
         state_root=root,
         base_url="https://127.0.0.1:8443",
         tls_certificate=identity.tls_certificate,
-        client_entrypoint=Path(sys.executable).with_name("agent-scheduler-submitter"),
+        client_entrypoint=runtime.client_entrypoint,
+        skill_source=runtime.skill_source,
+        config_source=runtime.config_source,
         harness=harness,
     )
-    verified = verify_qualification(
-        result, state_root=root, identity=identity, harness=harness
-    )
+    verified = verify_qualification(result, state_root=root, identity=identity, harness=harness)
     assert verified.status == "COMPLETED", verified.reason

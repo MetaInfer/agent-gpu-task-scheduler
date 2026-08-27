@@ -298,11 +298,13 @@ curl -sk $BASE/api/v1/tasks/$TASK
 ### 6.3 一键资格闭环
 
 ```bash
+export AGENT_SCHEDULER_CLIENT_KIT=/absolute/path/to/agent-client-kit-0.2.0
 python3 -m agent_scheduler.cli.main qualify [--base-url https://127.0.0.1:8443] [--timeout N] \
   [--harness claude|codex|pi|dsh]
 ```
 
-拉起真实 Submitter（默认 Claude ​Code，`--harness` 选其他三家），一次提交 1/2/4/8 卡
+`qualify` 会完整验证这个解压 Kit，并从 manifest 的精确 wheel 路径离线创建临时 client venv；
+变量缺失或 Kit 不完整时，在启动计费 Agent 前返回 `BLOCKED_QUALIFICATION`。拉起真实 Submitter（默认 Claude ​Code，`--harness` 选其他三家），一次提交 1/2/4/8 卡
 四个 Proposal，然后独立验证完整证据包。四个 harness 各自产出独立可验证的证据包——
 `--harness` 只决定谁写 Proposal，Master 内部的 Processor/Reviewer 始终是 Claude。
 详见第 11 节。
@@ -501,10 +503,12 @@ python3 -m agent_scheduler.cli.main inspect --state-root /public/share/agent-sch
 ## 11. 资格验证
 
 ```bash
+export AGENT_SCHEDULER_CLIENT_KIT=/absolute/path/to/agent-client-kit-0.2.0
 python3 -m agent_scheduler.cli.main qualify [--harness claude|codex|pi|dsh]
 ```
 
-流程：跑本地门禁并留证 → 检查 `/health` profile → 生成该 harness 的接入配置 → 拉起真实
+`AGENT_SCHEDULER_CLIENT_KIT` 必须指向本次待验证的解压 release Kit；旧 `/tmp` artifact 不能证明
+新实现。流程：完整验证 Kit 并离线安装精确 wheels → 跑本地门禁并留证 → 检查 `/health` profile → 生成该 harness 的接入配置 → 拉起真实
 Submitter 一次提交四个 Proposal → 轮询到终态 → 独立验证证据包。结果不依赖 Submitter
 自述——驱动按 `Qualification Run: <run_id>` 标记从 Ground Truth 反推 items，四个 harness
 在结构化输出能力上的差异因此不影响正确性。

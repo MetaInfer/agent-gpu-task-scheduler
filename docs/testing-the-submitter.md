@@ -15,10 +15,11 @@
 | **T3** | 单个 Agent 完整 1/2/4/8 卡资格闭环 | 显式 opt-in，一次只跑一个 harness | 真实 GPU 时间、真实计费 | Master（`HARNESS_MODE=claude`）+ Worker |
 
 T1 直接测试 `agent_scheduler_client` client package，包括配置渲染、MCP/REST 契约和
-`agent-scheduler-submitter` 入口，不要求 Agent 或服务进程。T2/T3 为每次运行创建独立的
-client workspace，只复制 canonical `submit-gpu-task` skill 和生成的连接配置，并从那里启动
-Agent；MCP 命令使用已安装的 `agent-scheduler-submitter`，不挂载服务端仓库，也不把服务端仓库
-用作 Agent cwd。
+`agent-scheduler-submitter` 入口，不要求 Agent 或服务进程。真实 T2/T3 先完整验证
+`AGENT_SCHEDULER_CLIENT_KIT` 指向的解压 Kit，再从 manifest 声明的精确 wheel 路径离线安装
+临时 venv。随后为每次运行创建独立的 client workspace，从 Kit 复制 canonical
+`submit-gpu-task` skill、渲染 Kit config，并从那里启动 Agent；MCP 命令使用这个 Kit venv 的
+`agent-scheduler-submitter`，不挂载服务端仓库，也不把服务端仓库用作 Agent cwd。
 
 三层递进：T1 不通，T2 必然也不通；T2 不通，先别启动 T3——T3 是整个仓库里最贵的一段，
 复用容器严格串行。Codex CLI、pi、dsh 三个新增 harness 各跑 4 个真实 Task，共 12 个；
@@ -39,6 +40,19 @@ python3 -m mypy src packages/client/src
 可靠的 T1。
 
 ## 通用前置
+
+T2/T3 的真实 Submitter 必须消费待发布 Kit，而不是 provider interpreter 或仓库 skill。先构建并
+解压新的 release artifact，然后显式设置：
+
+```bash
+export AGENT_SCHEDULER_CLIENT_KIT=/absolute/path/to/agent-client-kit-0.2.0
+python3 "$AGENT_SCHEDULER_CLIENT_KIT/verify_client_kit.py" \
+  "$AGENT_SCHEDULER_CLIENT_KIT"
+```
+
+fixture 会再次执行完整 manifest、SHA 和普通文件集合验证，创建临时 venv，并以 `--no-index
+--no-deps` 显式安装 manifest 中每一个 dependency wheel 和 client wheel。未设置该变量时，T2/T3
+会在启动任何计费 Agent 之前明确 skip。实现变更后，旧 `/tmp` Kit 不能作为新代码证据，必须重建。
 
 ### T2 前置：Master 用 fake harness 起
 

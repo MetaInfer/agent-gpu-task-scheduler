@@ -76,6 +76,18 @@ def test_qualify_defaults_to_claude():
     assert build_parser().parse_args(["qualify"]).harness == "claude"
 
 
+def test_qualify_requires_client_kit_before_reading_runtime(monkeypatch, capsys):
+    def forbidden_runtime(*_args, **_kwargs):
+        raise AssertionError("runtime must not be read before Client Kit preflight")
+
+    monkeypatch.delenv("AGENT_SCHEDULER_CLIENT_KIT", raising=False)
+    monkeypatch.setattr(cli_main, "load_runtime", forbidden_runtime)
+
+    assert cli_main.main(["qualify"]) == 3
+    output = capsys.readouterr().out
+    assert "AGENT_SCHEDULER_CLIENT_KIT" in output
+
+
 def test_qualify_rejects_an_unknown_harness():
     import pytest
 

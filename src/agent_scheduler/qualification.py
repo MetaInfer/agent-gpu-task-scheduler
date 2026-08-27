@@ -63,6 +63,8 @@ def run_submitter_agent(
     timeout_seconds: int = 45 * 60,
     executable: str | None = None,
     client_entrypoint: Path | None = None,
+    skill_source: Path | None = None,
+    config_source: Path | None = None,
     harness: str = "claude",
 ) -> QualificationResult:
     run_id = new_id("qual")
@@ -109,12 +111,18 @@ def run_submitter_agent(
         resolved_client_entrypoint = client_entrypoint or Path(sys.executable).with_name(
             "agent-scheduler-submitter"
         )
+        resolved_skill_source = skill_source or (
+            project_root / ".agents" / "skills" / "submit-gpu-task"
+        )
+        resolved_config_source = config_source or project_root / "config" / "client"
         run_dir = state_root / "qualification" / run_id
         client_workspace = run_dir / "workspace"
         invocation = build_submitter_invocation(
             harness,
             output_dir=run_dir,
             project_root=project_root,
+            skill_source=resolved_skill_source,
+            config_source=resolved_config_source,
             client_workspace=client_workspace,
             base_url=base_url,
             username="zz_chentian",
@@ -680,9 +688,7 @@ def reconstruct_qualification_result(store: EventStore, run_id: str) -> Qualific
             run_id,
         )
     if incomplete:
-        return _blocked(
-            tuple(items), f"Tasks did not reach COMPLETED: {incomplete}", run_id
-        )
+        return _blocked(tuple(items), f"Tasks did not reach COMPLETED: {incomplete}", run_id)
     if len(items) != len(_EXPECTED_CARD_COUNTS):
         return _blocked(
             tuple(items),

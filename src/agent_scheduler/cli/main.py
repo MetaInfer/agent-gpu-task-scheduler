@@ -6,6 +6,8 @@ import argparse
 import asyncio
 import json
 import os
+import subprocess
+import tempfile
 from pathlib import Path
 
 import httpx
@@ -14,6 +16,7 @@ from agent_scheduler_client.cli import run_mcp
 
 from agent_scheduler.adapters.harness import ClaudeCodeAdapter, FakeHarnessAdapter
 from agent_scheduler.adapters.onboarding import HARNESSES
+from agent_scheduler.client_kit import prepare_client_kit_runtime
 from agent_scheduler.config import Settings
 from agent_scheduler.domain.models import new_id
 from agent_scheduler.qualification import (
@@ -137,24 +140,36 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.command == "qualify":
         try:
+            configured_kit = os.environ.get("AGENT_SCHEDULER_CLIENT_KIT")
+            if not configured_kit:
+                raise ValueError("AGENT_SCHEDULER_CLIENT_KIT must name a verified unpacked Kit")
             settings = Settings.from_env()
-            identity = load_runtime(settings.state_root)
             project_root = Path(__file__).resolve().parents[3]
-            result = run_submitter_agent(
-                project_root=project_root,
-                state_root=settings.state_root,
-                base_url=args.base_url,
-                tls_certificate=identity.tls_certificate,
-                timeout_seconds=args.timeout,
-                harness=args.harness,
-            )
-            verified = verify_qualification(
-                result,
-                state_root=settings.state_root,
-                identity=identity,
-                harness=args.harness,
-            )
-        except (OSError, TypeError, ValueError) as exc:
+            with tempfile.TemporaryDirectory(
+                prefix="agent-client-kit-qualification-"
+            ) as temporary_directory:
+                runtime = prepare_client_kit_runtime(
+                    Path(configured_kit), Path(temporary_directory) / "venv"
+                )
+                identity = load_runtime(settings.state_root)
+                result = run_submitter_agent(
+                    project_root=project_root,
+                    state_root=settings.state_root,
+                    base_url=args.base_url,
+                    tls_certificate=identity.tls_certificate,
+                    timeout_seconds=args.timeout,
+                    client_entrypoint=runtime.client_entrypoint,
+                    skill_source=runtime.skill_source,
+                    config_source=runtime.config_source,
+                    harness=args.harness,
+                )
+                verified = verify_qualification(
+                    result,
+                    state_root=settings.state_root,
+                    identity=identity,
+                    harness=args.harness,
+                )
+        except (OSError, subprocess.SubprocessError, TypeError, ValueError) as exc:
             verified = QualificationResult(
                 run_id=new_id("qual"),
                 status="BLOCKED_QUALIFICATION",
