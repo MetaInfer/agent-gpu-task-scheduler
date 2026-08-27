@@ -1,8 +1,10 @@
 # 测试 Submitter：四个 Agent 的三层验证指南
 
 回答一个具体问题：改了 Submitter 接入之后，怎么确认 Claude ​Code / Codex CLI / pi / dsh
-四家都真的能用？本文档只谈**测试方法**——如何配置、如何跑、跑不通看哪里。接入配置本身
-（一次性安装、MCP 声明、Skill 发现）见 [从 Agent 会话提交](submitting-from-an-agent-session.md)。
+四家都真的能用？本文档是服务提供方工程师使用的**内部测试指南**——如何配置、如何跑、
+跑不通看哪里。Client 操作者的公开接入步骤见
+[从 Agent Client 提交](submitting-from-an-agent-client.md)；服务方的 Master/Worker 启动与内部联调见
+[从 Agent 会话提交](submitting-from-an-agent-session.md)。
 
 ## 三层测试总览
 
@@ -11,6 +13,12 @@
 | **T1** | 配置生成、契约校验、驱动侧重建逻辑 | 默认门禁的一部分 | 零成本，不发真实请求 | 无 |
 | **T2** | 单个 Agent 真实建一个 Proposal 就停 | 逐个 harness 显式 opt-in | 几个 token，不碰 GPU | Master（`HARNESS_MODE=fake` 即可） |
 | **T3** | 单个 Agent 完整 1/2/4/8 卡资格闭环 | 显式 opt-in，一次只跑一个 harness | 真实 GPU 时间、真实计费 | Master（`HARNESS_MODE=claude`）+ Worker |
+
+T1 直接测试 `agent_scheduler_client` client package，包括配置渲染、MCP/REST 契约和
+`agent-scheduler-submitter` 入口，不要求 Agent 或服务进程。T2/T3 为每次运行创建独立的
+client workspace，只复制 canonical `submit-gpu-task` skill 和生成的连接配置，并从那里启动
+Agent；MCP 命令使用已安装的 `agent-scheduler-submitter`，不挂载服务端仓库，也不把服务端仓库
+用作 Agent cwd。
 
 三层递进：T1 不通，T2 必然也不通；T2 不通，先别启动 T3——T3 是整个仓库里最贵的一段，
 复用容器严格串行。Codex CLI、pi、dsh 三个新增 harness 各跑 4 个真实 Task，共 12 个；
@@ -22,7 +30,8 @@ env -u RUN_REAL_CLAUDE -u RUN_REAL_CODEX -u RUN_REAL_PI -u RUN_REAL_DSH \
     -u RUN_REAL_GPU -u RUN_FULL_QUALIFICATION \
   python3 -m pytest \
   -m 'not real_claude and not real_codex and not real_pi and not real_dsh and not real_gpu'
-python3 -m ruff check . && python3 -m mypy src
+python3 -m ruff check .
+python3 -m mypy src packages/client/src
 ```
 
 不要把裸 `python3 -m pytest` 当成永远零成本：真实测试靠环境变量 opt-in；如果当前 shell 残留

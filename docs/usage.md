@@ -2,8 +2,10 @@
 
 适用版本 0.2.0。本文覆盖安装、初始化、配置、启动、提交任务、观察、运维、排障与边界。
 架构与设计约束见 [`agent-task-scheduler-spec.md`](agent-task-scheduler-spec.md)，真实资格证据见
-[`qualification-status.md`](qualification-status.md)。四个 Submitter harness 的分层测试命令和
-排障顺序见 [`testing-the-submitter.md`](testing-the-submitter.md)。
+[`qualification-status.md`](qualification-status.md)。本文是 Provider 工程师的服务端内部使用文档；
+Client 操作者请使用公开的 [`submitting-from-an-agent-client.md`](submitting-from-an-agent-client.md)。
+四个 Submitter harness 的分层测试命令和排障顺序见内部
+[`testing-the-submitter.md`](testing-the-submitter.md)。
 
 ---
 
@@ -58,7 +60,7 @@ python3 -m pip install -e '.[test]'
 ```bash
 python3 -m pytest
 python3 -m ruff check .
-python3 -m mypy src
+python3 -m mypy src packages/client/src
 ```
 
 涉及真实计费或真实硬件的测试必须显式 opt-in，分三层，成本依次上升：
@@ -77,9 +79,10 @@ RUN_REAL_GPU=1 RUN_FULL_QUALIFICATION=1 RUN_REAL_CODEX=1 \
   python3 -m pytest tests/test_real_qualification.py -m 'real_codex and real_gpu'
 ```
 
-四个 Agent（Claude ​Code、Codex CLI、pi、dsh）都能跑 T2/T3；四家的一次性安装前置
-（如 `pi install npm:pi-mcp-adapter`、`dsh plugin --profile headless add dsh-mcp-bridge`）
-见 [从 Agent 会话提交](submitting-from-an-agent-session.md)。
+四个 Agent（Claude ​Code、Codex CLI、pi、dsh）都能跑 T2/T3；Provider 工程师所需的
+Master/Worker 与四家 harness 前置见内部
+[从 Agent 会话提交](submitting-from-an-agent-session.md)。Client 操作者不执行这些内部资格命令，
+只按公开的 [从 Agent Client 提交](submitting-from-an-agent-client.md) 安装和预检 Client Kit。
 
 ---
 

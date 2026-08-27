@@ -16,9 +16,9 @@
 ## 文档
 
 - [使用文档](docs/usage.md) — 安装、配置、启动、提交、运维、排障的完整指南
-- [Agent Client 接入](docs/submitting-from-an-agent-client.md) — 不接触服务端源码，只安装 Client Kit、MCP 与 skill
-- [服务方内部 Agent 联调](docs/submitting-from-an-agent-session.md) — 启动 Master/Worker 并验证四种 harness
-- [测试 Submitter](docs/testing-the-submitter.md) — 四个 harness 分章节的 T1/T2/T3 测试与排障指南
+- [Agent Client 接入（公开）](docs/submitting-from-an-agent-client.md) — Client 操作者不接触服务端源码，只安装 Client Kit、MCP 与 skill
+- [服务方内部 Agent 联调](docs/submitting-from-an-agent-session.md) — Provider 工程师启动 Master/Worker 并验证四种 harness
+- [测试 Submitter（内部）](docs/testing-the-submitter.md) — Provider 工程师使用的四 harness T1/T2/T3 测试与排障指南
 - [系统 Spec](docs/agent-task-scheduler-spec.md) — 架构与设计约束
 - [资格状态](docs/qualification-status.md) — 真实资格证据
 
@@ -28,7 +28,7 @@
 python3 -m pip install -e '.[test]'
 python3 -m pytest
 python3 -m ruff check .
-python3 -m mypy src
+python3 -m mypy src packages/client/src
 ```
 
 真实测试必须显式 opt-in，分三层，成本依次上升：

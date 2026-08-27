@@ -190,3 +190,13 @@ def test_provider_doc_points_client_readers_to_the_client_doc():
     )
     assert "服务提供方内部" in text
     assert "submitting-from-an-agent-client.md" in text
+
+
+def test_internal_submitter_test_doc_describes_source_isolation():
+    text = (PROJECT_ROOT / "docs" / "testing-the-submitter.md").read_text(
+        encoding="utf-8"
+    )
+    assert "agent-scheduler-submitter" in text
+    assert "client workspace" in text
+    assert "不挂载服务端仓库" in text
+    assert "python3 -m mypy src packages/client/src" in text
