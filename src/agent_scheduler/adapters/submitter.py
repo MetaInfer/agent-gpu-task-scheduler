@@ -78,6 +78,8 @@ def build_submitter_invocation(
     write_onboarding(onboarding)
     if harness == "pi":
         _seed_pi_agent_dir(output_dir)
+    elif harness == "codex":
+        _seed_codex_home_auth(Path(onboarding.env["CODEX_HOME"]))
     binary = executable or submitter_executable(harness)
     prompt = _prompt(project_root, run_id, prompt_kind)
     env = _base_environment(ca_file, harness=harness, pi_provider=pi_provider)
@@ -218,3 +220,21 @@ def _seed_pi_agent_dir(output_dir: Path) -> None:
         candidate = source / name
         if candidate.is_file():
             shutil.copy2(candidate, output_dir / name)
+
+
+def _seed_codex_home_auth(codex_home: Path) -> None:
+    """Copy `codex login` auth into the synthetic CODEX_HOME, without touching the real one.
+
+    Codex resolves auth.json from CODEX_HOME, so pointing that variable at a synthetic,
+    per-run directory would otherwise silently drop any existing `codex login` session.
+    The copy is read-only-in-spirit: the real file is never moved, symlinked, or modified,
+    and nothing is written outside `codex_home` (which lives under the run's output_dir).
+    """
+    configured = os.environ.get("CODEX_HOME")
+    source_home = (
+        Path(configured) if configured else Path(os.environ.get("HOME", "/root")) / ".codex"
+    )
+    source_auth = source_home / "auth.json"
+    if source_auth.is_file():
+        codex_home.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_auth, codex_home / "auth.json")

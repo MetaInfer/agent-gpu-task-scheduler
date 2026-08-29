@@ -145,21 +145,35 @@ cancel_task       wait_for_task   wait_for_events    get_logs
 
 一次性前置：无（但需要先 `codex login` 完成认证，见排障表）。
 
-Codex 用 `-c` 覆盖而非 `codex mcp add`，因为后者会把配置写进
-`~/.codex/config.toml`，影响你所有项目。`build_onboarding("codex", ...)` 生成的正是
-一串 `-c` flag、不落任何文件：
+Codex 从 `$CODEX_HOME/config.toml` 加载配置，不支持在命令行内联整段 TOML。避免用
+`codex mcp add`（会写进 `~/.codex/config.toml`，影响你所有项目），改成把配置渲染进
+一个专用、临时的 `CODEX_HOME`：
 
-```bash
-codex exec \
-  -c mcp_servers.submitter.command=/usr/bin/python3 \
-  -c 'mcp_servers.submitter.args=["-m", "agent_scheduler.cli.main", "mcp", "--base-url", "https://127.0.0.1:8443", "--username", "zz_chentian"]' \
-  -c 'mcp_servers.submitter.cwd="/public/share/fh/agent-gpu-task-scheduler"' \
-  -c 'mcp_servers.submitter.env={AGENT_SCHEDULER_STATE_ROOT="/public/share/agent-scheduler-mvp"}'
+```toml
+# /tmp/agent-scheduler-codex-home-xyz/config.toml
+[mcp_servers.submitter]
+command = "/usr/bin/python3"
+args = ["-m", "agent_scheduler.cli.main", "mcp",
+        "--base-url", "https://127.0.0.1:8443", "--username", "zz_chentian"]
+cwd = "/public/share/fh/agent-gpu-task-scheduler"
+
+[mcp_servers.submitter.env]
+AGENT_SCHEDULER_STATE_ROOT = "/public/share/agent-scheduler-mvp"
 ```
 
-把 `/usr/bin/python3` 换成你自己 `python3` 的绝对路径（`command -v python3`）——codex 子进程不一定
-继承你交互 shell 的 PATH，写绝对路径最保险。四个 `-c` 缺一不可：少了任何一个，
-`mcp_servers.submitter` 要么拿不到可执行文件，要么找不到 state root 对应的证书。
+```bash
+CODEX_HOME=/tmp/agent-scheduler-codex-home-xyz codex exec \
+  --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox \
+  -C /public/share/fh/agent-gpu-task-scheduler
+```
+
+`build_onboarding("codex", ...)` 生成的正是这样一份 `config.toml`（Client Kit 场景下
+没有上面的 `env` 表，因为 client entrypoint 走 HTTPS，不需要 state root），并把它当作
+`CODEX_HOME` 唯一的配置来源——不再有第二套从同样的值重新拼出来的 `-c` flag，Codex 进程
+读到的字节和渲染出来的字节完全一致。如果本机之前 `codex login` 过，fixture 会把真实
+`CODEX_HOME`（未设置时是 `~/.codex`）下的 `auth.json` 复制（不是移动或软链接）进这个
+临时目录，登录态照常可用；用 API key 认证不受影响，因为那条路径不依赖 `CODEX_HOME`
+文件内容。
 
 ### pi
 

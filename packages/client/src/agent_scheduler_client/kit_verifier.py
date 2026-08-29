@@ -10,6 +10,10 @@ import zipfile
 from email.parser import Parser
 from pathlib import Path, PurePosixPath
 
+_CLIENT_DISTRIBUTION = "agent-gpu-task-scheduler-client"
+_CLIENT_PACKAGE = "agent_scheduler_client"
+_SERVER_PACKAGE = "agent_scheduler"
+
 
 def _safe_relative(value: object, description: str) -> str:
     if not isinstance(value, str) or not value or "\\" in value:
@@ -95,6 +99,46 @@ def _normalized_distribution(value: str) -> str:
     return normalized
 
 
+def _wheel_member_parts(name: str) -> tuple[str, ...]:
+    if not name or "\\" in name:
+        raise ValueError(f"unsafe wheel member path: {name!r}")
+    path = PurePosixPath(name)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"unsafe wheel member path: {name!r}")
+    return tuple(part for part in path.parts if part not in {"", "."})
+
+
+def _inspect_wheel_members(root: Path, relative: str) -> set[str]:
+    """Enforce the same ZIP-member isolation policy the provider-side builder enforces.
+
+    Rejects unsafe paths, symlinks, and any non-regular-file/directory member; rejects any
+    member whose first path component is the server package. Returns the set of top-level
+    path components the wheel provides, so callers can additionally detect cross-wheel
+    package collisions (e.g. the client package leaking into a dependency wheel).
+    """
+    try:
+        with zipfile.ZipFile(root / relative) as archive:
+            top_level: set[str] = set()
+            for info in archive.infolist():
+                parts = _wheel_member_parts(info.filename)
+                mode = info.external_attr >> 16
+                file_type = stat.S_IFMT(mode)
+                if stat.S_ISLNK(mode):
+                    raise ValueError(f"wheel contains a symlink member: {relative}!{info.filename}")
+                if file_type not in {0, stat.S_IFREG, stat.S_IFDIR}:
+                    raise ValueError(
+                        "wheel member is not a regular file or directory: "
+                        f"{relative}!{info.filename}"
+                    )
+                if parts and parts[0] == _SERVER_PACKAGE:
+                    raise ValueError(f"wheel contains the server package: {relative}")
+                if parts:
+                    top_level.add(parts[0])
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise ValueError(f"invalid wheel archive: {relative}") from exc
+    return top_level
+
+
 def _wheel_identity(root: Path, relative: str) -> tuple[str, str]:
     try:
         with zipfile.ZipFile(root / relative) as archive:
@@ -145,6 +189,9 @@ def _manifest_wheels(root: Path, manifest: dict[str, object]) -> set[str]:
     if client.get("version") != kit_version:
         raise ValueError("manifest client version must equal kit_version")
     client_wheel = _safe_relative(client.get("wheel"), "manifest client wheel")
+    client_members = _inspect_wheel_members(root, client_wheel)
+    if _CLIENT_PACKAGE not in client_members:
+        raise ValueError(f"client wheel is missing the {_CLIENT_PACKAGE} package")
     client_identity = _wheel_identity(root, client_wheel)
     if client_identity != (
         "agent-gpu-task-scheduler-client",
@@ -184,10 +231,17 @@ def _manifest_wheels(root: Path, manifest: dict[str, object]) -> set[str]:
             raise ValueError(f"manifest dependency distribution is not normalized: {distribution}")
         if normalized_distribution in distributions:
             raise ValueError(f"duplicate manifest dependency distribution: {distribution}")
+        if normalized_distribution == _normalized_distribution(_CLIENT_DISTRIBUTION):
+            raise ValueError(
+                f"dependency wheel distribution collides with the client distribution: {distribution}"
+            )
         distributions.add(normalized_distribution)
         if not isinstance(version, str) or not version:
             raise ValueError("manifest dependency version must be a non-empty string")
         wheel = _safe_relative(dependency.get("wheel"), "manifest dependency wheel")
+        dependency_members = _inspect_wheel_members(root, wheel)
+        if _CLIENT_PACKAGE in dependency_members:
+            raise ValueError(f"dependency wheel contains the client package: {wheel}")
         if _wheel_identity(root, wheel) != (normalized_distribution, version):
             raise ValueError(f"manifest dependency does not match wheel metadata: {distribution}")
         if wheel in wheels:

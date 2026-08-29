@@ -174,15 +174,28 @@ render_client_config
 
 ### Codex CLI
 
-TOML 模板是本次连接参数的可读参考。后续启动命令会把其中相同的 `command`、`args`、`cwd`
-作为每进程覆盖传入；不运行任何会写入用户级全局配置的 MCP 添加命令：
+TOML 模板本身就是启动时实际生效的配置——不是人读的参考,也不会被第二次转成 `-c` 参数。
+渲染完成后，把它当作一份全新、独立的 `config.toml`，放进一个专用的 `CODEX_HOME`
+目录（不是 `~/.codex`）；步骤 6 启动 codex 时只要这个环境变量还在 shell 里，codex 就会
+从这份文件加载 `mcp_servers.submitter`。不运行任何会写入用户级全局配置
+（`~/.codex/config.toml`）的 MCP 添加命令：
 
 ```bash
 export HARNESS='codex'
 export SOURCE_TEMPLATE='/opt/agent-client/kit/config/codex-mcp.example.toml'
-export RENDERED_CONFIG="$CLIENT_WORKSPACE/.client-config/codex-mcp.toml"
+REAL_CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+export CODEX_HOME="$CLIENT_WORKSPACE/.client-config/codex-home"
+export RENDERED_CONFIG="$CODEX_HOME/config.toml"
 render_client_config
+if [ -f "$REAL_CODEX_HOME/auth.json" ]; then
+  cp "$REAL_CODEX_HOME/auth.json" "$CODEX_HOME/auth.json"
+fi
 ```
+
+如果你之前用 `codex login` 认证过，上面这一步会把真实（当前生效）`CODEX_HOME` 下的
+`auth.json` 复制一份进新目录，让登录态继续可用——**复制，不要移动或软链接**，原文件
+保持不动。用 `OPENAI_API_KEY`（或对应厂商网关）认证的场景不需要这一步——那条路径不依赖
+`CODEX_HOME` 的文件内容。
 
 ### pi
 
@@ -287,10 +300,7 @@ case "$HARNESS" in
     claude --strict-mcp-config --mcp-config "$RENDERED_CONFIG"
     ;;
   codex)
-    codex \
-      -c "mcp_servers.submitter.command=\"$CLIENT_ENTRYPOINT\"" \
-      -c "mcp_servers.submitter.args=[\"--base-url\", \"$MASTER_URL\", \"--username\", \"$USERNAME\", \"--ca-file\", \"$CA_FILE\"]" \
-      -c "mcp_servers.submitter.cwd=\"$CLIENT_WORKSPACE\""
+    codex  # reads $CODEX_HOME/config.toml (no manual -c overrides)
     ;;
   pi)
     pi --mcp-config "$RENDERED_CONFIG"

@@ -75,7 +75,7 @@ ARTIFACT_FILE_CHECKS = (
 
 LAUNCH_COMMANDS = (
     'claude --strict-mcp-config --mcp-config "$RENDERED_CONFIG"',
-    "codex \\",
+    "codex  # reads $CODEX_HOME/config.toml (no manual -c overrides)",
     'pi --mcp-config "$RENDERED_CONFIG"',
     'dsh --profile headless --patch "$RENDERED_CONFIG"',
 )

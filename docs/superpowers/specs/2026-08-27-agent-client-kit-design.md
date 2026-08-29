@@ -664,6 +664,13 @@ Kit builder 只接受显式输入：
     "wheel": "wheels/agent_gpu_task_scheduler_client-0.2.0-py3-none-any.whl",
     "python_requires": ">=3.10"
   },
+  "dependencies": [
+    {
+      "distribution": "httpx",
+      "version": "0.28.1",
+      "wheel": "wheels/httpx-0.28.1-py3-none-any.whl"
+    }
+  ],
   "master_api": "v1",
   "mcp_server_name": "submitter",
   "tool_count": 12,
@@ -675,6 +682,12 @@ Kit builder 只接受显式输入：
   }
 }
 ```
+
+`dependencies` 是一个数组，每个元素对应一个随 Kit 打包的第三方依赖 wheel（`distribution`
+是标准化、去重后的 distribution 名称，`wheel` 是相对 Kit 根的路径，均以 `wheels/<file>.whl`
+形式给出）；client distribution 本身不出现在这个数组里。加这个字段是因为 wheelhouse 必须能
+在完全离线、没有任何 resolver 的环境下被校验和安装——manifest 需要显式声明每个依赖 wheel
+的身份，验证器才能在不解析依赖图的前提下确认每个 wheel 都是预期的那一个。
 
 上述 harness version 是本设计时环境中实际检测到的基线；实施时若验证环境已升级，manifest 写入
 实际通过 T5 的版本，不伪造旧版本结果。
@@ -753,7 +766,8 @@ import agent_scheduler               fails with ModuleNotFoundError
 覆盖：
 
 - 目录结构完整；
-- manifest schema 与实际 artifact 一致；
+- manifest schema 与实际 artifact 一致，含 `dependencies` 数组与每个依赖 wheel 的
+  distribution/version 元数据；
 - `SHA256SUMS` 覆盖全部普通文件；
 - wheelhouse 在禁止网络时可安装；
 - skill frontmatter 有效；

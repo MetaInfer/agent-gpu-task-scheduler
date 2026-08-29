@@ -193,6 +193,15 @@ RUN_REAL_GPU=1 RUN_FULL_QUALIFICATION=1 RUN_REAL_CODEX=1 \
 （`src/agent_scheduler/adapters/submitter.py` 里 `elif harness == "codex":` 块内），不会
 泄漏到其他三家。
 
+**已知点（配置来源）：** codex 没有 `--config-file`，配置永远从 `$CODEX_HOME/config.toml`
+加载。`build_onboarding("codex", ...)` 把渲染出的 TOML 直接写成
+`$OUTPUT_DIR/codex-home/config.toml`，并把该目录设进 `invocation.env["CODEX_HOME"]`；
+`argv` 里不再有任何 `-c mcp_servers.submitter.*` 覆盖——TOML 文件是唯一的配置来源，没有
+第二套从同样的值重新拼出来的旁路。启动前 `build_submitter_invocation` 还会把真实
+CODEX_HOME（`CODEX_HOME` 环境变量，或未设置时的 `~/.codex`）下已有的 `auth.json` 复制
+（不是移动或软链接）进这个新目录，`codex login` 的登录态才不会被隔离掉；真实 `~/.codex`
+或已有的 `CODEX_HOME` 内容永远不会被写入或修改。
+
 ## pi
 
 **一次性安装：**

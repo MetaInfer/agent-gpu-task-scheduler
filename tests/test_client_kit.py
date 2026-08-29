@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 from agent_scheduler_client import __version__
+from agent_scheduler_client.kit_verifier import verify_client_kit as shipped_verify_client_kit
 from agent_scheduler_client.mcp import SubmitterMCPAdapter
 
 try:
@@ -798,6 +799,137 @@ def test_dependency_wheelhouse_rejects_wheel_symlink(
 
     assert linked_wheel.is_symlink()
     assert not output.exists()
+
+
+def _rezip_with_extra_member(
+    path: Path, name: str, data: bytes = b"", *, symlink: bool = False
+) -> None:
+    """Re-pack `path` byte-for-byte plus one extra member, simulating post-build tampering."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(path) as source, zipfile.ZipFile(buffer, "w") as target:
+        for item in source.infolist():
+            target.writestr(item, source.read(item.filename))
+        if symlink:
+            info = zipfile.ZipInfo(name)
+            info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            target.writestr(info, "target")
+        else:
+            target.writestr(name, data)
+    path.write_bytes(buffer.getvalue())
+
+
+def _rehash_checksum(root: Path, relative: str) -> None:
+    """Recompute SHA256SUMS for one file after tampering with it post-build."""
+    checksum_path = root / "SHA256SUMS"
+    digest = hashlib.sha256((root / relative).read_bytes()).hexdigest()
+    lines = checksum_path.read_text(encoding="ascii").splitlines()
+    checksum_path.write_text(
+        "\n".join(
+            f"{digest}  {relative}" if line.endswith(f"  {relative}") else line for line in lines
+        )
+        + "\n",
+        encoding="ascii",
+    )
+
+
+def _first_dependency_wheel(built_kit: Path) -> str:
+    manifest = json.loads((built_kit / "MANIFEST.json").read_text(encoding="utf-8"))
+    wheel = manifest["dependencies"][0]["wheel"]
+    assert isinstance(wheel, str)
+    return wheel
+
+
+def test_shipped_stdlib_verifier_accepts_a_clean_built_kit(built_kit: Path) -> None:
+    """Regression guard: the new ZIP-member policy must not reject a real, untampered Kit."""
+    manifest = shipped_verify_client_kit(built_kit)
+    assert manifest["kit_version"] == "0.2.0"
+
+
+@pytest.mark.parametrize("wheel_kind", ["client", "dependency"])
+def test_shipped_stdlib_verifier_rejects_a_wheel_containing_the_server_package(
+    wheel_kind: str, built_kit: Path
+) -> None:
+    manifest = json.loads((built_kit / "MANIFEST.json").read_text(encoding="utf-8"))
+    relative = (
+        manifest["client"]["wheel"]
+        if wheel_kind == "client"
+        else _first_dependency_wheel(built_kit)
+    )
+    _rezip_with_extra_member(built_kit / relative, "agent_scheduler/__init__.py")
+    _rehash_checksum(built_kit, relative)
+
+    with pytest.raises(ValueError, match="server package"):
+        shipped_verify_client_kit(built_kit)
+
+
+@pytest.mark.parametrize("wheel_kind", ["client", "dependency"])
+def test_shipped_stdlib_verifier_rejects_a_wheel_with_a_symlink_member(
+    wheel_kind: str, built_kit: Path
+) -> None:
+    manifest = json.loads((built_kit / "MANIFEST.json").read_text(encoding="utf-8"))
+    relative = (
+        manifest["client"]["wheel"]
+        if wheel_kind == "client"
+        else _first_dependency_wheel(built_kit)
+    )
+    _rezip_with_extra_member(built_kit / relative, "evil-link", symlink=True)
+    _rehash_checksum(built_kit, relative)
+
+    with pytest.raises(ValueError, match="symlink"):
+        shipped_verify_client_kit(built_kit)
+
+
+@pytest.mark.parametrize(
+    "member",
+    ["/etc/passwd", "../../escape.py", "nested/../../escape.py"],
+)
+@pytest.mark.parametrize("wheel_kind", ["client", "dependency"])
+def test_shipped_stdlib_verifier_rejects_a_wheel_with_an_unsafe_member_path(
+    wheel_kind: str, member: str, built_kit: Path
+) -> None:
+    manifest = json.loads((built_kit / "MANIFEST.json").read_text(encoding="utf-8"))
+    relative = (
+        manifest["client"]["wheel"]
+        if wheel_kind == "client"
+        else _first_dependency_wheel(built_kit)
+    )
+    _rezip_with_extra_member(built_kit / relative, member)
+    _rehash_checksum(built_kit, relative)
+
+    with pytest.raises(ValueError, match="unsafe"):
+        shipped_verify_client_kit(built_kit)
+
+
+def test_shipped_stdlib_verifier_rejects_a_dependency_wheel_containing_the_client_package(
+    built_kit: Path,
+) -> None:
+    relative = _first_dependency_wheel(built_kit)
+    _rezip_with_extra_member(built_kit / relative, "agent_scheduler_client/__init__.py")
+    _rehash_checksum(built_kit, relative)
+
+    with pytest.raises(ValueError, match="client package"):
+        shipped_verify_client_kit(built_kit)
+
+
+def test_shipped_stdlib_verifier_rejects_a_dependency_distribution_equal_to_the_client_distribution(
+    built_kit: Path, tmp_path: Path
+) -> None:
+    relative = _first_dependency_wheel(built_kit)
+    replacement = _write_wheel(
+        tmp_path / "replacement.whl",
+        "agent-gpu-task-scheduler-client",
+        "some_other_module",
+        "0.2.0",
+    )
+    (built_kit / relative).write_bytes(replacement.read_bytes())
+    _rehash_checksum(built_kit, relative)
+    manifest = json.loads((built_kit / "MANIFEST.json").read_text(encoding="utf-8"))
+    manifest["dependencies"][0]["distribution"] = "agent-gpu-task-scheduler-client"
+    manifest["dependencies"][0]["version"] = "0.2.0"
+    _rewrite_manifest_and_checksum(built_kit, manifest)
+
+    with pytest.raises(ValueError, match="client distribution"):
+        shipped_verify_client_kit(built_kit)
 
 
 @pytest.mark.parametrize("kind", ["symlink", "fifo"])

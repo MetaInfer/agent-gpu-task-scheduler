@@ -140,6 +140,64 @@ def test_codex_runs_non_interactively_without_touching_the_user_config(tmp_path:
     assert invocation.argv[1] == "exec"
     assert "--json" in invocation.argv
     assert "--skip-git-repo-check" in invocation.argv
+    assert "--dangerously-bypass-approvals-and-sandbox" in invocation.argv
+    assert not any("mcp_servers.submitter" in value for value in invocation.argv)
+    assert "-c" not in invocation.argv
+
+    codex_home = Path(invocation.env["CODEX_HOME"])
+    assert tmp_path in codex_home.parents
+    config_toml = codex_home / "config.toml"
+    assert config_toml.is_file()
+    rendered = config_toml.read_text(encoding="utf-8")
+    template_path = PROJECT_ROOT / "config" / "client" / "codex-mcp.example.toml"
+    written_files = onboarding_module.build_onboarding(
+        "codex",
+        output_dir=tmp_path / "run",
+        workspace=tmp_path / "client-workspace",
+        base_url="https://127.0.0.1:8443",
+        username="zz_chentian",
+        client_entrypoint=Path("/opt/agent-client/venv/bin/agent-scheduler-submitter"),
+        ca_file=Path("/shared/state/tls/certificate.pem"),
+        config_source=PROJECT_ROOT / "config" / "client",
+    ).files
+    # The file this test can read from disk is byte-identical to the actually-rendered
+    # content -- it is written once, not re-derived by a second code path.
+    assert set(written_files.values()) == {rendered}
+    assert template_path.is_file()
+
+
+def test_codex_home_carries_existing_login_auth_without_touching_the_real_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    (real_codex_home / "auth.json").write_text('{"tokens": {}}', encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+
+    invocation = _invoke("codex", tmp_path)
+
+    synthetic_codex_home = Path(invocation.env["CODEX_HOME"])
+    assert synthetic_codex_home != real_codex_home
+    assert tmp_path in synthetic_codex_home.parents
+    assert (synthetic_codex_home / "auth.json").read_text(encoding="utf-8") == '{"tokens": {}}'
+    # The real CODEX_HOME must not be touched: still exactly the two files we put there.
+    assert {path.name for path in real_codex_home.iterdir()} == {"auth.json"}
+
+
+def test_codex_home_has_no_auth_when_none_exists_and_never_creates_outside_tmp_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    fake_home = tmp_path / "fake-home-without-codex-login"
+    fake_home.mkdir()
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    invocation = _invoke("codex", tmp_path)
+
+    synthetic_codex_home = Path(invocation.env["CODEX_HOME"])
+    assert tmp_path in synthetic_codex_home.parents
+    assert not (synthetic_codex_home / "auth.json").exists()
+    assert not (fake_home / ".codex").exists()
 
 
 def test_dsh_disables_the_approval_prompt(tmp_path: Path):

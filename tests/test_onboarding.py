@@ -89,7 +89,7 @@ def test_generated_files_land_only_under_the_output_directory(harness: str, tmp_
     output_dir = tmp_path / "run"
     config = _build(harness, tmp_path)
     for path in config.files:
-        assert path.parent == output_dir
+        assert path == output_dir or output_dir in path.parents
 
 
 def test_claude_config_is_a_valid_strict_mcp_config(tmp_path: Path):
@@ -124,10 +124,21 @@ def test_pi_reuses_the_same_mcp_json_shape_and_promotes_direct_tools(tmp_path: P
     assert config.env["PI_CODING_AGENT_DIR"] == str(written.parent)
 
 
-def test_codex_config_is_parsed_from_kit_template_and_passed_as_flags(tmp_path: Path):
+def test_codex_config_is_rendered_as_the_sole_codex_home_config(tmp_path: Path):
+    """The rendered TOML must be the only thing that drives the codex launch.
+
+    No independently-synthesized `-c mcp_servers.submitter.*` argv may exist alongside it
+    -- that would be a second, divergent source of truth for the same configuration.
+    """
     config = _build("codex", tmp_path)
-    assert config.argv.count("-c") == 3
-    rendered = next(content for path, content in config.files.items() if path.suffix == ".toml")
+    assert config.argv == ()
+    assert not any("mcp_servers.submitter" in value for value in config.argv)
+    codex_home = Path(config.env["CODEX_HOME"])
+    assert codex_home == tmp_path / "run" / "codex-home"
+    config_toml_path, rendered = next(
+        (path, content) for path, content in config.files.items() if path.suffix == ".toml"
+    )
+    assert config_toml_path == codex_home / "config.toml"
     server = tomllib.loads(rendered)["mcp_servers"]["submitter"]
     assert server == {
         "command": "/opt/agent-client/venv/bin/agent-scheduler-submitter",
@@ -141,11 +152,6 @@ def test_codex_config_is_parsed_from_kit_template_and_passed_as_flags(tmp_path: 
         ],
         "cwd": str(tmp_path / "workspace"),
     }
-    joined = " ".join(config.argv)
-    assert (
-        "mcp_servers.submitter.command="
-        "/opt/agent-client/venv/bin/agent-scheduler-submitter" in joined
-    )
 
 
 @pytest.mark.parametrize("bad", ['quote"value', "back\\slash", "line\nfeed", "control\x01"])

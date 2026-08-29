@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import shutil
@@ -117,7 +116,6 @@ def build_onboarding(
         "CA_FILE": str(ca_file),
         "CLIENT_WORKSPACE": str(workspace),
     }
-    args = ["--base-url", base_url, "--username", username, "--ca-file", str(ca_file)]
     if harness in {"claude", "pi"}:
         path = output_dir / "mcp.json"
         content = _render_template(config_source / "mcp.example.json", values)
@@ -128,20 +126,14 @@ def build_onboarding(
             env={} if harness == "claude" else {"PI_CODING_AGENT_DIR": str(output_dir)},
         )
     if harness == "codex":
-        path = output_dir / "codex-mcp.toml"
         content = _render_template(config_source / "codex-mcp.example.toml", values)
+        codex_home = output_dir / "codex-home"
+        config_toml = codex_home / "config.toml"
         return OnboardingConfig(
             harness=harness,
-            files={path: content},
-            argv=(
-                "-c",
-                f"mcp_servers.submitter.command={client_entrypoint}",
-                "-c",
-                f"mcp_servers.submitter.args={json.dumps(args)}",
-                "-c",
-                f'mcp_servers.submitter.cwd="{workspace}"',
-            ),
-            env={},
+            files={config_toml: content},
+            argv=(),
+            env={"CODEX_HOME": str(codex_home)},
         )
     path = output_dir / "submitter-mcp.patch.yml"
     content = _render_template(config_source / "dsh-mcp.example.patch.yml", values)
