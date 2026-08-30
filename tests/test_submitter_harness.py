@@ -71,7 +71,12 @@ def test_connectivity_prompt_requests_one_unconfirmed_proposal(tmp_path: Path):
 
 
 @pytest.mark.parametrize("harness", HARNESSES)
-def test_invocation_contains_no_server_repository_path(harness: str, tmp_path: Path):
+def test_invocation_contains_no_server_repository_path(
+    harness: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # The invocation copies the parent PATH by design (the harness binary must resolve),
+    # so pin it: the test runner's own venv may legitimately live under PROJECT_ROOT.
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
     invocation = _invoke(harness, tmp_path)
     rendered = "\n".join(
         [

@@ -1,9 +1,12 @@
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 from agent_scheduler.cli import main as cli_main
 from agent_scheduler.runtime import init_runtime
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_mcp_command_never_calls_load_runtime(tmp_path: Path, monkeypatch):
@@ -50,12 +53,17 @@ def test_mcp_command_never_calls_load_runtime(tmp_path: Path, monkeypatch):
 
 
 def test_python_module_entrypoint_reaches_cli_help():
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(PROJECT_ROOT / "src"), str(PROJECT_ROOT / "packages" / "client" / "src")]
+    )
     completed = subprocess.run(
         [sys.executable, "-m", "agent_scheduler.cli.main", "--help"],
         text=True,
         capture_output=True,
         check=False,
         timeout=10,
+        env=environment,
     )
 
     assert completed.returncode == 0
