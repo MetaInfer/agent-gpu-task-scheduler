@@ -492,8 +492,9 @@ pi 使用 `pi-mcp-adapter` 提供的显式 MCP config 参数或隔离的 project
 
 ### 10.3 Codex CLI
 
-`config/codex-mcp.example.toml` 提供可读、可解析的参考配置；客户端文档推荐将相同键以单次 `-c`
-override 传入当前 Codex 进程，从而不写 `~/.codex/config.toml`。
+`config/codex-mcp.example.toml` 渲染后作为一次运行专用的 `CODEX_HOME/config.toml`，codex 启动时
+实际加载的就是这份文件，不再转成 `-c` override，也不写 `~/.codex/config.toml`；已有的 `codex
+login` 认证通过把原 `CODEX_HOME` 下已存在的 `auth.json` 复制进该目录保留。
 
 配置必须包含：
 
