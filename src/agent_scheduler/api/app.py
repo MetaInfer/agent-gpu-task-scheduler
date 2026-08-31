@@ -25,7 +25,7 @@ from agent_scheduler.scheduler.core import Scheduler, SchedulingError, WorkerDri
 from agent_scheduler.storage import EventStore, StoreCorruptionError, prune_framework_logs
 from agent_scheduler.worker.docker import DockerCLI, DockerError
 from agent_scheduler.worker.driver import DockerWorkerDriver, FakeWorkerDriver
-from agent_scheduler.worker.gpu import HySmiSampler
+from agent_scheduler.worker.gpu import GpuSamplingError, HySmiSampler
 from agent_scheduler.worker.protocol import RemoteWorkerDriver, WorkerHub
 
 
@@ -615,15 +615,28 @@ def create_app(settings: Settings, identity: RuntimeIdentity | None = None) -> F
     return app
 
 
+def _tick_safely(scheduler: Scheduler) -> None:
+    try:
+        scheduler.tick("scheduler-loop")
+    except (OSError, StoreCorruptionError, ValueError):
+        # One transient failure (store I/O, parsing) must never kill scheduling for
+        # good; the next pass re-attempts.
+        return
+
+
 async def _scheduler_loop(scheduler: Scheduler) -> None:
     while True:
-        await asyncio.to_thread(scheduler.tick, "scheduler-loop")
+        await asyncio.to_thread(_tick_safely, scheduler)
         await asyncio.sleep(1)
 
 
-async def _sample_local_worker(scheduler: Scheduler, sampler: HySmiSampler, worker_id: str) -> None:
-    while True:
-        snapshots = await asyncio.to_thread(sampler.sample)
+def _register_sample(
+    scheduler: Scheduler,
+    sampler: HySmiSampler,
+    worker_id: str,
+) -> bool:
+    try:
+        snapshots = sampler.sample()
         scheduler.register_worker(
             WorkerSnapshot(
                 worker_id=worker_id,
@@ -632,6 +645,18 @@ async def _sample_local_worker(scheduler: Scheduler, sampler: HySmiSampler, work
                 gpus=snapshots,
             )
         )
+        return True
+    except (GpuSamplingError, OSError, StoreCorruptionError):
+        # A single `hy-smi` timeout raises GpuSamplingError, and one uncaught raise
+        # silently killed this task for good — freezing heartbeats so queued Tasks
+        # could never dispatch until a Master restart. Keep the loop alive; the next
+        # pass re-samples with a fresh heartbeat.
+        return False
+
+
+async def _sample_local_worker(scheduler: Scheduler, sampler: HySmiSampler, worker_id: str) -> None:
+    while True:
+        await asyncio.to_thread(_register_sample, scheduler, sampler, worker_id)
         await asyncio.sleep(10)
 
 
