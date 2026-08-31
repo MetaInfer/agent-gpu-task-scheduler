@@ -178,12 +178,13 @@ class Scheduler:
                         and (utc_now() - queued.enqueued_at).total_seconds() >= 30 * 60
                     ):
                         self._queue.pop(queued.task.task_id)
-                        self._transition(
-                            queued.task,
-                            TaskState.BLOCKED,
-                            request_id,
-                            failure_reason="QUALIFICATION_GPU_WAIT_EXPIRED",
-                        )
+                        if self._statuses[queued.task.task_id].state is TaskState.QUEUED:
+                            self._transition(
+                                queued.task,
+                                TaskState.BLOCKED,
+                                request_id,
+                                failure_reason="QUALIFICATION_GPU_WAIT_EXPIRED",
+                            )
                     continue
                 self._queue.pop(queued.task.task_id)
                 claimed = (queued.task, selections)
@@ -725,7 +726,7 @@ class Scheduler:
         self._statuses = latest_status
         for status in latest_status.values():
             queued_task = self._tasks.get(status.task_id)
-            if queued_task and status.state in {TaskState.QUEUED, TaskState.BLOCKED}:
+            if queued_task and status.state is TaskState.QUEUED:
                 self._queue[queued_task.task_id] = _Queued(
                     queued_task, status, status.updated_at, status.updated_at
                 )

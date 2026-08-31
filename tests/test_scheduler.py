@@ -90,6 +90,37 @@ def test_qualification_gpu_wait_expires_at_30_minutes(runtime_identity):
     assert status.failure_reason == "QUALIFICATION_GPU_WAIT_EXPIRED"
 
 
+def test_blocked_task_is_not_requeued_on_rebuild(runtime_identity):
+    root, identity = runtime_identity
+    task = signed_task(identity)
+    scheduler = scheduler_for(root, identity, threshold=90)
+    scheduler.register_worker(worker(91, GpuState.DRIFTED))
+    scheduler.enqueue(task)
+    scheduler._queue[task.task_id].enqueued_at = utc_now() - timedelta(minutes=31)
+    scheduler.tick()
+    assert scheduler.get_status(task.task_id).state is TaskState.BLOCKED
+    rebuilt = scheduler_for(root, identity, threshold=90)
+    rebuilt.register_worker(worker(91, GpuState.DRIFTED))
+    # A re-queued BLOCKED task would expire again 30 minutes after the rebuild and
+    # crash every tick with InvalidTransition (BLOCKED -> BLOCKED).
+    assert rebuilt.queued_task_ids() == []
+    assert rebuilt.tick() == []
+    assert rebuilt.get_status(task.task_id).state is TaskState.BLOCKED
+
+
+def test_expiry_skips_an_already_blocked_queue_entry(runtime_identity):
+    root, identity = runtime_identity
+    task = signed_task(identity)
+    scheduler = scheduler_for(root, identity, threshold=90)
+    scheduler.register_worker(worker(91, GpuState.DRIFTED))
+    scheduler.enqueue(task)
+    scheduler._transition(task, TaskState.BLOCKED, "test", failure_reason="manual")
+    scheduler._queue[task.task_id].enqueued_at = utc_now() - timedelta(minutes=31)
+    assert scheduler.tick() == []
+    assert scheduler.get_status(task.task_id).state is TaskState.BLOCKED
+    assert scheduler.queued_task_ids() == []
+
+
 def test_cleanup_failure_retains_entire_lease(runtime_identity):
     root, identity = runtime_identity
     task = signed_task(identity)
