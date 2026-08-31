@@ -200,7 +200,10 @@ RUN_REAL_GPU=1 RUN_FULL_QUALIFICATION=1 RUN_REAL_CODEX=1 \
 第二套从同样的值重新拼出来的旁路。启动前 `build_submitter_invocation` 还会把真实
 CODEX_HOME（`CODEX_HOME` 环境变量，或未设置时的 `~/.codex`）下已有的 `auth.json` 复制
 （不是移动或软链接）进这个新目录，`codex login` 的登录态才不会被隔离掉；真实 `~/.codex`
-或已有的 `CODEX_HOME` 内容永远不会被写入或修改。
+或已有的 `CODEX_HOME` 内容永远不会被写入或修改。真实 home 下的 `config.toml` 同样会被
+**继承**（复制其内容、剥离 `mcp_servers` 开头的表、置于渲染模板之前），否则操作者配置的
+provider/model（自定义 `base_url`、`model_provider`、`[model_providers.*]`）会在合成 home
+里丢失，codex 退回默认端点而无法连接——真机验收曾因此 900 秒无任何模型回复。
 
 ## pi
 

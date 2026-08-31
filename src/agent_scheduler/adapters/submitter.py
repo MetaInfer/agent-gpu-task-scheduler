@@ -79,7 +79,7 @@ def build_submitter_invocation(
     if harness == "pi":
         _seed_pi_agent_dir(output_dir)
     elif harness == "codex":
-        _seed_codex_home_auth(Path(onboarding.env["CODEX_HOME"]))
+        _seed_codex_home(Path(onboarding.env["CODEX_HOME"]))
     binary = executable or submitter_executable(harness)
     prompt = _prompt(project_root, run_id, prompt_kind)
     env = _base_environment(ca_file, harness=harness, pi_provider=pi_provider)
@@ -222,13 +222,35 @@ def _seed_pi_agent_dir(output_dir: Path) -> None:
             shutil.copy2(candidate, output_dir / name)
 
 
-def _seed_codex_home_auth(codex_home: Path) -> None:
-    """Copy `codex login` auth into the synthetic CODEX_HOME, without touching the real one.
+def _strip_mcp_servers_sections(text: str) -> str:
+    """Drop every `[mcp_servers...]` table from a Codex config, so a merged config keeps
+    exactly one — the Kit-rendered one — and TOML table-duplication errors cannot occur."""
+    kept: list[str] = []
+    skipping = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            skipping = stripped.startswith(("[mcp_servers", "[[mcp_servers"))
+            if skipping:
+                continue
+        if skipping:
+            continue
+        kept.append(line)
+    return "\n".join(kept)
 
-    Codex resolves auth.json from CODEX_HOME, so pointing that variable at a synthetic,
-    per-run directory would otherwise silently drop any existing `codex login` session.
-    The copy is read-only-in-spirit: the real file is never moved, symlinked, or modified,
-    and nothing is written outside `codex_home` (which lives under the run's output_dir).
+
+def _seed_codex_home(codex_home: Path) -> None:
+    """Copy login auth and operator config into the synthetic CODEX_HOME, without
+    touching the real one.
+
+    Codex resolves auth.json and config.toml from CODEX_HOME, so pointing that variable
+    at a synthetic per-run directory silently drops any existing `codex login` session
+    AND the operator's model provider settings (base_url, model, custom providers) —
+    the Kit-rendered config.toml contains only `mcp_servers.submitter`. The operator's
+    config is therefore inherited read-only: copied verbatim (minus any mcp_servers
+    tables, which the rendered template owns) under the rendered MCP section. The real
+    files are never moved, symlinked, or modified, and nothing is written outside
+    `codex_home` (which lives under the run's output_dir).
     """
     configured = os.environ.get("CODEX_HOME")
     source_home = (
@@ -238,3 +260,15 @@ def _seed_codex_home_auth(codex_home: Path) -> None:
     if source_auth.is_file():
         codex_home.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_auth, codex_home / "auth.json")
+    source_config = source_home / "config.toml"
+    if not source_config.is_file():
+        return
+    config_path = codex_home / "config.toml"
+    if not config_path.is_file():
+        codex_home.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_config, config_path)
+        return
+    inherited = _strip_mcp_servers_sections(source_config.read_text(encoding="utf-8"))
+    rendered = config_path.read_text(encoding="utf-8")
+    if inherited:
+        config_path.write_text(f"{inherited}\n\n{rendered}", encoding="utf-8")

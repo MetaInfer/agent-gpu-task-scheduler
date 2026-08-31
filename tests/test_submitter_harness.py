@@ -140,7 +140,12 @@ def test_claude_argv_allows_only_the_canonical_submitter_tools(tmp_path: Path):
     )
 
 
-def test_codex_runs_non_interactively_without_touching_the_user_config(tmp_path: Path):
+def test_codex_runs_non_interactively_without_touching_the_user_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Isolate from the operator's real ~/.codex/config.toml so the byte-identity
+    # assertion below stays about the Kit's own rendering.
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "empty-codex-home"))
     invocation = _invoke("codex", tmp_path)
     assert invocation.argv[1] == "exec"
     assert "--json" in invocation.argv
@@ -185,8 +190,82 @@ def test_codex_home_carries_existing_login_auth_without_touching_the_real_home(
     assert synthetic_codex_home != real_codex_home
     assert tmp_path in synthetic_codex_home.parents
     assert (synthetic_codex_home / "auth.json").read_text(encoding="utf-8") == '{"tokens": {}}'
-    # The real CODEX_HOME must not be touched: still exactly the two files we put there.
+    # The real CODEX_HOME must not be touched: still exactly the files we put there.
     assert {path.name for path in real_codex_home.iterdir()} == {"auth.json"}
+
+
+def test_codex_home_inherits_operator_provider_config_under_the_rendered_mcp_section(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    operator_config = (
+        'model = "gpt-5.6-sol"\n'
+        'model_provider = "pucoding"\n'
+        "\n"
+        '[model_providers.pucoding]\n'
+        'base_url = "https://pucoding.com/v1"\n'
+        "\n"
+        "[mcp_servers.other]\n"
+        'command = "something-else"\n'
+    )
+    (real_codex_home / "config.toml").write_text(operator_config, encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+
+    invocation = _invoke("codex", tmp_path)
+
+    synthetic_codex_home = Path(invocation.env["CODEX_HOME"])
+    merged = (synthetic_codex_home / "config.toml").read_text(encoding="utf-8")
+    rendered = next(
+        iter(
+            onboarding_module.build_onboarding(
+                "codex",
+                output_dir=tmp_path / "run",
+                workspace=tmp_path / "client-workspace",
+                base_url="https://127.0.0.1:8443",
+                username="zz_chentian",
+                client_entrypoint=Path("/opt/agent-client/venv/bin/agent-scheduler-submitter"),
+                ca_file=Path("/shared/state/tls/certificate.pem"),
+                config_source=PROJECT_ROOT / "config" / "client",
+            ).files.values()
+        )
+    )
+    assert merged.startswith(operator_config.split("[mcp_servers.other]")[0].rstrip() + "\n")
+    assert 'base_url = "https://pucoding.com/v1"' in merged
+    assert "[mcp_servers.other]" not in merged
+    assert merged.count("[mcp_servers.submitter]") == 1
+    assert merged.endswith(rendered)
+    # The operator's own mcp_servers table must be dropped, never merged into a
+    # duplicate-table config, and the real home stays untouched.
+    assert (real_codex_home / "config.toml").read_text(encoding="utf-8") == operator_config
+
+
+def test_codex_home_keeps_only_the_rendered_config_when_no_operator_config_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    (real_codex_home / "auth.json").write_text('{"tokens": {}}', encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+
+    invocation = _invoke("codex", tmp_path)
+
+    synthetic_codex_home = Path(invocation.env["CODEX_HOME"])
+    rendered = next(
+        iter(
+            onboarding_module.build_onboarding(
+                "codex",
+                output_dir=tmp_path / "run",
+                workspace=tmp_path / "client-workspace",
+                base_url="https://127.0.0.1:8443",
+                username="zz_chentian",
+                client_entrypoint=Path("/opt/agent-client/venv/bin/agent-scheduler-submitter"),
+                ca_file=Path("/shared/state/tls/certificate.pem"),
+                config_source=PROJECT_ROOT / "config" / "client",
+            ).files.values()
+        )
+    )
+    assert (synthetic_codex_home / "config.toml").read_text(encoding="utf-8") == rendered
 
 
 def test_codex_home_has_no_auth_when_none_exists_and_never_creates_outside_tmp_path(

@@ -190,12 +190,25 @@ render_client_config
 if [ -f "$REAL_CODEX_HOME/auth.json" ]; then
   cp "$REAL_CODEX_HOME/auth.json" "$CODEX_HOME/auth.json"
 fi
+if [ -f "$REAL_CODEX_HOME/config.toml" ]; then
+  awk 'BEGIN{skip=0} /^\[/{skip=($0 ~ /^\[\[?mcp_servers/)} !skip' \
+    "$REAL_CODEX_HOME/config.toml" > "$RENDERED_CONFIG.inherited"
+  cat "$RENDERED_CONFIG.inherited" "$RENDERED_CONFIG" > "$RENDERED_CONFIG.merged"
+  mv "$RENDERED_CONFIG.merged" "$RENDERED_CONFIG"
+  rm -f "$RENDERED_CONFIG.inherited"
+fi
 ```
 
 如果你之前用 `codex login` 认证过，上面这一步会把真实（当前生效）`CODEX_HOME` 下的
 `auth.json` 复制一份进新目录，让登录态继续可用——**复制，不要移动或软链接**，原文件
 保持不动。用 `OPENAI_API_KEY`（或对应厂商网关）认证的场景不需要这一步——那条路径不依赖
 `CODEX_HOME` 的文件内容。
+
+同样重要：如果你在 `~/.codex/config.toml` 里配置过 provider/model（例如自定义
+`base_url`、`model_provider` 或 `[model_providers.*]` 表），新目录里的 `config.toml`
+必须把它们**继承**进来，否则 codex 会退回默认端点。上面的 `awk` 把真实配置里
+`mcp_servers` 开头的表剥离后（那份表归 Kit 模板所有，避免 TOML 重复表报错），整体放在
+渲染模板**前面**——模板写在后面，`mcp_servers.submitter` 以 Kit 渲染值为准。
 
 ### pi
 
