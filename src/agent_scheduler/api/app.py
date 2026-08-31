@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 import time
 import uuid
@@ -615,11 +616,14 @@ def create_app(settings: Settings, identity: RuntimeIdentity | None = None) -> F
     return app
 
 
+_LOOP_LOG = logging.getLogger("agent_scheduler.loops")
+
+
 def _tick_safely(scheduler: Scheduler) -> None:
     try:
         scheduler.tick("scheduler-loop")
     except Exception:  # noqa: BLE001 — a background loop must survive any transient failure; one uncaught raise kills scheduling for good.
-        # The next pass re-attempts.
+        _LOOP_LOG.warning("scheduler tick failed", exc_info=True)
         return
 
 
@@ -646,7 +650,7 @@ def _register_sample(
         )
         return True
     except Exception:  # noqa: BLE001 — a heartbeat loop must survive any transient failure; the observed deaths were silent and froze scheduling for good.
-        # The next pass re-samples with a fresh heartbeat.
+        _LOOP_LOG.warning("worker GPU sampling failed", exc_info=True)
         return False
 
 
