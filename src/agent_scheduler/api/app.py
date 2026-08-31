@@ -25,7 +25,7 @@ from agent_scheduler.scheduler.core import Scheduler, SchedulingError, WorkerDri
 from agent_scheduler.storage import EventStore, StoreCorruptionError, prune_framework_logs
 from agent_scheduler.worker.docker import DockerCLI, DockerError
 from agent_scheduler.worker.driver import DockerWorkerDriver, FakeWorkerDriver
-from agent_scheduler.worker.gpu import GpuSamplingError, HySmiSampler
+from agent_scheduler.worker.gpu import HySmiSampler
 from agent_scheduler.worker.protocol import RemoteWorkerDriver, WorkerHub
 
 
@@ -618,9 +618,8 @@ def create_app(settings: Settings, identity: RuntimeIdentity | None = None) -> F
 def _tick_safely(scheduler: Scheduler) -> None:
     try:
         scheduler.tick("scheduler-loop")
-    except (OSError, StoreCorruptionError, ValueError):
-        # One transient failure (store I/O, parsing) must never kill scheduling for
-        # good; the next pass re-attempts.
+    except Exception:  # noqa: BLE001 — a background loop must survive any transient failure; one uncaught raise kills scheduling for good.
+        # The next pass re-attempts.
         return
 
 
@@ -646,11 +645,8 @@ def _register_sample(
             )
         )
         return True
-    except (GpuSamplingError, OSError, StoreCorruptionError):
-        # A single `hy-smi` timeout raises GpuSamplingError, and one uncaught raise
-        # silently killed this task for good — freezing heartbeats so queued Tasks
-        # could never dispatch until a Master restart. Keep the loop alive; the next
-        # pass re-samples with a fresh heartbeat.
+    except Exception:  # noqa: BLE001 — a heartbeat loop must survive any transient failure; the observed deaths were silent and froze scheduling for good.
+        # The next pass re-samples with a fresh heartbeat.
         return False
 
 
