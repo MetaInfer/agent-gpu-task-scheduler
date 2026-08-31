@@ -70,14 +70,64 @@ below blocked one attempt and was fixed before this COMPLETED run:
   `a53dfb9`): PATH leakage into a no-repo-path assertion, and a ten-second `--help`
   subprocess timeout that a transient host-load spike could trip.
 
-## Codex / pi / dsh
+## dsh
 
-Not yet qualified on this date. Blocked on provider-side prerequisites, not on the
-Client Kit: Codex requires an OpenAI-compatible endpoint serving `/v1/*` (the
-configured gateway serves the API at root paths only); pi's requests are rejected by
-the configured gateways (`403 Request not allowed` on the Anthropic path, timeouts on
-the OpenAI path); dsh needs a valid `DEEPSEEK_API_KEY` (the configured key is rejected
-by the provider).
+- Checked at: 2026-08-31
+- Status: `COMPLETED`
+- Qualification run: `qual_01a05723f00c74d29f2a6434cf732b52`
+- Harness under test: dsh (headless profile, `DSH_PERMISSION_MODE=danger-full-access` for
+  this invocation only), credentials from the operator-provided `.env`
+- T2 (fake-Master connectivity): passed (24.5s)
+
+| Cards | Proposal | Task | State |
+| --- | --- | --- | --- |
+| 1 | `prop_01a05724df5b75a4ac4d0b772957c3b9` | `task_01a05726ae1f75cc90a6ff6d018ee361` | COMPLETED |
+| 2 | `prop_01a0572537e27d1c9fd29b4a1bcde851` | `task_01a05726eb6b786aa9d81e9a4b6e00af` | COMPLETED |
+| 4 | `prop_01a0572592dc7a97a2dd1b2422114e78` | `task_01a0572724b27659984d191f26ab391b` | COMPLETED |
+| 8 | `prop_01a05725ffde7b1e9ff631e6f1386ac3` | `task_01a057276ff675eea1e23a0017251720` | COMPLETED |
+
+Numerical evidence: all_reduce 1.0/3.0/10.0/36.0 on 1/2/4/8 cards (`gpu_ids`
+0 / 0-1 / 0-3 / 0-7), GEMM ok, backend nccl, host kme6.
+
+## pi
+
+- Checked at: 2026-08-31
+- Status: `COMPLETED`
+- Qualification run: `qual_01a057c471ed7849a2c28282b76f12f7`
+- Harness under test: pi through `--provider deepseek --model deepseek-v4-flash`
+  (`AGENT_SCHEDULER_PI_PROVIDER=deepseek`, `AGENT_SCHEDULER_PI_MODEL=deepseek-v4-flash`);
+  the Anthropic and OpenAI gateways reject pi's request shape, so the deepseek
+  provider with the operator-provided `.env` credentials is the qualified path
+- T2 (fake-Master connectivity): passed (31.8s)
+
+| Cards | Proposal | Task | State |
+| --- | --- | --- | --- |
+| 1 | `prop_01a057c678977f86b8672d8410a9179e` | `task_01a057c85d2a715a8d380ba54396e97c` | COMPLETED |
+| 2 | `prop_01a057c6acf57113a1a4d193ff6b03ce` | `task_01a057c8a50d75b2ae74581cc87edd5e` | COMPLETED |
+| 4 | `prop_01a057c70adc74ae834ae442de62f880` | `task_01a057c8e2f47e2fad7902b0587af6ba` | COMPLETED |
+| 8 | `prop_01a057c7a1c77f889d34a3915f7bdae4` | `task_01a057c91f777064b3a4a72d5ebecb4a` | COMPLETED |
+
+Numerical evidence: all_reduce 1.0/3.0/10.0/36.0 on 1/2/4/8 cards (`gpu_ids`
+0 / 0-1 / 0-3 / 0-7), GEMM ok, backend nccl.
+
+## Codex
+
+- Checked at: 2026-08-31
+- Status: `COMPLETED`
+- Qualification run: `qual_01a057d7a21d7545968eef1fa7c6a9f9`
+- Harness under test: Codex CLI through the operator's `/v1` gateway endpoint
+  (`model_provider` config inherited from the real `CODEX_HOME`, model gpt-5.6-sol)
+- T2 (fake-Master connectivity): passed (1:54)
+
+| Cards | Proposal | Task | State |
+| --- | --- | --- | --- |
+| 1 | `prop_01a057d9689973b3ba1be3cbb6288243` | `task_01a057db524c7b13b1027707bbf46b53` | COMPLETED |
+| 2 | `prop_01a057d9c5e37ad7b442657cedaf8f2c` | `task_01a057db93e87c9cb58f926ae47ae2eb` | COMPLETED |
+| 4 | `prop_01a057da042e792eb76a6b7e92ca6198` | `task_01a057dc13b17c76b3ee15e2810827de` | COMPLETED |
+| 8 | `prop_01a057da5fde7e5fa8f11011e9bf2428` | `task_01a057dbde367ead9c5c47507e26f15b` | COMPLETED |
+
+Numerical evidence: all_reduce 1.0/3.0/10.0/36.0 on 1/2/4/8 cards (`gpu_ids`
+0 / 0-1 / 0-3 / 0-7), GEMM ok, backend nccl.
 
 ## Previous run (2026-08-21)
 
