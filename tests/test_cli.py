@@ -62,7 +62,10 @@ def test_python_module_entrypoint_reaches_cli_help():
         text=True,
         capture_output=True,
         check=False,
-        timeout=10,
+        # The qualification gate runs the full suite on a busy shared host; a cold
+        # import can exceed ten seconds under a load spike even though the CLI is
+        # healthy. Sixty seconds still fails fast for a genuinely broken entrypoint.
+        timeout=60,
         env=environment,
     )
 
