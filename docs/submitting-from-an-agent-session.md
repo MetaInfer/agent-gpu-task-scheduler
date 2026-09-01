@@ -31,34 +31,76 @@
 
 MCP Adapter 只是个翻译层，后面必须有活着的控制面。
 
-```bash
-cd /public/share/fh/agent-gpu-task-scheduler
-export AGENT_SCHEDULER_STATE_ROOT=/public/share/agent-scheduler-mvp
-export AGENT_SCHEDULER_PROFILE=qualification
-export AGENT_SCHEDULER_HARNESS_MODE=claude
-export AGENT_SCHEDULER_WORKER_MODE=remote
-export ANTHROPIC_AUTH_TOKEN=...        # 或 ANTHROPIC_API_KEY
+### 1.1 每台机器安装自己的虚拟环境
 
-python3 -m agent_scheduler.cli.main serve     # 终端 1
-python3 -m agent_scheduler.cli.main worker    # 终端 2
-```
+仓库可以通过 NFS 挂载，但 **`.venv` 不得在机器之间共享**。editable install 和 console
+script 都记录源码及 Python 的绝对路径；例如一台机器使用 `/public/share/fh/...`，另一台使用
+`/data/fh/...` 时，共享 `.venv` 会直接报 `No module named agent_scheduler`。
 
-确认：
+下面假定当前机器上的源码路径是 `/data/fh/agent-gpu-task-scheduler`。在 Master 和每台 Worker
+上分别执行一次，虚拟环境放在节点本地的 `/opt`：
 
 ```bash
-curl -sk https://127.0.0.1:8443/health
+mkdir -p /opt/agent-scheduler
+uv venv /opt/agent-scheduler/venv --python 3.12
+uv pip install --python /opt/agent-scheduler/venv/bin/python \
+  -e /data/fh/agent-gpu-task-scheduler
+
+/opt/agent-scheduler/venv/bin/python -c \
+  'import agent_scheduler; print(agent_scheduler.__file__)'
 ```
 
-`workers` 必须是 `1`，`integrity` 必须是 `valid`。**这一步不通过，后面全都白搭。**
+最后一条必须输出当前机器源码树下的 `src/agent_scheduler/__init__.py`。不要继续使用仓库里的
+`.venv/bin/python` 或裸 `python3`。
+
+### 1.2 准备配置并分别启动
+
+Master 和 Worker 是不同进程，真实多机部署时运行在不同机器。Master 使用 `master.json`，
+每台 Worker 使用只包含自己身份的 `worker.json`；两者都不从环境变量读取调度配置或 Worker
+凭据。先按 [配置与多机 Worker](usage.md#多机-worker) 准备独立 key、CA 和 JSON 配置。
+
+只在首次部署时，由 Master 对共享 state root 初始化一次：
+
+```bash
+/opt/agent-scheduler/venv/bin/agent-scheduler init-runtime \
+  --state-root /public/share/agent-scheduler-mvp
+```
+
+终端 1，在 Master 机器启动：
+
+```bash
+/opt/agent-scheduler/venv/bin/agent-scheduler serve \
+  --config /etc/agent-scheduler/master.json \
+  --host 0.0.0.0 --port 8443
+```
+
+终端 2，在 Worker 机器启动：
+
+```bash
+/opt/agent-scheduler/venv/bin/agent-scheduler worker \
+  --config /etc/agent-scheduler/worker.json
+```
+
+若只在一台机器做开发联调，也仍然启动上述两个独立进程，不使用 `local` 模式。
+
+使用 CA 确认，不要用 `-k` 绕过 TLS：
+
+```bash
+curl --cacert /public/share/agent-scheduler-mvp/tls/certificate.pem \
+  https://127.0.0.1:8443/health
+```
+
+单 Worker 联调时，`workers` 和 `configured_workers` 必须都是 `1`，`integrity` 必须是
+`valid`。**这一步不通过，后面全都白搭。**
 
 > Master 起不来最常见的原因是端口被上一次没退干净的进程占着。`serve` 会打印
 > `address already in use` 然后静默退出，而旧进程仍在服务旧代码——症状是「我明明改了却没生效」。
 > 用 `ss -lntp | grep 8443` 确认。
 
-`AGENT_SCHEDULER_HARNESS_MODE=claude` 意味着 Master 内部的 Processor 和 Reviewer 角色会真的
+Master 配置中的 `"harness_mode": "claude"` 意味着 Processor 和 Reviewer 角色会真的
 调用 Claude，**会产生费用**——这与你打算用哪家 Agent 来提交 Proposal 是两回事：Processor/
 Reviewer 是控制面固定的内部角色，不随 Submitter 换成 Codex CLI/pi/dsh 而改变。只想跑通链路
-不想花钱，把它设成 `fake`——除了 Processor/Reviewer 是假的，其余（签名编译、调度、租约、
+不想花钱，把该字段设成 `"fake"`——除了 Processor/Reviewer 是假的，其余（签名编译、调度、租约、
 Docker、产物校验）全是真的。
 
 ## 步骤 2 · 给会话装 MCP Server
@@ -66,20 +108,23 @@ Docker、产物校验）全是真的。
 四家最终都指向同一条命令，服务端没有任何 harness 专属分支：
 
 ```
-python3 -m agent_scheduler.cli.main mcp --base-url https://127.0.0.1:8443 --username zz_chentian
+/opt/agent-scheduler/venv/bin/agent-scheduler mcp \
+  --base-url https://127.0.0.1:8443 \
+  --username zz_chentian \
+  --ca-file /public/share/agent-scheduler-mvp/tls/certificate.pem
 ```
 
-`AGENT_SCHEDULER_STATE_ROOT` 必须与 Master 一致——Adapter 用
-`<state-root>/tls/certificate.pem` 作 CA。区别只在于每家怎么把这条命令声明给会话。
+`--ca-file` 必须显式指向 Master CA；Adapter 不读取调度器环境变量。区别只在于每家怎么把
+这条命令声明给会话。
 下面每节的配置内容都以 `build_onboarding()` 的真实输出为准，可以自己核对：
 
 ```bash
-python3 -c "
+/opt/agent-scheduler/venv/bin/python -c "
 import sys
 from pathlib import Path
 from agent_scheduler.adapters.onboarding import build_onboarding
 config = build_onboarding('claude', output_dir=Path('/tmp/demo'),
-    project_root=Path('/public/share/fh/agent-gpu-task-scheduler'),
+    project_root=Path('/data/fh/agent-gpu-task-scheduler'),
     state_root=Path('/public/share/agent-scheduler-mvp'),
     base_url='https://127.0.0.1:8443', username='zz_chentian',
     python_path=Path(sys.executable).resolve())
@@ -96,14 +141,14 @@ print(config.argv, config.files)
 **方式 A：`claude mcp add`（推荐，作用域可控）**
 
 ```bash
-cd /public/share/fh/agent-gpu-task-scheduler
+cd /data/fh/agent-gpu-task-scheduler
 
 claude mcp add submitter \
   --scope project \
-  --env AGENT_SCHEDULER_STATE_ROOT=/public/share/agent-scheduler-mvp \
-  -- python3 -m agent_scheduler.cli.main mcp \
+  -- /opt/agent-scheduler/venv/bin/agent-scheduler mcp \
        --base-url https://127.0.0.1:8443 \
-       --username zz_chentian
+       --username zz_chentian \
+       --ca-file /public/share/agent-scheduler-mvp/tls/certificate.pem
 ```
 
 `--scope project` 写进项目配置；换成 `user` 则对你所有会话生效。
@@ -152,13 +197,11 @@ Codex 从 `$CODEX_HOME/config.toml` 加载配置，不支持在命令行内联�
 ```toml
 # /tmp/agent-scheduler-codex-home-xyz/config.toml
 [mcp_servers.submitter]
-command = "/usr/bin/python3"
-args = ["-m", "agent_scheduler.cli.main", "mcp",
-        "--base-url", "https://127.0.0.1:8443", "--username", "zz_chentian"]
-cwd = "/public/share/fh/agent-gpu-task-scheduler"
-
-[mcp_servers.submitter.env]
-AGENT_SCHEDULER_STATE_ROOT = "/public/share/agent-scheduler-mvp"
+command = "/opt/agent-scheduler/venv/bin/agent-scheduler"
+args = ["mcp", "--base-url", "https://127.0.0.1:8443",
+        "--username", "zz_chentian", "--ca-file",
+        "/public/share/agent-scheduler-mvp/tls/certificate.pem"]
+cwd = "/data/fh/agent-gpu-task-scheduler"
 ```
 
 ```bash
@@ -193,12 +236,11 @@ pi install npm:pi-mcp-adapter
 {
   "mcpServers": {
     "submitter": {
-      "command": "/usr/bin/python3",
-      "args": ["-m", "agent_scheduler.cli.main", "mcp",
-                "--base-url", "https://127.0.0.1:8443",
-                "--username", "zz_chentian"],
-      "cwd": "/public/share/fh/agent-gpu-task-scheduler",
-      "env": {"AGENT_SCHEDULER_STATE_ROOT": "/public/share/agent-scheduler-mvp"},
+      "command": "/opt/agent-scheduler/venv/bin/agent-scheduler",
+      "args": ["mcp", "--base-url", "https://127.0.0.1:8443",
+                "--username", "zz_chentian", "--ca-file",
+                "/public/share/agent-scheduler-mvp/tls/certificate.pem"],
+      "cwd": "/data/fh/agent-gpu-task-scheduler",
       "directTools": [
         "create_proposal", "reply", "confirm_revision", "get_reviews",
         "resume", "cancel", "get_proposal", "get_task", "cancel_task",
@@ -241,11 +283,9 @@ dsh plugin --profile headless add dsh-mcp-bridge
       config:
         serverName: submitter
         transport: stdio
-        command: "/usr/bin/python3"
-        args: ["-m", "agent_scheduler.cli.main", "mcp", "--base-url", "https://127.0.0.1:8443", "--username", "zz_chentian"]
-        cwd: "/public/share/fh/agent-gpu-task-scheduler"
-        env:
-          AGENT_SCHEDULER_STATE_ROOT: "/public/share/agent-scheduler-mvp"
+        command: "/opt/agent-scheduler/venv/bin/agent-scheduler"
+        args: ["mcp", "--base-url", "https://127.0.0.1:8443", "--username", "zz_chentian", "--ca-file", "/public/share/agent-scheduler-mvp/tls/certificate.pem"]
+        cwd: "/data/fh/agent-gpu-task-scheduler"
     - id: skill-filesystem-submitter
       name: '@deepseek-ai/dsh-skill-filesystem'
       config:
@@ -355,11 +395,13 @@ Reviewer 是控制面的固定角色，不随 Submitter 换人而放水。
 想确认通路本身没问题，可以直接喂 JSON-RPC 给 Adapter，跳过任何一家 Agent：
 
 ```bash
-export AGENT_SCHEDULER_STATE_ROOT=/public/share/agent-scheduler-mvp
 printf '%s\n%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
-| python3 -m agent_scheduler.cli.main mcp --base-url https://127.0.0.1:8443 --username zz_chentian
+| /opt/agent-scheduler/venv/bin/agent-scheduler mcp \
+    --base-url https://127.0.0.1:8443 \
+    --username zz_chentian \
+    --ca-file /public/share/agent-scheduler-mvp/tls/certificate.pem
 ```
 
 能列出 12 个工具就说明 Adapter、TLS、控制面这条链是通的，问题只可能在 Agent 侧配置。
@@ -370,8 +412,9 @@ printf '%s\n%s\n' \
 | --- | --- | --- |
 | Claude `/mcp` 里没有 `submitter` | 配置没被加载 | 确认启动目录，或改用 `--scope user` |
 | `submitter` 显示 `failed` | Adapter 进程起不来 | 用上面的手动验证命令看真实报错 |
-| `mcp requires --username` | 没传 `--username` | 加参数，或设 `AGENT_SCHEDULER_USERNAME` |
-| 连接被拒 / TLS 失败 | Master 没起，或 `AGENT_SCHEDULER_STATE_ROOT` 不对 | Adapter 用 `<state-root>/tls/certificate.pem` 作 CA，路径必须和 Master 一致 |
+| `mcp requires --username` | 没传 `--username` | 显式添加 `--username` |
+| 连接被拒 / TLS 失败 | Master 没起、URL 错误或 `--ca-file` 不匹配 | 核对 Master URL、证书 SAN 和显式 CA 文件；不得关闭 TLS 验证 |
+| `No module named agent_scheduler` | 使用了共享 `.venv`，或项目未在当前节点安装 | 按步骤 1.1 创建节点本地 `/opt/agent-scheduler/venv`，验证 import 后使用其 console script |
 | `403 USERNAME_NOT_ALLOWED` | 用户名不在白名单 | 用 `zz_chentian`，或 `reload-users` 加人 |
 | `422 INVALID_PROPOSAL` | 内容不合契约 | 读 `message`。最常见是 argv 不是两个位置参数 |
 | `409 IDEMPOTENCY_CONFLICT` | 同键不同负载 | 换新幂等键 |
@@ -386,7 +429,8 @@ printf '%s\n%s\n' \
 MCP Adapter 进程只读取 `<state-root>/tls/certificate.pem`（非机密材料，用于验证 Master 的
 TLS），**从不读取 Worker API Key 或 Ed25519 私钥**。这意味着它不需要 root——只要运行它的
 OS 账号是 state-root 属组的成员就够了，这也正好吻合最初的设计：Submitter 本就该是低权限的
-`zz_chentian`，而不是 root。这一条对四家 Agent 一视同仁：谁来跑 `python3 -m agent_scheduler.cli.main mcp` 都是
+`zz_chentian`，而不是 root。这一条对四家 Agent 一视同仁：谁来跑节点本地虚拟环境中的
+`agent-scheduler mcp` 都是
 同一个低权限进程，权限模型不因换了哪家 Agent 而改变。
 
 在验证用的主机上，Python 解释器安装在 `/root` 下，而 `/root` 本身对非 root 账号

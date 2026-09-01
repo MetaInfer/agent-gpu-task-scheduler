@@ -29,6 +29,12 @@ class RuntimeIdentity:
     tls_private_key: Path
 
 
+@dataclass(frozen=True)
+class WorkerRuntimeIdentity:
+    key_id: str
+    signing_public_key: Ed25519PublicKey
+
+
 def _sync_group(path: Path, reference: Path) -> None:
     """Match `path`'s owning group to `reference`'s.
 
@@ -186,6 +192,23 @@ def load_runtime(state_root: Path) -> RuntimeIdentity:
     )
     validate_runtime(state_root, identity)
     return identity
+
+
+def load_worker_runtime(state_root: Path) -> WorkerRuntimeIdentity:
+    """Load only public verification material required by a remote Worker."""
+    secrets_dir = state_root / "secrets"
+    public_path = secrets_dir / "ed25519-public.pem"
+    key_id_path = secrets_dir / "ed25519-key-id"
+    missing = [str(path) for path in (public_path, key_id_path) if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"Worker runtime identity is incomplete: {', '.join(missing)}")
+    public = serialization.load_pem_public_key(public_path.read_bytes())
+    if not isinstance(public, Ed25519PublicKey):
+        raise TypeError("runtime signing public key must be Ed25519")
+    key_id = key_id_path.read_text(encoding="ascii").strip()
+    if not key_id:
+        raise ValueError("runtime key identity is invalid")
+    return WorkerRuntimeIdentity(key_id=key_id, signing_public_key=public)
 
 
 def validate_runtime(state_root: Path, identity: RuntimeIdentity) -> None:

@@ -87,6 +87,7 @@ class ProposalService:
         key_id: str,
         allowed_users: set[str] | None = None,
         max_workers: int = 1,
+        allowed_worker_ids: tuple[str, ...] = ("worker-local-01",),
         policy_version: str = "policy-v1",
     ) -> None:
         self.events = events
@@ -95,6 +96,7 @@ class ProposalService:
         self.key_id = key_id
         self.allowed_users = allowed_users or {"zz_chentian"}
         self.max_workers = max_workers
+        self.allowed_worker_ids = allowed_worker_ids
         self.policy_version = policy_version
         self._records: dict[str, _Record] = {}
         self._idempotency: dict[tuple[str, str, str], IdempotencyRecord] = {}
@@ -407,9 +409,9 @@ class ProposalService:
                 key_id=self.key_id,
                 policy_version=self.policy_version,
                 max_workers=self.max_workers,
-                allowed_worker_ids=("worker-local-01",),
+                allowed_worker_ids=self.allowed_worker_ids,
                 allowed_container=(
-                    "worker-local-01",
+                    facts.required_worker_id,
                     "fh-sglang-deepseek-v4-flash",
                     "zz_chentian",
                 ),

@@ -25,8 +25,7 @@ from agent_scheduler.runtime import RuntimeIdentity, load_runtime
 from agent_scheduler.scheduler.core import Scheduler, SchedulingError, WorkerDriver
 from agent_scheduler.storage import EventStore, StoreCorruptionError, prune_framework_logs
 from agent_scheduler.worker.docker import DockerCLI, DockerError
-from agent_scheduler.worker.driver import DockerWorkerDriver, FakeWorkerDriver
-from agent_scheduler.worker.gpu import HySmiSampler
+from agent_scheduler.worker.driver import FakeWorkerDriver
 from agent_scheduler.worker.protocol import RemoteWorkerDriver, WorkerHub
 
 
@@ -58,7 +57,6 @@ class AppContext:
     proposals: ProposalService
     scheduler: Scheduler
     hub: WorkerHub | None
-    sampler: HySmiSampler | None
     draining: bool = False
 
 
@@ -71,23 +69,18 @@ def create_app(settings: Settings, identity: RuntimeIdentity | None = None) -> F
             events,
             prompts_dir=project_root / "prompts",
             mcp_config=project_root / "config" / "empty-mcp.json",
+            allowed_worker_ids=settings.allowed_worker_ids,
         )
         if settings.harness_mode == "claude"
-        else FakeHarnessAdapter()
+        else FakeHarnessAdapter(worker_id=settings.allowed_worker_ids[0])
     )
     hub: WorkerHub | None = None
-    sampler: HySmiSampler | None = None
     driver: WorkerDriver
     if settings.worker_mode == "fake":
         driver = FakeWorkerDriver()
-    elif settings.worker_mode == "local":
-        driver = DockerWorkerDriver(
-            DockerCLI(), events, identity.signing_public_key, identity.key_id
-        )
-        sampler = HySmiSampler(settings.vram_threshold)
     else:
         hub = WorkerHub(events, lambda _worker: None)
-        driver = RemoteWorkerDriver(hub, str(settings.state_root), settings.worker_id)
+        driver = RemoteWorkerDriver(hub, str(settings.state_root))
     scheduler = Scheduler(
         events,
         identity.signing_private_key,
@@ -106,19 +99,19 @@ def create_app(settings: Settings, identity: RuntimeIdentity | None = None) -> F
         key_id=identity.key_id,
         allowed_users=set(settings.allowed_users),
         max_workers=settings.max_workers,
+        allowed_worker_ids=settings.allowed_worker_ids,
     )
-    context = AppContext(settings, events, identity, proposals, scheduler, hub, sampler)
+    context = AppContext(settings, events, identity, proposals, scheduler, hub)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        sampler_task: asyncio.Task[None] | None = None
         scheduler_task: asyncio.Task[None] | None = None
         prune_framework_logs(settings.state_root)
         if settings.worker_mode == "fake":
             now = utc_now()
             scheduler.register_worker(
                 WorkerSnapshot(
-                    worker_id=settings.worker_id,
+                    worker_id=settings.allowed_worker_ids[0],
                     online=True,
                     last_heartbeat_at=now,
                     gpus=tuple(
@@ -133,20 +126,16 @@ def create_app(settings: Settings, identity: RuntimeIdentity | None = None) -> F
                     ),
                 )
             )
-        elif sampler is not None:
-            sampler_task = asyncio.create_task(
-                _sample_local_worker(scheduler, sampler, settings.worker_id)
-            )
         if settings.auto_schedule:
             scheduler_task = asyncio.create_task(_scheduler_loop(scheduler))
         try:
             yield
         finally:
-            for task in (sampler_task, scheduler_task):
+            for task in (scheduler_task,):
                 if task is not None:
                     task.cancel()
             await asyncio.gather(
-                *(task for task in (sampler_task, scheduler_task) if task is not None),
+                *(task for task in (scheduler_task,) if task is not None),
                 return_exceptions=True,
             )
 
@@ -189,7 +178,8 @@ def create_app(settings: Settings, identity: RuntimeIdentity | None = None) -> F
             raise _error(503, "GROUND_TRUTH_CORRUPT", str(exc), str(uuid.uuid4())) from exc
         return {
             "status": "ready" if not context.draining else "draining",
-            "workers": len(scheduler.workers()),
+            "workers": sum(worker.online for worker in scheduler.workers()),
+            "configured_workers": len(settings.allowed_worker_ids),
             "integrity": integrity,
             "qualification": settings.qualification_profile,
             "harness_mode": settings.harness_mode,
@@ -596,8 +586,12 @@ def create_app(settings: Settings, identity: RuntimeIdentity | None = None) -> F
             return
         worker_id = websocket.headers.get("X-Worker-ID", "")
         authorization = websocket.headers.get("Authorization", "")
-        expected = f"Bearer {identity.worker_api_key}"
-        if worker_id != settings.worker_id or not secrets.compare_digest(authorization, expected):
+        configured_keys = dict(settings.worker_api_keys)
+        api_key = configured_keys.get(worker_id)
+        if api_key is None and not configured_keys and worker_id in settings.allowed_worker_ids:
+            api_key = identity.worker_api_key
+        expected = f"Bearer {api_key}" if api_key is not None else ""
+        if not expected or not secrets.compare_digest(authorization, expected):
             await websocket.close(code=4401, reason="invalid Worker identity")
             return
         await hub.serve(worker_id, websocket)
@@ -631,33 +625,6 @@ async def _scheduler_loop(scheduler: Scheduler) -> None:
     while True:
         await asyncio.to_thread(_tick_safely, scheduler)
         await asyncio.sleep(1)
-
-
-def _register_sample(
-    scheduler: Scheduler,
-    sampler: HySmiSampler,
-    worker_id: str,
-) -> bool:
-    try:
-        snapshots = sampler.sample()
-        scheduler.register_worker(
-            WorkerSnapshot(
-                worker_id=worker_id,
-                online=True,
-                last_heartbeat_at=utc_now(),
-                gpus=snapshots,
-            )
-        )
-        return True
-    except Exception:  # noqa: BLE001 — a heartbeat loop must survive any transient failure; the observed deaths were silent and froze scheduling for good.
-        _LOOP_LOG.warning("worker GPU sampling failed", exc_info=True)
-        return False
-
-
-async def _sample_local_worker(scheduler: Scheduler, sampler: HySmiSampler, worker_id: str) -> None:
-    while True:
-        await asyncio.to_thread(_register_sample, scheduler, sampler, worker_id)
-        await asyncio.sleep(10)
 
 
 def _request_id(request: Request) -> str:

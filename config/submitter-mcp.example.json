@@ -1,20 +1,17 @@
 {
   "mcpServers": {
     "submitter": {
-      "command": "python3",
+      "command": "/opt/agent-scheduler/venv/bin/agent-scheduler",
       "args": [
-        "-m",
-        "agent_scheduler.cli.main",
         "mcp",
         "--base-url",
         "https://127.0.0.1:8443",
         "--username",
-        "zz_chentian"
+        "zz_chentian",
+        "--ca-file",
+        "/public/share/agent-scheduler-mvp/tls/certificate.pem"
       ],
-      "cwd": "/public/share/fh/agent-gpu-task-scheduler",
-      "env": {
-        "AGENT_SCHEDULER_STATE_ROOT": "/public/share/agent-scheduler-mvp"
-      }
+      "cwd": "/data/fh/agent-gpu-task-scheduler"
     }
   }
 }

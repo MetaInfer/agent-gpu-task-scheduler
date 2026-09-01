@@ -121,6 +121,7 @@ class ClaudeCodeAdapter:
         mcp_config: Path = Path("config/empty-mcp.json"),
         timeout_seconds: int = 600,
         max_attempts: int = 4,
+        allowed_worker_ids: tuple[str, ...] = ("worker-local-01",),
     ) -> None:
         self.events = events
         self.executable = executable
@@ -128,6 +129,7 @@ class ClaudeCodeAdapter:
         self.mcp_config = mcp_config.resolve()
         self.timeout_seconds = timeout_seconds
         self.max_attempts = max_attempts
+        self.allowed_worker_ids = allowed_worker_ids
 
     def process(self, revision: Revision) -> ProposalFacts:
         facts_id = new_id("facts")
@@ -139,6 +141,7 @@ class ClaudeCodeAdapter:
             "`c1cf6dee074e03c026dd7272e358d7b15c65b6ff3b6ae1c1f71e7efae341de0c`; "
             "argv MUST be the Proposal-unique container output and business-log paths derived "
             "from proposal_id, and required host paths MUST map `/data` to `/public/share`.\n\n"
+            f"allowed_worker_ids={json.dumps(self.allowed_worker_ids)}\n"
             f"facts_id={facts_id}\nproposal_id={revision.proposal_id}\n"
             f"revision_id={revision.revision_id}\nrevision_markdown:\n{revision.markdown}"
         )

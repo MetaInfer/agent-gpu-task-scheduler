@@ -1,0 +1,18 @@
+{
+  "state_root": "/public/share/agent-scheduler-mvp",
+  "harness_mode": "claude",
+  "worker_mode": "remote",
+  "profile": "production",
+  "vram_threshold": 2.0,
+  "allowed_users": ["zz_chentian"],
+  "max_workers": 2,
+  "workers": {
+    "worker-gpu-01": {
+      "api_key_file": "/etc/agent-scheduler/worker-gpu-01.key"
+    },
+    "worker-gpu-02": {
+      "api_key_file": "/etc/agent-scheduler/worker-gpu-02.key"
+    }
+  },
+  "auto_schedule": true
+}

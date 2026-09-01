@@ -16,15 +16,20 @@ from agent_scheduler_client.cli import run_mcp
 
 from agent_scheduler.adapters.harness import ClaudeCodeAdapter, FakeHarnessAdapter
 from agent_scheduler.adapters.onboarding import HARNESSES
+from agent_scheduler.api.app import create_app
 from agent_scheduler.client_kit import prepare_client_kit_runtime
-from agent_scheduler.config import Settings
+from agent_scheduler.config import Settings, WorkerSettings
 from agent_scheduler.domain.models import new_id
 from agent_scheduler.qualification import (
     QualificationResult,
     run_submitter_agent,
     verify_qualification,
 )
-from agent_scheduler.runtime import init_runtime, load_runtime, load_tls_certificate
+from agent_scheduler.runtime import (
+    init_runtime,
+    load_runtime,
+    load_worker_runtime,
+)
 from agent_scheduler.storage.events import EventStore
 from agent_scheduler.worker.client import WorkerClient
 from agent_scheduler.worker.docker import DockerCLI
@@ -39,15 +44,17 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--state-root", type=Path, required=True)
 
     serve = subparsers.add_parser("serve", help="start loopback HTTPS/WSS Master")
+    serve.add_argument("--config", type=Path, required=True)
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8443)
 
     worker = subparsers.add_parser("worker", help="start the outbound WSS Worker")
-    worker.add_argument("--uri", default="wss://127.0.0.1:8443/api/v1/worker/ws")
+    worker.add_argument("--config", type=Path, required=True)
 
     mcp = subparsers.add_parser("mcp", help="run Submitter MCP Adapter on stdio")
     mcp.add_argument("--base-url", default="https://127.0.0.1:8443")
-    mcp.add_argument("--username", default=os.environ.get("AGENT_SCHEDULER_USERNAME"))
+    mcp.add_argument("--username", required=True)
+    mcp.add_argument("--ca-file", type=Path, required=True)
 
     qualify = subparsers.add_parser("qualify", help="run real four-task qualification")
     qualify.add_argument("--base-url", default="https://127.0.0.1:8443")
@@ -85,10 +92,10 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(init_runtime(args.state_root), indent=2))
         return 0
     if args.command == "serve":
-        settings = Settings.from_env()
+        settings = Settings.from_file(args.config)
         identity = load_runtime(settings.state_root)
         uvicorn.run(
-            "agent_scheduler.api.entrypoint:app",
+            create_app(settings, identity),
             host=args.host,
             port=args.port,
             ssl_certfile=str(identity.tls_certificate),
@@ -97,8 +104,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     if args.command == "worker":
-        settings = Settings.from_env()
-        identity = load_runtime(settings.state_root)
+        settings = WorkerSettings.from_file(args.config)
+        identity = load_worker_runtime(settings.state_root)
         event_store = EventStore(settings.state_root)
         driver = DockerWorkerDriver(
             DockerCLI(),
@@ -119,24 +126,21 @@ def main(argv: list[str] | None = None) -> int:
             else FakeHarnessAdapter()
         )
         client = WorkerClient(
-            uri=args.uri,
+            uri=settings.master_uri,
             worker_id=settings.worker_id,
-            api_key=identity.worker_api_key,
+            api_key=settings.api_key,
             driver=driver,
             sampler=HySmiSampler(settings.vram_threshold),
-            ca_file=str(identity.tls_certificate),
+            ca_file=str(settings.ca_file),
             controller=controller,
         )
         asyncio.run(client.run())
         return 0
     if args.command == "mcp":
-        if not args.username:
-            raise SystemExit("mcp requires --username or AGENT_SCHEDULER_USERNAME")
-        settings = Settings.from_env()
         return run_mcp(
             base_url=args.base_url,
             username=args.username,
-            ca_file=load_tls_certificate(settings.state_root),
+            ca_file=args.ca_file,
         )
     if args.command == "qualify":
         try:

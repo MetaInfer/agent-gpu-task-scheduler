@@ -10,7 +10,7 @@ from agent_scheduler.worker.client import WorkerClient, WorkerClientError
 from agent_scheduler.worker.docker import DockerCLI
 from agent_scheduler.worker.driver import DockerWorkerDriver
 from agent_scheduler.worker.gpu import HySmiSampler
-from agent_scheduler.worker.protocol import WorkerHub
+from agent_scheduler.worker.protocol import RemoteWorkerDriver, WorkerHub
 
 
 def test_worker_rereads_ground_truth_before_docker(runtime_identity):
@@ -123,6 +123,53 @@ def test_master_protocol_sequence_survives_restart(tmp_path):
     )
     hub = WorkerHub(store, lambda _worker: None)
     assert hub._sequence["worker-local-01"] == 42
+
+
+def test_remote_driver_routes_each_plan_to_its_worker(runtime_identity):
+    root, identity = runtime_identity
+    task = signed_task(identity)
+    unit = task.units[0]
+    plan = sign_model(
+        ExecutionPlan(
+            key_id=identity.key_id,
+            plan_id=new_id("plan"),
+            assignment_id=new_id("assign"),
+            execution_id=task.execution_id,
+            task_id=task.task_id,
+            task_content_hash=task.content_hash or "0" * 64,
+            dispatch_generation=1,
+            worker_id="worker-remote-02",
+            unit_id=unit.unit_id,
+            gpu_ids=(0,),
+            lease_epoch=1,
+            container_name=unit.container_name,
+            submitter_username=unit.submitter_username,
+            container_user=unit.container_user,
+            image_digest=unit.image_digest,
+            created_at=utc_now(),
+        ),
+        identity.signing_private_key,
+    )
+
+    class Hub:
+        def __init__(self):
+            self.events = EventStore(root)
+            self.worker_ids = []
+
+        def request(self, worker_id, *_args, **_kwargs):
+            self.worker_ids.append(worker_id)
+            return ProtocolEnvelope(
+                message_id=new_id("msg"),
+                sequence=1,
+                message_type="PLAN_RESULT",
+                payload={"accepted": True},
+            )
+
+    hub = Hub()
+    driver = RemoteWorkerDriver(hub, str(root))
+
+    assert driver.acknowledge_plan(plan, task)
+    assert hub.worker_ids == ["worker-remote-02"]
 
 
 def test_unacked_worker_response_survives_restart(runtime_identity):

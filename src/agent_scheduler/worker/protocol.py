@@ -223,14 +223,18 @@ class WorkerHub:
 
 
 class RemoteWorkerDriver(WorkerDriver):
-    def __init__(self, hub: WorkerHub, state_root: str, worker_id: str = "worker-local-01") -> None:
+    def __init__(self, hub: WorkerHub, state_root: str, worker_id: str | None = None) -> None:
         self.hub = hub
         self.state_root = state_root
         self.worker_id = worker_id
+        self._assignment_workers: dict[str, str] = {}
 
     def prepare(self, manifest: PrepareManifest, task: Task) -> bool:
+        # Record the route before the request: a timeout must still allow the Scheduler's
+        # fencing/status query to reach the Worker that may have started preparing.
+        self._assignment_workers[manifest.assignment_id] = manifest.worker_id
         response = self.hub.request(
-            self.worker_id,
+            manifest.worker_id,
             "PREPARE",
             {"manifest": manifest.model_dump(mode="json"), **self._task_reference(task)},
             assignment_id=manifest.assignment_id,
@@ -238,12 +242,12 @@ class RemoteWorkerDriver(WorkerDriver):
             lease_epoch=manifest.lease_epoch,
             timeout=30,
         )
-        self._ingest_worker_evidence(task)
+        self._ingest_worker_evidence(task, manifest.worker_id)
         return response.payload.get("accepted") is True
 
     def acknowledge_plan(self, plan: ExecutionPlan, task: Task) -> bool:
         response = self.hub.request(
-            self.worker_id,
+            plan.worker_id,
             "PLAN",
             {**self._plan_reference(plan), **self._task_reference(task)},
             assignment_id=plan.assignment_id,
@@ -251,12 +255,12 @@ class RemoteWorkerDriver(WorkerDriver):
             lease_epoch=plan.lease_epoch,
             timeout=30,
         )
-        self._ingest_worker_evidence(task)
+        self._ingest_worker_evidence(task, plan.worker_id)
         return response.payload.get("accepted") is True
 
     def execute(self, plan: ExecutionPlan, task: Task) -> ExecutionResult:
         response = self.hub.request(
-            self.worker_id,
+            plan.worker_id,
             "EXECUTE",
             {**self._plan_reference(plan), **self._task_reference(task)},
             assignment_id=plan.assignment_id,
@@ -264,7 +268,7 @@ class RemoteWorkerDriver(WorkerDriver):
             lease_epoch=plan.lease_epoch,
             timeout=max(unit.timeout_seconds for unit in task.units) + 180,
         )
-        self._ingest_worker_evidence(task)
+        self._ingest_worker_evidence(task, plan.worker_id)
         return ExecutionResult(
             exit_code=int(response.payload["exit_code"]),
             logs_present=response.payload.get("logs_present") is True,
@@ -281,8 +285,11 @@ class RemoteWorkerDriver(WorkerDriver):
         lease_epoch: int,
         task: Task,
     ) -> str:
+        worker_id = self._assignment_workers.get(assignment_id, self.worker_id)
+        if worker_id is None:
+            raise WorkerProtocolError("assignment has no known Worker")
         response = self.hub.request(
-            self.worker_id,
+            worker_id,
             "STATUS_QUERY",
             self._task_reference(task),
             assignment_id=assignment_id,
@@ -295,7 +302,7 @@ class RemoteWorkerDriver(WorkerDriver):
 
     def cancel(self, plan: ExecutionPlan, task: Task) -> bool:
         response = self.hub.request(
-            self.worker_id,
+            plan.worker_id,
             "CANCEL",
             {**self._plan_reference(plan), **self._task_reference(task)},
             assignment_id=plan.assignment_id,
@@ -303,12 +310,12 @@ class RemoteWorkerDriver(WorkerDriver):
             lease_epoch=plan.lease_epoch,
             timeout=60,
         )
-        self._ingest_worker_evidence(task)
+        self._ingest_worker_evidence(task, plan.worker_id)
         return response.payload.get("cancelled") is True
 
     def reconcile(self, plan: ExecutionPlan, task: Task) -> bool:
         response = self.hub.request(
-            self.worker_id,
+            plan.worker_id,
             "RECONCILE",
             {**self._plan_reference(plan), **self._task_reference(task)},
             assignment_id=plan.assignment_id,
@@ -316,14 +323,14 @@ class RemoteWorkerDriver(WorkerDriver):
             lease_epoch=plan.lease_epoch,
             timeout=30,
         )
-        self._ingest_worker_evidence(task)
+        self._ingest_worker_evidence(task, plan.worker_id)
         return response.payload.get("safe") is True
 
-    def _ingest_worker_evidence(self, task: Task) -> None:
+    def _ingest_worker_evidence(self, task: Task, worker_id: str) -> None:
         path = (
             Path(self.state_root)
             / "worker-inbox"
-            / self.worker_id
+            / worker_id
             / task.execution_id
             / "driver-events.jsonl"
         )

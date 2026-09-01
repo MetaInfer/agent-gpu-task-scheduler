@@ -9,7 +9,7 @@ from agent_scheduler.runtime import init_runtime
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_mcp_command_never_calls_load_runtime(tmp_path: Path, monkeypatch):
+def test_mcp_command_uses_explicit_ca_without_reading_runtime(tmp_path: Path, monkeypatch):
     """The `mcp` CLI command backs the Submitter, which is deliberately unprivileged per
     the spec's trust model. Deleting every other secret and asserting on `load_runtime`
     itself proves the command reaches the TLS certificate without touching any of them."""
@@ -27,7 +27,6 @@ def test_mcp_command_never_calls_load_runtime(tmp_path: Path, monkeypatch):
         raise AssertionError("mcp command must not call load_runtime")
 
     monkeypatch.setattr(cli_main, "load_runtime", _forbidden)
-    monkeypatch.setenv("AGENT_SCHEDULER_STATE_ROOT", str(root))
 
     started = {}
 
@@ -42,7 +41,15 @@ def test_mcp_command_never_calls_load_runtime(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(cli_main, "run_mcp", fake_run_mcp)
 
     exit_code = cli_main.main(
-        ["mcp", "--base-url", "https://127.0.0.1:8443", "--username", "zz_chentian"]
+        [
+            "mcp",
+            "--base-url",
+            "https://127.0.0.1:8443",
+            "--username",
+            "zz_chentian",
+            "--ca-file",
+            str(root / "tls" / "certificate.pem"),
+        ]
     )
     assert exit_code == 0
     assert started == {
@@ -85,6 +92,17 @@ def test_qualify_defaults_to_claude():
     from agent_scheduler.cli.main import build_parser
 
     assert build_parser().parse_args(["qualify"]).harness == "claude"
+
+
+def test_master_and_worker_require_explicit_configuration_files():
+    from agent_scheduler.cli.main import build_parser
+
+    assert build_parser().parse_args(["serve", "--config", "master.json"]).config == Path(
+        "master.json"
+    )
+    assert build_parser().parse_args(["worker", "--config", "worker.json"]).config == Path(
+        "worker.json"
+    )
 
 
 def test_qualify_requires_client_kit_before_reading_runtime(monkeypatch, capsys):

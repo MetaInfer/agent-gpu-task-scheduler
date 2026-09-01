@@ -65,29 +65,29 @@ python3 -m agent_scheduler.cli.main init-runtime \
   --state-root /public/share/agent-scheduler-mvp
 ```
 
-若任一身份文件已存在，命令会拒绝覆盖。仓库现有 `.env` 不由项目读取；运维 shell 应在启动前显式加载所需环境。真实 Claude 角色使用受限非交互调用（`--print --setting-sources ""`，禁用内置工具/slash command/session/外部 settings），认证由父进程提供 `ANTHROPIC_API_KEY` 或 `ANTHROPIC_AUTH_TOKEN`。
+若任一身份文件已存在，命令会拒绝覆盖。Master/Worker 的调度配置和 Worker 凭据从显式
+JSON 配置及 `0600` key 文件读取，不使用环境变量。真实 Claude 角色使用受限非交互调用
+（`--print --setting-sources ""`，禁用内置工具/slash command/session/外部 settings）。
 
 ## 启动真实闭环
 
-三个终端使用相同环境：
+先复制示例并按部署修改 Master/Worker 配置：
 
 ```bash
-export AGENT_SCHEDULER_STATE_ROOT=/public/share/agent-scheduler-mvp
-export AGENT_SCHEDULER_PROFILE=qualification
-export AGENT_SCHEDULER_HARNESS_MODE=claude
-export AGENT_SCHEDULER_WORKER_MODE=remote
+cp config/master.example.json /etc/agent-scheduler/master.json
+cp config/worker.example.json /etc/agent-scheduler/worker.json
 ```
 
 终端 1：loopback HTTPS/WSS Master。
 
 ```bash
-python3 -m agent_scheduler.cli.main serve
+python3 -m agent_scheduler.cli.main serve --config /etc/agent-scheduler/master.json
 ```
 
 终端 2：root Worker，主动建立 WSS并每10秒上报真实 `hy-smi`。
 
 ```bash
-python3 -m agent_scheduler.cli.main worker
+python3 -m agent_scheduler.cli.main worker --config /etc/agent-scheduler/worker.json
 ```
 
 终端 3：真实 Submitter 通过本地 MCP Adapter 一次提交四个 Proposal，并验证持久证据。

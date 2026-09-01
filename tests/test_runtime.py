@@ -5,7 +5,12 @@ from pathlib import Path
 import pytest
 from cryptography import x509
 
-from agent_scheduler.runtime import init_runtime, load_runtime, load_tls_certificate
+from agent_scheduler.runtime import (
+    init_runtime,
+    load_runtime,
+    load_tls_certificate,
+    load_worker_runtime,
+)
 
 
 def test_runtime_identity_is_real_and_refuses_overwrite(tmp_path: Path):
@@ -60,3 +65,14 @@ def test_load_tls_certificate_missing_raises(tmp_path: Path):
     root = tmp_path / "state"
     with pytest.raises(FileNotFoundError, match="TLS certificate is missing"):
         load_tls_certificate(root)
+
+
+def test_worker_runtime_never_loads_master_private_credentials(tmp_path: Path):
+    root = tmp_path / "state"
+    init_runtime(root)
+    for name in ("ed25519-private.pem", "tls-private-key.pem", "worker-api-key"):
+        (root / "secrets" / name).unlink()
+
+    identity = load_worker_runtime(root)
+
+    assert identity.key_id.startswith("ed25519-")

@@ -230,14 +230,16 @@ def test_unknown_harness_is_rejected(tmp_path: Path):
         _build("gemini", tmp_path)
 
 
-def test_example_mcp_config_uses_the_python_module_entrypoint():
+def test_example_mcp_config_uses_node_local_console_entrypoint_and_explicit_ca():
     config = json.loads(
         (PROJECT_ROOT / "config" / "submitter-mcp.example.json").read_text(encoding="utf-8")
     )
     server = config["mcpServers"]["submitter"]
 
-    assert server["command"] == "python3"
-    assert server["args"][:3] == ["-m", "agent_scheduler.cli.main", "mcp"]
+    assert server["command"] == "/opt/agent-scheduler/venv/bin/agent-scheduler"
+    assert server["args"][0] == "mcp"
+    assert "--ca-file" in server["args"]
+    assert "env" not in server
 
 
 def test_onboarding_docs_cover_every_harness():

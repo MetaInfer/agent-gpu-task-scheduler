@@ -4,7 +4,15 @@ from pathlib import Path
 import pytest
 from conftest import signed_task
 
-from agent_scheduler.domain.models import GpuSnapshot, GpuState, TaskState, WorkerSnapshot, utc_now
+from agent_scheduler.domain.models import (
+    GpuSnapshot,
+    GpuState,
+    TaskState,
+    WorkerSnapshot,
+    new_id,
+    utc_now,
+)
+from agent_scheduler.integrity import sign_model
 from agent_scheduler.scheduler import Scheduler, SchedulingError
 from agent_scheduler.storage import EventStore
 from agent_scheduler.worker import FakeWorkerDriver
@@ -27,6 +35,10 @@ def worker(vram: float = 0.0, state: GpuState = GpuState.AVAILABLE) -> WorkerSna
             for index in range(8)
         ),
     )
+
+
+def named_worker(worker_id: str) -> WorkerSnapshot:
+    return worker().model_copy(update={"worker_id": worker_id})
 
 
 def scheduler_for(root: Path, identity, driver=None, threshold: float = 2.0):
@@ -65,6 +77,33 @@ def test_scheduler_runs_barriers_and_releases_lease(runtime_identity):
         "FINALIZING",
         "COMPLETED",
     ]
+
+
+def test_scheduler_dispatches_one_task_across_two_workers(runtime_identity):
+    root, identity = runtime_identity
+    original = signed_task(identity)
+    first = original.units[0].model_copy(update={"worker_id": "worker-a"})
+    second = original.units[0].model_copy(
+        update={"unit_id": new_id("unit"), "worker_id": "worker-b"}
+    )
+    task = sign_model(
+        original.model_copy(
+            update={"units": (first, second), "content_hash": None, "signature": None}
+        ),
+        identity.signing_private_key,
+    )
+    driver = FakeWorkerDriver()
+    scheduler = scheduler_for(root, identity, driver)
+    scheduler.register_worker(named_worker("worker-a"))
+    scheduler.register_worker(named_worker("worker-b"))
+
+    scheduler.enqueue(task)
+    result = scheduler.tick()[0]
+
+    assert result.state is TaskState.COMPLETED
+    assert len(driver.executed) == 2
+    plans = list(EventStore(root).iter_immutable("plans"))
+    assert {plan["worker_id"] for plan in plans} == {"worker-a", "worker-b"}
 
 
 def test_vram_gate_keeps_task_queued(runtime_identity):

@@ -200,6 +200,19 @@ def test_provider_doc_points_client_readers_to_the_client_doc():
     assert "submitting-from-an-agent-client.md" in text
 
 
+def test_provider_doc_uses_node_local_venv_and_explicit_server_configuration():
+    text = (PROJECT_ROOT / "docs" / "submitting-from-an-agent-session.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "/opt/agent-scheduler/venv/bin/agent-scheduler serve" in text
+    assert "serve \\\n  --config /etc/agent-scheduler/master.json" in text
+    assert "/opt/agent-scheduler/venv/bin/agent-scheduler worker" in text
+    assert "worker \\\n  --config /etc/agent-scheduler/worker.json" in text
+    assert "No module named agent_scheduler" in text
+    assert "export AGENT_SCHEDULER_STATE_ROOT" not in text
+
+
 def test_internal_submitter_test_doc_describes_source_isolation():
     text = (PROJECT_ROOT / "docs" / "testing-the-submitter.md").read_text(encoding="utf-8")
     assert "agent-scheduler-submitter" in text

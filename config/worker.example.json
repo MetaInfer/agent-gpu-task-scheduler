@@ -1,0 +1,10 @@
+{
+  "state_root": "/public/share/agent-scheduler-mvp",
+  "worker_id": "worker-gpu-01",
+  "master_uri": "wss://master.example.com:8443/api/v1/worker/ws",
+  "api_key_file": "/etc/agent-scheduler/worker.key",
+  "ca_file": "/etc/agent-scheduler/master-ca.pem",
+  "harness_mode": "claude",
+  "profile": "production",
+  "vram_threshold": 2.0
+}

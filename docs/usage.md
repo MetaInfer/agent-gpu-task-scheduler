@@ -141,29 +141,77 @@ chgrp "$group" "$state_root/tls/certificate.pem"
 
 ## 4. 配置
 
-全部通过环境变量，进程启动时校验，非法值直接拒绝启动。
+Master 和 Worker 都使用显式 JSON 配置文件；启动路径不从环境变量读取调度配置或 Worker
+凭据。示例见 `config/master.example.json` 和 `config/worker.example.json`。未知字段、错误类型、
+缺失文件和权限宽于 `0600` 的 key 文件都会导致进程拒绝启动。
 
-| 变量 | 默认 | 说明 |
-| --- | --- | --- |
-| `AGENT_SCHEDULER_STATE_ROOT` | `/public/share/agent-scheduler-mvp` | NFS Ground Truth 根目录 |
-| `AGENT_SCHEDULER_PROFILE` | 未设置（生产） | 设为 `qualification` 启用资格 profile |
-| `AGENT_SCHEDULER_VRAM_THRESHOLD` | 见下 | GPU 准入的 VRAM 上限（百分比） |
-| `AGENT_SCHEDULER_HARNESS_MODE` | `fake` | `fake` 或 `claude` |
-| `AGENT_SCHEDULER_WORKER_MODE` | `remote` | `fake`、`local` 或 `remote` |
-| `AGENT_SCHEDULER_ALLOWED_USERS` | `zz_chentian` | 逗号分隔的 Submitter 白名单 |
-| `AGENT_SCHEDULER_MAX_WORKERS` | `1` | 代码模型允许 `TaskUnit <= max_workers` |
-| `AGENT_SCHEDULER_AUTO_SCHEDULE` | `1` | `0` 表示只接受 Admin `tick` 手动推进 |
-| `AGENT_SCHEDULER_USERNAME` | — | MCP Adapter 的 Submitter 身份 |
+`remote` Master 没有 `worker_id`：它只维护 `workers` 白名单。`worker_id` 仅写在各台
+Worker 自己的配置中。真实运行只支持 `remote`；`fake` 仅用于自动化测试，不操作 GPU 或
+Docker。原有的 `local` 执行分支已经删除。
 
 ### VRAM 阈值
 
 | profile | 默认值 | 硬上限 |
 | --- | --- | --- |
-| 生产（未设 `PROFILE`） | `2.0` | `2.0` |
+| `production` | `2.0` | `2.0` |
 | `qualification` | `97.0` | `97.0` |
 
 超过所属 profile 的硬上限会在启动时抛 `ValueError`。资格 profile 的放宽由运维显式批准，
 必须在事件中留痕，**调度器不得为了让任务通过而自行抬高阈值**。
+
+### 多机 Worker
+
+先为每台机器生成不同的 Bearer key，并限制权限：
+
+```bash
+openssl rand -base64 32 > /etc/agent-scheduler/worker-gpu-01.key
+openssl rand -base64 32 > /etc/agent-scheduler/worker-gpu-02.key
+chmod 600 /etc/agent-scheduler/worker-gpu-*.key
+```
+
+复制并修改示例配置后启动 Master：
+
+```bash
+cp config/master.example.json /etc/agent-scheduler/master.json
+agent-scheduler serve --config /etc/agent-scheduler/master.json --host 0.0.0.0 --port 8443
+```
+
+每台 Worker 只部署该机器自己的 `worker.json` 和 key，然后启动：
+
+```bash
+agent-scheduler worker --config /etc/agent-scheduler/worker.json
+```
+
+生产部署的 TLS 证书 SAN 必须覆盖 Master URI 的主机名；初始化命令生成的 localhost
+开发证书不能用于跨机器连接。Worker 只加载 Ed25519 公钥，不读取 Master 的签名私钥、
+TLS 私钥或其他 Worker 的 API key。
+
+### 多机测试
+
+先运行不需要 GPU、Docker 或网络的自动化测试：
+
+```bash
+pytest -q \
+  tests/test_config.py \
+  tests/test_scheduler.py::test_scheduler_dispatches_one_task_across_two_workers \
+  tests/test_worker_client.py::test_remote_driver_routes_each_plan_to_its_worker \
+  tests/test_runtime.py::test_worker_runtime_never_loads_master_private_credentials
+```
+
+真实机器联调时依次启动 Master、`worker-gpu-01` 和 `worker-gpu-02`，再使用部署 CA 检查：
+
+```bash
+curl --cacert /etc/agent-scheduler/master-ca.pem \
+  https://master.example.com:8443/health
+```
+
+期望 `workers` 为 `2`、`configured_workers` 为 `2`、`integrity` 为 `valid`。然后提交两个分别
+明确指定 `worker-gpu-01`、`worker-gpu-02` 的 1-GPU Proposal，确认各自产生的 Plan 中
+`worker_id` 正确，并检查两台机器都只启动了自己的容器。不要在一台物理机上同时启动两个
+不同 ID 的 Worker 来做执行测试，否则 Scheduler 会把同一组物理 GPU 误认为两组资源。
+
+最后做凭据负向测试：停止 `worker-gpu-02`，临时让它使用错误 key 后重启；Master 必须拒绝
+连接且 `/health` 的 `workers` 只能为 `1`。恢复正确 key 后应回到 `2`。
 
 ### Claude 角色调用契约
 
@@ -187,26 +235,25 @@ claude --print --no-session-persistence --disable-slash-commands \
 
 ## 5. 启动
 
-三个终端共用同一套环境：
+Master 和 Worker 使用各自的配置文件。真实 Claude harness 的服务凭据仍按 Claude CLI
+自身的凭据机制提供，不属于调度器配置。
 
 ```bash
-export AGENT_SCHEDULER_STATE_ROOT=/public/share/agent-scheduler-mvp
-export AGENT_SCHEDULER_PROFILE=qualification
-export AGENT_SCHEDULER_HARNESS_MODE=claude
-export AGENT_SCHEDULER_WORKER_MODE=remote
-export ANTHROPIC_AUTH_TOKEN=...        # 或 ANTHROPIC_API_KEY
+cp config/master.example.json /etc/agent-scheduler/master.json
+cp config/worker.example.json /etc/agent-scheduler/worker.json
 ```
 
 终端 1 — Master：
 
 ```bash
-python3 -m agent_scheduler.cli.main serve [--host 127.0.0.1] [--port 8443]
+python3 -m agent_scheduler.cli.main serve --config /etc/agent-scheduler/master.json \
+  [--host 127.0.0.1] [--port 8443]
 ```
 
 终端 2 — Worker（主动外连，每 10 秒上报真实 `hy-smi`）：
 
 ```bash
-python3 -m agent_scheduler.cli.main worker [--uri wss://127.0.0.1:8443/api/v1/worker/ws]
+python3 -m agent_scheduler.cli.main worker --config /etc/agent-scheduler/worker.json
 ```
 
 ### 确认启动成功
@@ -336,7 +383,7 @@ python3 -m agent_scheduler.cli.main qualify [--base-url https://127.0.0.1:8443] 
 ## Risks and Notes
 ```
 
-每份 Proposal 必须写明：Submitter `zz_chentian`；Worker `worker-local-01`；
+每份 Proposal 必须写明：Submitter `zz_chentian`；Master 配置白名单中的目标 Worker ID；
 容器 `fh-sglang-deepseek-v4-flash`，容器用户 `root`；镜像 digest；冻结 launcher 及其 SHA-256；
 Proposal 唯一的产物与业务日志路径；有界的前台命令与总超时。
 
