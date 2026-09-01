@@ -6,9 +6,11 @@ from agent_scheduler.domain.models import GpuState
 from agent_scheduler.worker.gpu import GpuSamplingError, HySmiSampler
 
 
-def output(vram: int) -> str:
+def output(vram: int, count: int = 8) -> str:
     header = "DCU Temp AvgPwr Perf PwrCap VRAM% DCU% Mode\n"
-    rows = "\n".join(f"{index} 50.0C 100.0W auto 400.0W {vram}% 0.0% Normal" for index in range(8))
+    rows = "\n".join(
+        f"{index} 50.0C 100.0W auto 400.0W {vram}% 0.0% Normal" for index in range(count)
+    )
     return header + rows + "\n"
 
 
@@ -26,13 +28,22 @@ def test_drifted_gpu_requires_three_low_samples(monkeypatch):
     assert all(item.state is GpuState.AVAILABLE for item in sampler.sample())
 
 
-def test_missing_gpu_row_is_rejected(monkeypatch):
+def test_four_gpu_worker_is_accepted(monkeypatch):
     monkeypatch.setattr(
         subprocess,
         "run",
-        lambda *args, **kwargs: subprocess.CompletedProcess(
-            ["hy-smi"], 0, output(1).rsplit("\n", 2)[0], ""
-        ),
+        lambda *args, **kwargs: subprocess.CompletedProcess(["hy-smi"], 0, output(1, 4), ""),
     )
-    with pytest.raises(GpuSamplingError, match="exactly"):
+    snapshots = HySmiSampler(2).sample()
+    assert [item.gpu_id for item in snapshots] == [0, 1, 2, 3]
+
+
+def test_noncontiguous_gpu_ids_are_rejected(monkeypatch):
+    malformed = output(1, 4).replace("2 50.0C", "4 50.0C")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(["hy-smi"], 0, malformed, ""),
+    )
+    with pytest.raises(GpuSamplingError, match="contiguous"):
         HySmiSampler(2).sample()

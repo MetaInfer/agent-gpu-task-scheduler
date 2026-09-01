@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import ssl
 import threading
@@ -32,6 +33,9 @@ from agent_scheduler.worker.gpu import HySmiSampler
 
 class WorkerClientError(RuntimeError):
     pass
+
+
+_LOG = logging.getLogger("agent_scheduler.worker")
 
 
 @dataclass
@@ -189,7 +193,12 @@ class WorkerClient:
 
     async def _heartbeats(self, websocket: ClientConnection) -> None:
         while True:
-            snapshots = await asyncio.to_thread(self.sampler.sample)
+            try:
+                snapshots = await asyncio.to_thread(self.sampler.sample)
+            except Exception:  # noqa: BLE001 - transient hardware sampling must not kill heartbeats silently.
+                _LOG.error("Worker GPU sampling failed; heartbeat will retry", exc_info=True)
+                await asyncio.sleep(10)
+                continue
             worker = WorkerSnapshot(
                 worker_id=self.worker_id,
                 online=True,

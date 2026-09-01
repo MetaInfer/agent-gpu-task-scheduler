@@ -3,7 +3,14 @@ import json
 import pytest
 from conftest import signed_task
 
-from agent_scheduler.domain.models import ExecutionPlan, ProtocolEnvelope, new_id, utc_now
+from agent_scheduler.domain.models import (
+    ExecutionPlan,
+    GpuSnapshot,
+    GpuState,
+    ProtocolEnvelope,
+    new_id,
+    utc_now,
+)
 from agent_scheduler.integrity import canonical_bytes, sign_model
 from agent_scheduler.storage import EventStore
 from agent_scheduler.worker.client import WorkerClient, WorkerClientError
@@ -204,3 +211,63 @@ def test_unacked_worker_response_survives_restart(runtime_identity):
     rebuilt._ack_response(response.message_id)
     assert original_id not in rebuilt._responses
     assert not (rebuilt._protocol_dir / "responses" / f"{original_id}.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_sampling_failure_is_logged_and_retried(
+    runtime_identity, monkeypatch, caplog
+):
+    root, identity = runtime_identity
+    store = EventStore(root)
+    driver = DockerWorkerDriver(DockerCLI(), store, identity.signing_public_key, identity.key_id)
+
+    class Sampler:
+        calls = 0
+
+        def sample(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("transient hy-smi failure")
+            now = utc_now()
+            return (
+                GpuSnapshot(
+                    gpu_id=0,
+                    vram_percent=0.0,
+                    sampled_at=now,
+                    state=GpuState.AVAILABLE,
+                    raw_line="test",
+                ),
+            )
+
+    class WebSocket:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, value):
+            self.sent.append(value)
+            raise StopAsyncIteration
+
+    async def no_delay(_seconds):
+        return None
+
+    monkeypatch.setattr("agent_scheduler.worker.client.asyncio.sleep", no_delay)
+    sampler = Sampler()
+    client = WorkerClient(
+        uri="wss://unused",
+        worker_id="worker-local-01",
+        api_key="unused",
+        driver=driver,
+        sampler=sampler,
+        ca_file="unused",
+    )
+    websocket = WebSocket()
+
+    with (
+        caplog.at_level("ERROR", logger="agent_scheduler.worker"),
+        pytest.raises(StopAsyncIteration),
+    ):
+        await client._heartbeats(websocket)
+
+    assert sampler.calls == 2
+    assert len(websocket.sent) == 1
+    assert "heartbeat will retry" in caplog.text

@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 
 from agent_scheduler.domain.models import GpuSnapshot, GpuState, utc_now
 
-_ROW = re.compile(r"^(?P<id>[0-7])\s+\S+\s+\S+\s+\S+\s+\S+\s+(?P<vram>\d+(?:\.\d+)?)%\s+")
+_ROW = re.compile(r"^(?P<id>\d+)\s+\S+\s+\S+\s+\S+\s+\S+\s+(?P<vram>\d+(?:\.\d+)?)%\s+")
 
 
 class GpuSamplingError(RuntimeError):
@@ -43,6 +43,10 @@ class HySmiSampler:
             if not match:
                 continue
             gpu_id = int(match.group("id"))
+            if gpu_id > 7:
+                raise GpuSamplingError(f"hy-smi reported unsupported GPU ID {gpu_id}; maximum is 7")
+            if gpu_id in seen:
+                raise GpuSamplingError(f"hy-smi reported duplicate GPU ID {gpu_id}")
             vram = float(match.group("vram"))
             seen.add(gpu_id)
             previous = self._states.get(gpu_id, GpuState.UNKNOWN)
@@ -66,6 +70,12 @@ class HySmiSampler:
                     raw_line=raw_line,
                 )
             )
-        if seen != set(range(8)):
-            raise GpuSamplingError(f"hy-smi did not report exactly GPU IDs 0-7: {sorted(seen)}")
+        if not seen:
+            raise GpuSamplingError("hy-smi did not report any GPU rows")
+        expected = set(range(max(seen) + 1))
+        if seen != expected:
+            raise GpuSamplingError(
+                "hy-smi GPU IDs must be contiguous from 0: "
+                f"expected {sorted(expected)}, got {sorted(seen)}"
+            )
         return tuple(sorted(snapshots, key=lambda snapshot: snapshot.gpu_id))
