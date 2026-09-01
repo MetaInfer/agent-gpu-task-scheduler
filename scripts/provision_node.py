@@ -185,21 +185,17 @@ def provision_worker(args: argparse.Namespace) -> None:
 def check_config(args: argparse.Namespace) -> None:
     from agent_scheduler.config import Settings, WorkerSettings
 
-    settings = (
-        Settings.from_file(args.config)
-        if args.kind == "master"
-        else WorkerSettings.from_file(args.config)
-    )
-    print(
-        json.dumps(
-            {
-                "kind": args.kind,
-                "config": str(args.config),
-                "valid": True,
-                "settings": repr(settings),
-            }
-        )
-    )
+    if args.kind == "master":
+        master = Settings.from_file(args.config)
+        summary: dict[str, object] = {
+            "worker_mode": master.worker_mode,
+            "worker_ids": list(master.allowed_worker_ids),
+            "max_workers": master.max_workers,
+        }
+    else:
+        worker = WorkerSettings.from_file(args.config)
+        summary = {"worker_id": worker.worker_id, "master_uri": worker.master_uri}
+    print(json.dumps({"kind": args.kind, "config": str(args.config), "valid": True, **summary}))
 
 
 def main() -> int:

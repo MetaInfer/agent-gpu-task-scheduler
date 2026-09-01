@@ -127,3 +127,26 @@ def test_worker_provisioning_rejects_master_host_absent_from_certificate(tmp_pat
 
     assert completed.returncode != 0
     assert "absent from certificate SAN" in completed.stderr
+
+
+def test_check_output_never_discloses_worker_api_key(tmp_path: Path):
+    state = tmp_path / "state"
+    config = tmp_path / "master-config"
+    init_runtime(state)
+    provisioned = run(
+        "master",
+        "--state-root",
+        state,
+        "--config-dir",
+        config,
+        "--worker-id",
+        "worker-a",
+    )
+    assert provisioned.returncode == 0, provisioned.stderr
+    key = (config / "worker-a.key").read_text().strip()
+
+    checked = run("check", "--kind", "master", "--config", config / "master.json")
+
+    assert checked.returncode == 0, checked.stderr
+    assert key not in checked.stdout
+    assert "worker-a" in checked.stdout
