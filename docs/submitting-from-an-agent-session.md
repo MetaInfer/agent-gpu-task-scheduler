@@ -66,6 +66,23 @@ Master 和 Worker 是不同进程，真实多机部署时运行在不同机器�
   --state-root /public/share/agent-scheduler-mvp
 ```
 
+初始化后，可以使用仓库内的幂等安全脚本生成配置。它遇到已有配置或 key 会拒绝覆盖：
+
+```bash
+/opt/agent-scheduler/venv/bin/python \
+  /data/fh/agent-gpu-task-scheduler/scripts/provision_node.py master \
+  --state-root /data/fh/agent-scheduler-mvp \
+  --config-dir /etc/agent-scheduler \
+  --worker-id worker-gpu-01 \
+  --worker-id worker-gpu-02 \
+  --profile production \
+  --harness-mode claude
+```
+
+该命令生成 `master.json` 和逐 Worker 独立 key。每台 Worker 收到自己的 key 和 Master CA 后，
+用同一脚本的 `worker` 子命令安装本机配置；脚本会在写入前验证 `master_uri` 主机名确实出现
+在证书 SAN 中。
+
 终端 1，在 Master 机器启动：
 
 ```bash
